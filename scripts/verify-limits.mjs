@@ -144,6 +144,12 @@ try {
     mkdirSync(at(side), { recursive: true });
     for (let f = 0; f < 60; f++) writeFileSync(at(side, `f${String(f).padStart(2, '0')}.txt`), '');
   }
+  // One directory large enough that scanning it is itself the expensive part.
+  // A budget checked only on entering a walk never fires here: there is one
+  // walk, and it is already inside it.
+  mkdirSync(at('flat'), { recursive: true });
+  for (let f = 0; f < 5000; f++) writeFileSync(at('flat', `g${f}.txt`), '');
+
   // Empty files: zero body bytes, one header each. The #19 bypass.
   mkdirSync(at('many'), { recursive: true });
   for (let f = 0; f < 300; f++) writeFileSync(at('many', `empty-${String(f).padStart(4, '0')}.txt`), '');
@@ -224,6 +230,15 @@ try {
   r = ctx({ ...IN, paths: ['wide/**/*.txt'] });
   quiet(r, 'GLM_MCP_GLOB_TIMEOUT_MS', 'a 150-directory walk against the 10 s default');
 
+  // The budget has to be checked while entries are being examined, not only on
+  // the way into a directory. A single flat scan enters once and can then run
+  // for as long as the directory is wide.
+  r = ctx({ ...IN, paths: ['flat/*'], env: { GLM_MCP_GLOB_TIMEOUT_MS: 1 } });
+  firesNaming(r, 'GLM_MCP_GLOB_TIMEOUT_MS', 'a 5,000-entry flat scan against a 1 ms budget');
+
+  r = ctx({ ...IN, paths: ['flat/*'], env: { GLM_MCP_MAX_ENTRIES: 100 } });
+  firesNaming(r, 'GLM_MCP_MAX_ENTRIES', 'a 5,000-entry flat scan against a 100-entry budget');
+
   // ------------------------------------------------- 6. brace expansions
   const braces = (n) => `nowhere/${'{a,b}'.repeat(n)}/*.txt`;
   r = ctx({ ...IN, paths: [braces(12)], timeoutMs: 20_000 });
@@ -241,6 +256,20 @@ try {
 
   r = ctx({ ...IN, paths: [braces(20)], env: { GLM_MCP_MAX_BRACE_EXPANSIONS: 'not-a-number' }, timeoutMs: 20_000 });
   firesNaming(r, 'GLM_MCP_MAX_BRACE_EXPANSIONS', 'an unparsable cap falling back to the default');
+
+  // A limit stops the operation that hit it and leaves the rest of the call
+  // alone. Suppressing "no matches" for a pattern that WAS refused is right;
+  // suppressing it for every pattern that follows is a second silent drop.
+  r = ctx({
+    ...IN,
+    paths: [braces(20), 'definitely-missing-*.zzz'],
+    env: { GLM_MCP_MAX_BRACE_EXPANSIONS: 1 },
+    timeoutMs: 20_000,
+  });
+  firesNaming(r, 'GLM_MCP_MAX_BRACE_EXPANSIONS', 'the refused pattern of the pair');
+  if (!noteHas(r, 'definitely-missing-*.zzz')) {
+    fail(`a limit on one pattern must not swallow the next pattern's own note — ${show(r)}`);
+  }
 
   // Ordinary brace use is settled behaviour from #3 and must not regress.
   r = ctx({ ...IN, paths: ['braces/{one,two}.ts'] });
