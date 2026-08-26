@@ -20,7 +20,11 @@ const BUDGET: Record<Exclude<Reasoning, "none">, number> = {
 
 /**
  * Resolve the z.ai key without ever hardcoding it:
- *   ZAI_API_KEY  ->  ~/.config/zai/api-key  ->  the key ZCode already stores.
+ *   ZAI_API_KEY  ->  ~/.config/zai/api-key  ->  (opt-in) the key ZCode already stores.
+ *
+ * The ZCode fallback reads another application's config file, so it is off unless
+ * GLM_MCP_ALLOW_ZCODE_KEY=1 is set. Reading a credential a user configured for a
+ * different tool should be their explicit choice, not a convenience they discover.
  */
 export function resolveApiKey(): string {
   const fromEnv = process.env.ZAI_API_KEY?.trim();
@@ -33,7 +37,7 @@ export function resolveApiKey(): string {
   }
 
   const zcode = join(homedir(), ".zcode", "v2", "config.json");
-  if (existsSync(zcode)) {
+  if (process.env.GLM_MCP_ALLOW_ZCODE_KEY === "1" && existsSync(zcode)) {
     try {
       const cfg = JSON.parse(readFileSync(zcode, "utf8"));
       const k = cfg?.provider?.["builtin:zai-coding-plan"]?.options?.apiKey;
@@ -44,7 +48,8 @@ export function resolveApiKey(): string {
   }
 
   throw new Error(
-    "No z.ai API key found. Set ZAI_API_KEY, or write the key to ~/.config/zai/api-key.",
+    "No z.ai API key found. Set ZAI_API_KEY, or write the key to ~/.config/zai/api-key. " +
+      "To reuse the key ZCode stores, set GLM_MCP_ALLOW_ZCODE_KEY=1.",
   );
 }
 
