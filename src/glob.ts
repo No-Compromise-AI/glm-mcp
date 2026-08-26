@@ -307,10 +307,13 @@ export function expandGlob(
   // A fully literal branch names one path, so collect never reaches walk's
   // deadline check — a cap-sized run of such branches is a stat loop the wall
   // clock never sees, bypassing #16 as thoroughly as a wide single directory.
-  // Sampled like the entry loops below: every 64th branch, not every one.
+  // The clock is read before the first branch — an already-expired budget is
+  // spent however few branches remain, and a stride of 64 would let 63 of
+  // them through unsampled — and then every 64th, like the entry loops below,
+  // rather than every one.
   let branch = 0;
   for (const p of expanded) {
-    if (++branch % 64 === 0 && Date.now() > b.deadline) {
+    if (branch++ % 64 === 0 && Date.now() > b.deadline) {
       budgetNote(b, timeoutNote(b));
       break;
     }

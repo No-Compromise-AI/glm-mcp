@@ -226,6 +226,25 @@ test('a single wide directory cannot outlive the wall-clock budget', (t) => {
   );
 });
 
+test('an already-spent budget stops the literal brace branches before branch one', (t) => {
+  pin(t, { GLM_MCP_GLOB_TIMEOUT_MS: 1 });
+  // wide/** burns the call's wall clock. The brace pattern after it expands to
+  // fully literal branches — no wildcard anywhere, so collect never enters
+  // walk() and its on-the-way-in check — and the branch loop's own clock is
+  // sampled every 64th branch, which a 2-branch expansion never reaches: both
+  // files sailed through on an expired budget with nothing in notes.
+  const literal = 'src/{a/one.ts,b/two.ts}';
+  const ctx = buildFileContext(['wide/**/*.txt', literal], ROOT);
+  assert.ok(
+    ctx.notes.some((n) => n.includes('GLM_MCP_GLOB_TIMEOUT_MS') && n.includes(literal)),
+    `an expired budget must stop the brace loop before its first branch: ${JSON.stringify(ctx.notes)}`,
+  );
+  assert.ok(
+    !ctx.text.includes('BRANCH-A-BODY') && !ctx.text.includes('BRANCH-B-BODY'),
+    'branches processed after the deadline must not be matched',
+  );
+});
+
 test('the 1,500-entry walk stays under the 200,000 default without a note', (t) => {
   pin(t);
   const ctx = buildFileContext(['wide/**/*.txt'], ROOT);
@@ -284,6 +303,29 @@ test("a limit on one pattern does not swallow the next pattern's own note", (t) 
   assert.ok(
     ctx.notes.some((n) => n.includes('skipped (no matches): definitely-missing-*.zzz')),
     `the pattern after it still says it matched nothing: ${JSON.stringify(ctx.notes)}`,
+  );
+});
+
+test('a repeated refused pattern keeps its refusal and gains no no-matches note', (t) => {
+  pin(t, { GLM_MCP_MAX_BRACE_EXPANSIONS: 1 });
+  // A, B, A: both brace patterns are refused, and the second A's refusal is a
+  // repeat of the first's — de-duplicated by the note sink, so the callback
+  // does not fire again for it. Remembering only the latest limited pattern
+  // goes stale when B's refusal overwrites A's, and the repeated A lands in
+  // notes as "no matches" right beside the refusal that says otherwise.
+  const again = 'src/{a,b}/*.none';
+  const ctx = buildFileContext([again, 'docs/{x,y}/*.none', again], ROOT);
+  assert.ok(
+    ctx.notes.some((n) => n.includes(`refused (too many brace expansions): ${again}`)),
+    `the repeated pattern keeps its refusal note: ${JSON.stringify(ctx.notes)}`,
+  );
+  assert.ok(
+    ctx.notes.some((n) => n.includes('refused (too many brace expansions): docs/{x,y}/*.none')),
+    `the pattern between them keeps its own refusal: ${JSON.stringify(ctx.notes)}`,
+  );
+  assert.ok(
+    !ctx.notes.some((n) => n.includes(`skipped (no matches): ${again}`)),
+    `a pattern that was refused must not also be filed as no matches: ${JSON.stringify(ctx.notes)}`,
   );
 });
 
