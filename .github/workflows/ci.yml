@@ -1,0 +1,28 @@
+# Runs on every pull request and on main. This is what branch protection should
+# require: a PR that merges without its tests having run is a PR nobody checked.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read   # a fork PR gets a read-only token and no secrets
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false          # report every failing version, not just the first
+      matrix:
+        node: ['20', '22', '24']  # 20 is the floor declared in engines
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm test
+      - run: npm run verify:ignore
+      - run: npm run verify:globs
