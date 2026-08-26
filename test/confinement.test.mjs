@@ -73,6 +73,14 @@ before(() => {
   put('rootA/a.txt', 'AAA-IN-ROOT-A');
   put('rootA/inner.md', 'INNER-MARKDOWN');
   put('rootA/src/one.ts', 'ONE-TS');
+  // The honest match that must survive beside the rootA/docs symlink, and the
+  // two brace-spelled files: one inside the root (a literal before it is ever
+  // a pattern), one outside it (containment must survive the same literal
+  // reading). #3 settled that a path existing on disk is read literally even
+  // when its name contains metacharacters.
+  put('rootA/sub/docs/fine.txt', 'HONEST-DOCS');
+  put('rootA/{..,safe}', 'LITERAL-BRACE-BODY');
+  put('outside/{..,secret}.env', 'BRACED-OUTSIDE-SECRET');
   put('rootB/b.txt', 'BBB-IN-ROOT-B');
   put('rootC/c.txt', 'CCC-IN-ROOT-C');
   put('rootA-evil/e.txt', 'EVIL-SIBLING-PREFIX');
@@ -147,6 +155,29 @@ test('a directory sharing the root’s textual prefix is outside it', (t) => {
   const ctx = buildFileContext([at('rootA-evil/e.txt')], A);
   assert.ok(!ctx.text.includes('EVIL-SIBLING-PREFIX'));
   assert.ok(refusedNote(ctx, 'rootA-evil'), JSON.stringify(ctx.notes));
+});
+
+test('a real file whose name contains braces is read literally, not anchored by its branches', (t) => {
+  pin(t, { roots: A });
+  // `{..,safe}` exists on disk, so it is a literal before it is a pattern: the
+  // synthetic `..` branch of a pattern reading must not be allowed to anchor a
+  // file that is sitting inside the root all along.
+  const ctx = buildFileContext(['{..,safe}'], A);
+  assert.ok(ctx.text.includes('LITERAL-BRACE-BODY'), JSON.stringify(ctx.notes));
+  assert.deepEqual(ctx.notes, []);
+  assert.equal(ctx.refusedCall, false);
+});
+
+test('a literal path outside the roots is still refused, by its own realpath', (t) => {
+  pin(t, { roots: A });
+  // The same brace-literal shape, but the file really is outside the root:
+  // judging the literal branch by the file's own resolved identity — rather
+  // than by any anchor — must not weaken containment one direction while it
+  // fixes it in the other.
+  const ctx = buildFileContext(['../outside/{..,secret}.env'], A);
+  assert.ok(!ctx.text.includes('BRACED-OUTSIDE-SECRET'), JSON.stringify(ctx.text));
+  assert.ok(refusedNote(ctx, '../outside/{..,secret}.env'), JSON.stringify(ctx.notes));
+  assert.equal(ctx.refusedCall, false);
 });
 
 test('several roots: each named root reads, an unnamed sibling does not', (t) => {
@@ -396,12 +427,30 @@ test('expandGlob without roots stays unconfined', () => {
 
 test('expandGlob does not descend into a directory whose realpath leaves the roots', (t) => {
   pin(t, { roots: A });
-  // `docs` is met mid-walk (after the `*` segment), so only walk containment
-  // can stop it; the leading-literal anchor cannot see this one.
-  assert.deepEqual(expandGlob('*/docs/*.txt', A, [A]), []);
-  // The same shape one level deeper, through a real directory.
-  const ctx = buildFileContext(['*/docs/*.txt'], A);
-  assert.ok(!ctx.text.includes('DEEP_SECRET'));
+  // `**` may swallow zero segments, so the literal `docs` segment meets the
+  // hostile symlink mid-walk, where the leading-literal anchor cannot see it.
+  // (The old `*/docs/*.txt` shape never reached it — a wildcard segment never
+  // follows a symlinked directory — and passed whatever the walker did.)
+  assert.deepEqual(expandGlob('**/docs/*.txt', A, [A]), ['sub/docs/fine.txt']);
+  const refused = [];
+  expandGlob('**/docs/*.txt', A, [A], (r) => refused.push(r));
+  assert.deepEqual(refused, ['docs']);
+  // And through buildFileContext the pruned directory is a refusal note like
+  // any other: partial context must not read as complete when the thing being
+  // hidden is a hostile symlink.
+  const ctx = buildFileContext(['**/docs/*.txt'], A);
+  assert.ok(!ctx.text.includes('DEEP_SECRET'), JSON.stringify(ctx.notes));
+  assert.ok(ctx.text.includes('HONEST-DOCS'), JSON.stringify(ctx.notes));
+  assert.ok(refusedNote(ctx, 'docs', '**/docs/*.txt'), JSON.stringify(ctx.notes));
+  assert.equal(ctx.refusedCall, false);
+  // One directory refused once: each brace branch below meets `docs`, and the
+  // caller does not need it said twice.
+  const twice = buildFileContext(['{**,**}/docs/*.txt'], A);
+  assert.equal(
+    twice.notes.filter((n) => /refused/.test(n) && n.includes('docs')).length,
+    1,
+    JSON.stringify(twice.notes),
+  );
 });
 
 test('an in-root symlinked directory is still descended when a segment names it', (t) => {

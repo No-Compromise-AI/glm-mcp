@@ -152,29 +152,43 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   for (const p of paths) {
     // The credential rule runs before any existence check (decision 3), so
     // /proc/self/environ is reported as refused, not missing, where it does
-    // not exist. Containment probes where a literal resolves to or a pattern's
-    // walk would be anchored — refusing a pattern before it walks is what
-    // keeps an absolute pattern from traversing the volume first. Each brace
-    // expansion is probed on its own, because the anchor of a brace pattern as
-    // written is the anchor of none of its branches, and a branch that leaves
-    // the roots would otherwise vanish inside expandGlob without a word.
+    // not exist. A path that exists on disk is then read literally — judged
+    // by the file's own resolved identity, never by where a pattern reading
+    // of its metacharacters would anchor, because report[final].md and
+    // {..,safe} exist as themselves before they exist as patterns (#3). Only
+    // a genuine pattern is judged by its brace branches' anchors — refusing
+    // a pattern before it walks is what keeps an absolute pattern from
+    // traversing the volume first, and each expansion is probed on its own
+    // because the anchor of a brace pattern as written is the anchor of none
+    // of its branches.
     const resolved = keyOf(p);
     if (denied.has(resolved)) {
       notes.push(`refused (credential path): ${p}`);
+      continue;
+    }
+    if (!isGlobPattern(p) || namesSomething(p)) {
+      if (included.has(resolved)) continue;
+      if (roots && !insideRoots(resolved, roots)) {
+        notes.push(`refused: ${p} resolves outside the allowed roots`);
+        included.add(resolved);
+        continue;
+      }
+      included.add(resolved);
+      files.push({ p, via: p, resolved });
       continue;
     }
     if (roots && patternAnchors(p, cwd).some((a) => !insideRoots(realpathish(a), roots))) {
       notes.push(`refused: ${p} resolves outside the allowed roots`);
       continue;
     }
-    if (!isGlobPattern(p) || namesSomething(p)) {
-      if (!included.has(resolved)) {
-        included.add(resolved);
-        files.push({ p, via: p, resolved });
-      }
-      continue;
-    }
-    const matches = expandGlob(p, cwd, roots ?? undefined);
+    // A directory the walk prunes for leaving the roots is a refusal like any
+    // other: expandGlob reports each one once, with the spelling a match
+    // would carry, so the note names both it and the pattern that reached it.
+    const matches = expandGlob(p, cwd, roots ?? undefined, (refused) => {
+      notes.push(
+        `refused: ${refused} (matched by ${p}) resolves outside the allowed roots`,
+      );
+    });
     if (matches.length === 0) {
       notes.push(`skipped (no matches): ${p}`);
       continue;

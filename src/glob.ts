@@ -195,10 +195,29 @@ function literalName(seg: string): string | undefined {
  * read, so a pattern rooted at the top of the volume cannot traverse it before
  * its matches are refused one by one. Without `roots` the expansion is
  * unconfined, exactly as it was before confinement existed.
+ *
+ * `onRefused`, when given, is called with the pattern-relative spelling of each
+ * directory the confinement prunes mid-walk. A pruned directory is a refusal
+ * like any other: without this the caller would return partial context that
+ * reads as complete — the silent narrowing decision 1 rules out — and what it
+ * would be hiding is a hostile symlink. The same directory can be reached by
+ * several routes (`**` more than once, or one brace branch per route), so it is
+ * reported once per expansion, not once per route.
  */
-export function expandGlob(pattern: string, cwd: string, roots?: string[]): string[] {
+export function expandGlob(
+  pattern: string,
+  cwd: string,
+  roots?: string[],
+  onRefused?: (refused: string) => void,
+): string[] {
   const found = new Set<string>();
-  for (const p of expandBraces(pattern)) collect(p, cwd, found, roots ?? null);
+  const said = new Set<string>();
+  const refuse = onRefused === undefined ? undefined : (p: string) => {
+    if (said.has(p)) return;
+    said.add(p);
+    onRefused(p);
+  };
+  for (const p of expandBraces(pattern)) collect(p, cwd, found, roots ?? null, refuse);
   return [...found].sort();
 }
 
@@ -279,7 +298,13 @@ function anchorOf(pattern: string, cwd: string): Anchor | null {
   return { base, prefix, rest: segments.slice(first), root };
 }
 
-function collect(pattern: string, cwd: string, found: Set<string>, roots: string[] | null): void {
+function collect(
+  pattern: string,
+  cwd: string,
+  found: Set<string>,
+  roots: string[] | null,
+  onRefused?: (refused: string) => void,
+): void {
   const anchor = anchorOf(pattern, cwd);
   if (anchor === null) return; // a bare root ("/", "C:/") names no segment to match
   const { base, prefix, rest, root } = anchor;
@@ -318,8 +343,15 @@ function collect(pattern: string, cwd: string, found: Set<string>, roots: string
   // A directory the walk may enter. Under confinement a directory whose
   // realpath leaves the roots is not descended into however it was matched —
   // named literally by a segment, reached by a wildcard, or found by `**` —
-  // because resolving first is what closes the symlink escape.
-  const enterable = (dir: string): boolean => !roots || insideRoots(realpathish(dir), roots);
+  // because resolving first is what closes the symlink escape. Refusing one
+  // is reported through `onRefused` with the same spelling a match would
+  // carry, so a pruned directory becomes the caller's note instead of
+  // context that quietly narrows.
+  const enterable = (dir: string, rel: string): boolean => {
+    if (!roots || insideRoots(realpathish(dir), roots)) return true;
+    onRefused?.(rel);
+    return false;
+  };
 
   const walk = (dir: string, rel: string, i: number): void => {
     const seg = compiled[i];
@@ -358,7 +390,7 @@ function collect(pattern: string, cwd: string, found: Set<string>, roots: string
         // Real directories only: a '**'-matched symlink could point anywhere,
         // including back up this very walk, and never terminate it.
         if (e.isDirectory()) {
-          if (!skip(e.name, i) && enterable(join(dir, e.name))) {
+          if (!skip(e.name, i) && enterable(join(dir, e.name), child(e.name))) {
             walk(join(dir, e.name), child(e.name), i);
           }
         } else if (last && kind(e) === "file") emit(child(e.name));
@@ -376,7 +408,7 @@ function collect(pattern: string, cwd: string, found: Set<string>, roots: string
         // spells its name out — an explicit request, as with the ignore
         // bypass — never where a wildcard happened to match it.
         if ((e.isDirectory() || names[i] === e.name) && !skip(e.name, i)
-          && enterable(join(dir, e.name))) {
+          && enterable(join(dir, e.name), child(e.name))) {
           walk(join(dir, e.name), child(e.name), i + 1);
         }
       }
