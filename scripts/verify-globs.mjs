@@ -3,8 +3,10 @@
 // order, and a literal path wins over pattern interpretation even when its
 // name contains glob metacharacters. The issue's symlink P2 is covered too:
 // an explicitly named symlinked directory is followed, wildcards and terminal
-// directory links are not. Checks run against this repository and a throwaway
-// fixture tree.
+// directory links are not. So is its Windows P2, in the forward-slash forms
+// that do not collide with `\` escape syntax: drive-letter patterns anchor at
+// their drive. Checks run against this repository and a throwaway fixture
+// tree.
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
@@ -90,6 +92,34 @@ try {
     fail('a symlink to a directory must not be listed as a file');
   }
   if (!expandGlob('filelink', root).includes('filelink')) fail('a symlink to a file must still match');
+
+  // Windows drive-letter patterns (the issue's path-handling P2): `C:/...` is
+  // absolute there. The platform is faked and the fixture anchored at the
+  // process cwd — the one place a `C:/`-rooted walk can land on a POSIX host —
+  // which still proves the drive anchors the search and shapes the emitted
+  // names. Native backslashed patterns are deliberately out of scope: `\` is
+  // the escape syntax on every platform.
+  {
+    const realPlatform = process.platform;
+    const realCwd = process.cwd();
+    const drive = mkdtempSync(join(tmpdir(), 'glm-globs-drive-verify-'));
+    mkdirSync(join(drive, 'C:', 'repo', 'src'), { recursive: true });
+    writeFileSync(join(drive, 'C:', 'repo', 'src', 'a.ts'), 'W');
+    process.chdir(drive);
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    try {
+      for (const cwd of ['Z:\\elsewhere', join(drive, 'unrelated')]) {
+        const got = expandGlob('C:/repo/src/*.ts', cwd);
+        if (JSON.stringify(got) !== JSON.stringify(['C:/repo/src/a.ts'])) {
+          fail(`a drive-letter pattern must anchor at its drive, not cwd=${cwd}: [${got.join(', ')}]`);
+        }
+      }
+    } finally {
+      Object.defineProperty(process, 'platform', { value: realPlatform });
+      process.chdir(realCwd);
+      rmSync(drive, { recursive: true, force: true });
+    }
+  }
 
   if (hadEnv) process.env.GLM_MCP_GLOB_IGNORE = savedEnv;
   else delete process.env.GLM_MCP_GLOB_IGNORE;

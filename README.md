@@ -79,7 +79,10 @@ Lists the model ids available on the configured account.
   `report[final].md` is read, not pattern-matched. A pattern that matches nothing is reported
   in `Notes`, exactly like a missing file. Glob expansion follows a symlinked directory only
   when the pattern names it explicitly (`linked/*.ts`); wildcards never follow symlinks, and
-  a link to a directory is never listed as a file.
+  a link to a directory is never listed as a file. On Windows, forward-slash drive and UNC
+  patterns (`C:/src/**/*.ts`, `//server/share/src/*.ts`) are honoured as absolute; `\` is the
+  escape character on every platform, so spell Windows globs with `/` rather than native
+  backslashes.
 - **Glob expansion skips dependency and output directories** — `node_modules`, `.git`,
   `dist`, `build`, `coverage`, `.next`, `.turbo`, `vendor`, `target` — so `**/*.ts` matches
   your source instead of 1,700 dependency type definitions crowding out the context budget.
@@ -111,5 +114,6 @@ directory: wildcards skip all of them (nested ones included), an explicit segmen
 not — still enters the directory it names, a literal later in the pattern cannot unlock a
 wildcard earlier in it, and `GLM_MCP_GLOB_IGNORE` replaces the defaults, trims its entries,
 and disables skipping entirely when empty. `verify:globs` checks `./` and `../` prefixes,
-order-independent de-duplication, literal paths containing glob metacharacters, and symlinked
-directories, against this repository and a fixture tree of its own.
+order-independent de-duplication, literal paths containing glob metacharacters, symlinked
+directories, and Windows drive-letter patterns (run against a faked platform), against this
+repository and fixture trees of its own.

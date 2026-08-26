@@ -179,7 +179,10 @@ function literalName(seg: string): string | undefined {
  * Expand one glob pattern against `cwd` into the files it matches, sorted.
  * Directories are traversed, never listed; a pattern is only reported when it
  * has matched at least one file. Leading `.` and `..` segments resolve against
- * `cwd`, so `./src/**` and `../neighbour/src/**` start where they point.
+ * `cwd`, so `./src/**` and `../neighbour/src/**` start where they point. On
+ * Windows a forward-slash drive (`C:/src/**`) or UNC (`//server/share/src/**`)
+ * prefix is absolute, like a leading `/` anywhere; a backslash is an escape on
+ * every platform, never a separator.
  * Ignored directories (see globIgnoreSet) are not entered — unless the pattern
  * spells their name out as a segment, which reads as the caller asking for
  * them deliberately. The same explicitness decides symlinked directories: a
@@ -192,15 +195,28 @@ export function expandGlob(pattern: string, cwd: string): string[] {
 }
 
 function collect(pattern: string, cwd: string, found: Set<string>): void {
-  const absolute = pattern.startsWith("/");
-  const segments = pattern.split("/").filter((s) => s.length > 0);
+  // On Windows a drive prefix (`C:/repo`) or a UNC one (`//server/share`)
+  // spells an absolute pattern as surely as a leading `/` does. Only the
+  // forward-slash forms are honoured: a backslashed pattern is a native path,
+  // and reading its separators would collide with the `\` escape syntax this
+  // globber documents and tests. Off Windows `C:` stays an ordinary name.
+  const windows = process.platform === "win32";
+  const drive = windows ? /^([A-Za-z]:)\/(.*)$/.exec(pattern) : null;
+  const unc = windows && pattern.startsWith("//");
+  const absolute = pattern.startsWith("/") || drive !== null || unc;
+
+  const segments = (drive ? drive[2] : pattern).split("/").filter((s) => s.length > 0);
   if (segments.length === 0) return;
+
+  // Every emitted path grows this root — `C:/`, `//`, `/`, or nothing at all
+  // for a relative pattern — and the walk is anchored at the same text.
+  const root = drive ? `${drive[1]}/` : unc ? "//" : absolute ? "/" : "";
 
   // Leading literal segments — `.` and `..` included — resolve into the base
   // directory up front; `collect` would otherwise look for a directory entry
   // literally called `.` or `..` and match nothing. The prefix mirrors what
   // resolve() does, kept as display text for the paths that get emitted.
-  let base = absolute ? "/" : cwd;
+  let base = absolute ? root : cwd;
   const prefix: string[] = [];
   let first = 0;
   while (first < segments.length) {
@@ -210,7 +226,7 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
     if (name === ".") continue;
     if (name === "..") {
       if (prefix.length > 0 && prefix[prefix.length - 1] !== "..") prefix.pop();
-      else if (!absolute) prefix.push(".."); // above `/` there is nowhere left to name
+      else if (!absolute) prefix.push(".."); // above the root there is nowhere left to name
     } else {
       prefix.push(name);
     }
@@ -218,7 +234,7 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
   }
   const start = prefix.join("/");
   const emit = (rel: string) => {
-    found.add(absolute ? `/${rel}` : rel);
+    found.add(root + rel);
   };
 
   // A pattern that stays literal the whole way through names a single path:

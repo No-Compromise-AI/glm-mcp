@@ -6,7 +6,7 @@
 // directories.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 import { expandGlob } from '../dist/glob.js';
@@ -121,6 +121,15 @@ before(() => {
   put('', 'report[final].md', 'FINAL REPORT');
   put('cls', 'a.md', 'A-MD');
   put('cls', 'b.md', 'B-MD');
+  put('case', 'glob.ts', 'CASEBODY');
+  put('real', 'f.ts', 'F');
+  mkdirSync(join(fx, 'a'), { recursive: true });
+  symlinkSync(join(fx, 'real'), join(fx, 'a', 'linked'), 'dir');
+  // A dangling symlink named with glob metacharacters, plus the file its
+  // pattern reading would wrongly pick up instead.
+  put('dang', 'reportv.md', 'WILDBODY');
+  symlinkSync(join(fx, 'nowhere'), join(fx, 'dang', 'report[v2].md'));
+  symlinkSync(join(fx, 'nowhere'), join(fx, 'broken'));
   symlinkSync(join(fx, 'src'), join(fx, 'linked'), 'dir');
   symlinkSync(join(fx, 'src'), join(fx, 'dirlink'), 'dir');
   symlinkSync(join(fx, 'src', 'a.ts'), join(fx, 'filelink'), 'file');
@@ -202,4 +211,109 @@ test('a symlink to a directory is not listed as a file', () => {
 
 test('a symlink to a file still matches', () => {
   assert.deepEqual(expandGlob('filelink', fx), ['filelink']);
+});
+
+test('de-duplication tracks files, not spellings: symlink alias', () => {
+  // linked/a.ts and src/a.ts are the same file on disk; whichever way it is
+  // reached, directly or through a glob, it is read exactly once.
+  for (const paths of [['linked/a.ts', 'src/*.ts'], ['src/*.ts', 'linked/a.ts']]) {
+    const ctx = buildFileContext(paths, fx);
+    assert.equal(occurrences(ctx, 'A'), 1, JSON.stringify(paths));
+    assert.equal(
+      occurrences(ctx, '--- linked/a.ts ---') + occurrences(ctx, '--- src/a.ts ---'),
+      1,
+      `the same file must have exactly one header: ${JSON.stringify(ctx.text.match(/--- [^\n]+ ---/g))}`,
+    );
+  }
+});
+
+test('de-duplication tracks files, not spellings: case variants', (t) => {
+  // On a case-insensitive filesystem (macOS/Windows default) case/GLOB.ts and
+  // case/glob.ts name the same file; on a case-sensitive one they do not, and
+  // the literal simply does not exist.
+  if (!existsSync(join(fx, 'CASE'))) t.skip('filesystem is case-sensitive');
+  for (const paths of [['case/GLOB.ts', 'case/*.ts'], ['case/*.ts', 'case/GLOB.ts']]) {
+    const ctx = buildFileContext(paths, fx);
+    assert.equal(occurrences(ctx, 'CASEBODY'), 1, JSON.stringify(paths));
+  }
+});
+
+test('a dangling symlink is not reinterpreted as a pattern', () => {
+  // dang/report[v2].md exists as a name (the link) even though nothing is
+  // behind it: it must be read literally — and so fail to be read — rather
+  // than expand as [v2] and pick up the unrelated dang/reportv.md.
+  const ctx = buildFileContext(['dang/report[v2].md'], fx);
+  assert.ok(!ctx.text.includes('WILDBODY'), `the pattern reading leaked through: ${ctx.text}`);
+  assert.equal(ctx.text, '');
+  assert.equal(ctx.notes.length, 1);
+  assert.ok(ctx.notes[0].includes('dang/report[v2].md'), JSON.stringify(ctx.notes));
+});
+
+test('a nested symlinked directory is followed when a literal segment names it', () => {
+  // Unlike linked/*.ts (whose leading literal is resolved before the walk),
+  // this pattern meets the symlink mid-walk, through its own segment.
+  assert.deepEqual(expandGlob('*/linked/*.ts', fx), ['a/linked/f.ts']);
+  assert.deepEqual(expandGlob('**/linked/*.ts', fx), [
+    'a/linked/f.ts', 'linked/a.ts', 'linked/b.ts', 'linked/glm.ts',
+  ]);
+});
+
+test('** never follows a symlinked directory itself', () => {
+  const found = expandGlob('**/f.ts', fx);
+  assert.ok(!found.includes('a/linked/f.ts'), `** rode a symlink: ${JSON.stringify(found)}`);
+  assert.deepEqual(found, ['real/f.ts']);
+});
+
+test('a broken symlink matches nothing', () => {
+  const star = expandGlob('*', fx);
+  assert.ok(!star.includes('broken'), `a broken link was listed: ${JSON.stringify(star)}`);
+  assert.ok(star.includes('filelink'), 'a working file link must still match');
+  assert.deepEqual(expandGlob('broken', fx), []);
+  assert.deepEqual(expandGlob('brok*', fx), []);
+});
+
+// --- issue #3, Windows path handling ---
+// `C:/repo/src/*.ts` is absolute on Windows; off Windows `C:` is an ordinary
+// directory name. A POSIX host cannot address a drive, so the Windows case
+// fakes the platform and anchors its fixture at the process cwd — the one
+// place a `C:/`-rooted walk can land there. That still exercises drive
+// detection, base construction and the emitted names, and proves the cwd
+// argument never re-anchors a drive pattern (before the fix, Windows ran
+// `resolve(cwd, "C:")`, which searched `C:\repo\repo\src` and matched nothing).
+
+const driveFixture = () => {
+  const drive = mkdtempSync(join(tmpdir(), 'glm-glob-drive-'));
+  mkdirSync(join(drive, 'C:', 'repo', 'src'), { recursive: true });
+  writeFileSync(join(drive, 'C:', 'repo', 'src', 'a.ts'), 'A');
+  return drive;
+};
+
+test('a drive-letter pattern is absolute on Windows', () => {
+  const realPlatform = process.platform;
+  const realCwd = process.cwd();
+  const drive = driveFixture();
+  process.chdir(drive);
+  Object.defineProperty(process, 'platform', { value: 'win32' });
+  try {
+    for (const cwd of ['Z:\\elsewhere', join(drive, 'unrelated')]) {
+      assert.deepEqual(expandGlob('C:/repo/src/*.ts', cwd), ['C:/repo/src/a.ts'],
+        `the cwd argument must not re-anchor a drive pattern (cwd=${cwd})`);
+    }
+    // A `..` inside the drive pops the same way it does under `/`.
+    assert.deepEqual(expandGlob('C:/repo/../repo/src/*.ts', 'Z:\\elsewhere'), ['C:/repo/src/a.ts']);
+  } finally {
+    Object.defineProperty(process, 'platform', { value: realPlatform });
+    process.chdir(realCwd);
+    rmSync(drive, { recursive: true, force: true });
+  }
+});
+
+test('off Windows a `C:` segment is an ordinary directory name', (t) => {
+  if (process.platform === 'win32') t.skip('drive letters are absolute here');
+  const drive = driveFixture();
+  try {
+    assert.deepEqual(expandGlob('C:/repo/src/*.ts', drive), ['C:/repo/src/a.ts']);
+  } finally {
+    rmSync(drive, { recursive: true, force: true });
+  }
 });
