@@ -93,6 +93,25 @@ try {
   }
   if (!expandGlob('filelink', root).includes('filelink')) fail('a symlink to a file must still match');
 
+  // The same explicit-name policy one level down, where the segment meets the
+  // symlink mid-walk instead of being resolved away as a leading literal, plus
+  // the broken link that must never match anything.
+  put('real', 'f.ts', 'F');
+  mkdirSync(join(root, 'pkg'), { recursive: true });
+  symlinkSync(join(root, 'real'), join(root, 'pkg', 'linked'), 'dir');
+  const nested = expandGlob('*/linked/*.ts', root);
+  if (JSON.stringify(nested) !== JSON.stringify(['pkg/linked/f.ts'])) {
+    fail(`a literal segment must follow a nested symlinked directory: [${nested.join(', ')}]`);
+  }
+  const globstar = expandGlob('**/f.ts', root);
+  if (globstar.includes('pkg/linked/f.ts') || !globstar.includes('real/f.ts')) {
+    fail(`** must ride only real directories: [${globstar.join(', ')}]`);
+  }
+  symlinkSync(join(root, 'nowhere'), join(root, 'broken'));
+  if (expandGlob('*', root).includes('broken') || expandGlob('broken', root).length !== 0) {
+    fail('a broken symlink must match nothing');
+  }
+
   // Windows drive-letter patterns (the issue's path-handling P2): `C:/...` is
   // absolute there. The platform is faked and the fixture anchored at the
   // process cwd — the one place a `C:/`-rooted walk can land on a POSIX host —

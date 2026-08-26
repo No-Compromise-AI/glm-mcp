@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { expandGlob, isGlobPattern } from "./glob.js";
@@ -77,11 +77,34 @@ export function buildFileContext(paths: string[], cwd: string): { text: string; 
   // argument order. A path that exists on disk is used literally even when its
   // name contains glob metacharacters: report[final].md exists as itself before
   // it exists as a pattern.
+  // De-duplication tracks files, not spellings: realpathSync.native resolves
+  // each path to its canonical on-disk identity, so case variants on
+  // case-insensitive filesystems and symlink aliases on any platform collapse
+  // to one entry. A path that resolves to nothing (never created, or a
+  // dangling symlink) falls back to the lexical spelling.
+  const keyOf = (p: string): string => {
+    try {
+      return realpathSync.native(resolve(cwd, p));
+    } catch {
+      return resolve(cwd, p);
+    }
+  };
+  // lstat rather than existsSync: it does not follow the link, so a dangling
+  // symlink still names something and keeps its literal reading instead of
+  // being reinterpreted as the pattern its metacharacters spell out.
+  const namesSomething = (p: string): boolean => {
+    try {
+      lstatSync(resolve(cwd, p));
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const files: string[] = [];
   const included = new Set<string>();
   for (const p of paths) {
-    if (!isGlobPattern(p) || existsSync(resolve(cwd, p))) {
-      const key = resolve(cwd, p);
+    if (!isGlobPattern(p) || namesSomething(p)) {
+      const key = keyOf(p);
       if (!included.has(key)) {
         included.add(key);
         files.push(p);
@@ -94,7 +117,7 @@ export function buildFileContext(paths: string[], cwd: string): { text: string; 
       continue;
     }
     for (const m of matches) {
-      const key = resolve(cwd, m);
+      const key = keyOf(m);
       if (included.has(key)) continue;
       included.add(key);
       files.push(m);
