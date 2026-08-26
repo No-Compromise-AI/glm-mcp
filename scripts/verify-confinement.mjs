@@ -114,6 +114,8 @@ try {
   put('rootA/src/one.ts', 'ONE-TS');
   put('rootA/src/nested/two.ts', 'TWO-TS');
   put('rootA/sub/docs/fine.txt', 'HONEST-DOCS');
+  dir('rootA/teams/team1');
+  dir('rootA/teams/team2');
   // A real file whose name is nothing but metacharacters. #3 settled that a
   // path existing on disk is read literally; containment must not re-read it
   // as a pattern whose synthetic '..' branch escapes.
@@ -137,6 +139,10 @@ try {
   symlinkSync(at('rootA/a.txt'), at('rootA/alias.txt'));            // in-root link: must keep working
   symlinkSync(at('home/.config/zai/api-key'), at('home/link-to-key'));
   symlinkSync(at('rootA'), at('linkroot'));                         // a root spelled through a link
+  // Two distinct links in the tree to one directory outside it: the caller
+  // has two problems to fix, not one.
+  symlinkSync(at('outside/secretdir'), at('rootA/teams/team1/docs'));
+  symlinkSync(at('outside/secretdir'), at('rootA/teams/team2/docs'));
 
   const A = at('rootA');
   const B = at('rootB');
@@ -202,6 +208,31 @@ try {
   r = ctx({ paths: ['**/docs/*.txt'], cwd: A, roots: A });
   refuses(r, 'DEEP_SECRET', ['docs', '**/docs/*.txt'], 'a directory symlink pruned mid-walk');
   if (!shows(r, 'HONEST-DOCS')) fail(`the honest match beside a pruned link must survive — ${show(r)}`);
+
+  // Two escaping links, two refusals. Collapsing them by where they point
+  // hides one of the caller's two problems; only repeated routes to the same
+  // path may collapse.
+  r = ctx({ paths: ['teams/**/docs/*.txt'], cwd: A, roots: A });
+  if (shows(r, 'DEEP_SECRET')) fail(`two escaping links leaked — ${show(r)}`);
+  for (const team of ['teams/team1/docs', 'teams/team2/docs']) {
+    if (!noted(r, team)) fail(`each escaping link must be reported, ${team} was not — ${show(r)}`);
+  }
+  // Refused is not the same as absent. A pattern that refused something must
+  // not also be filed under "no matches", which reads as a pattern that was
+  // simply wrong.
+  if (r.notes.some((n) => /no matches/i.test(n))) {
+    fail(`a pattern whose matches were refused must not also be reported as matching nothing — ${show(r)}`);
+  }
+
+  // An absolute pattern's refusal has to name an absolute path. Matches carry
+  // the pattern's root through; refusals must not drop it.
+  r = ctx({ paths: [`${A}/teams/**/docs/*.txt`], cwd: A, roots: A });
+  if (shows(r, 'DEEP_SECRET')) fail(`an absolute escaping pattern leaked — ${show(r)}`);
+  for (const n of r.notes.filter((x) => /refused/i.test(x))) {
+    if (!n.includes(`${A}/teams/team`)) {
+      fail(`a refusal from an absolute pattern must name an absolute path, got ${JSON.stringify(n)}`);
+    }
+  }
 
   // ------------------------------- 5. a cwd outside the roots refuses the call
   r = ctx({ paths: ['a.txt'], cwd: at('outside'), roots: A, procCwd: A });
