@@ -1,9 +1,10 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { readFileSync, existsSync, lstatSync, realpathSync } from "node:fs";
+import { readFileSync, existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { expandGlob, isGlobPattern, patternAnchors } from "./glob.js";
 import { confineRoots, deniedCredentials, insideRoots, realpathish } from "./confine.js";
+import { envLimit, walkBudget, DEFAULT_MAX_FILE_BYTES } from "./limits.js";
 
 export const DEFAULT_MODEL = "glm-5.3";
 export const BASE_URL = process.env.ZAI_BASE_URL ?? "https://api.z.ai/api/anthropic";
@@ -70,6 +71,21 @@ export function getClient(): Anthropic {
 
 const MAX_FILE_CHARS = Number(process.env.GLM_MCP_MAX_FILE_CHARS ?? 800_000);
 
+/**
+ * The first `maxUnits` UTF-16 units of `s`, cut where it cannot split a
+ * surrogate pair (#19). Truncating mid-pair produces a lone surrogate — invalid
+ * wherever the prompt travels next — so a window ending on the high half of a
+ * pair yields one unit less rather than half a character.
+ */
+function takeUnits(s: string, maxUnits: number): string {
+  if (maxUnits <= 0) return "";
+  if (s.length <= maxUnits) return s;
+  const cut = s.charCodeAt(maxUnits - 1) >= 0xd800 && s.charCodeAt(maxUnits - 1) <= 0xdbff
+    ? maxUnits - 1
+    : maxUnits;
+  return s.slice(0, cut);
+}
+
 export interface FileContext {
   text: string;
   notes: string[];
@@ -111,6 +127,20 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // Decision 3 is unconditional — GLM_MCP_ALLOW_ANY_PATH widens the roots, it
   // does not re-open the server's own credentials.
   const denied = deniedCredentials();
+
+  // The walk-wide limits of decision 5 (#16, #17), shared by every pattern of
+  // this call: depth, entries and the wall clock are budgets of the call, not
+  // of each pattern, and every limit note lands here. A note also means part of
+  // this entry's expansion was stopped, which is why `limited` suppresses the
+  // "no matches" note below — a pattern cut short by a limit is not a pattern
+  // that matched nothing, and reading it as one is the silent truncation
+  // decision 5 exists to end.
+  let limited = false;
+  const budget = walkBudget((msg) => {
+    limited = true;
+    notes.push(msg);
+  });
+  const maxFileBytes = envLimit("GLM_MCP_MAX_FILE_BYTES", DEFAULT_MAX_FILE_BYTES);
 
   // Glob entries expand to the files they match, sorted and de-duplicated against
   // everything already listed; literal paths go through exactly as given. Every
@@ -177,35 +207,45 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       files.push({ p, via: p, resolved });
       continue;
     }
-    if (roots && patternAnchors(p, cwd).some((a) => !insideRoots(realpathish(a), roots))) {
-      notes.push(`refused: ${p} resolves outside the allowed roots`);
+    // Limits are notes, never throws — and that goes for hostile input this
+    // code has no specific rule for yet, not only for the rules it has. The
+    // brace cap (#17) is enforced inside patternAnchors and expandGlob on every
+    // route braces are expanded, so what this guard catches is the patterns
+    // nobody predicted; a caller still gets its other files either way.
+    try {
+      if (roots && patternAnchors(p, cwd, budget).some((a) => !insideRoots(realpathish(a), roots))) {
+        notes.push(`refused: ${p} resolves outside the allowed roots`);
+        continue;
+      }
+      // A directory the walk prunes for leaving the roots is a refusal like any
+      // other: expandGlob reports each reported path once, with the spelling a
+      // match would carry, so the note names both it and the pattern that
+      // reached it.
+      let refusedMatch = false;
+      const matches = expandGlob(p, cwd, roots ?? undefined, (refused) => {
+        refusedMatch = true;
+        notes.push(
+          `refused: ${refused} (matched by ${p}) resolves outside the allowed roots`,
+        );
+      }, budget);
+      if (matches.length === 0) {
+        // Refused is not the same as absent: a pattern whose matches were all
+        // stopped at the boundary — or cut short by a limit — must not also be
+        // filed under "no matches", which reads as a pattern that was simply
+        // wrong and contradicts the note beside it. Only a pattern that matched
+        // nothing, refused nothing and was limited by nothing says "no matches".
+        if (!refusedMatch && !limited) notes.push(`skipped (no matches): ${p}`);
+        continue;
+      }
+      for (const m of matches) {
+        const key = keyOf(m);
+        if (included.has(key)) continue;
+        included.add(key);
+        files.push({ p: m, via: p, resolved: key });
+      }
+    } catch (e) {
+      notes.push(`refused: ${p} (expansion failed: ${e instanceof Error ? e.message : String(e)})`);
       continue;
-    }
-    // A directory the walk prunes for leaving the roots is a refusal like any
-    // other: expandGlob reports each reported path once, with the spelling a
-    // match would carry, so the note names both it and the pattern that
-    // reached it.
-    let refusedMatch = false;
-    const matches = expandGlob(p, cwd, roots ?? undefined, (refused) => {
-      refusedMatch = true;
-      notes.push(
-        `refused: ${refused} (matched by ${p}) resolves outside the allowed roots`,
-      );
-    });
-    if (matches.length === 0) {
-      // Refused is not the same as absent: a pattern whose matches were all
-      // stopped at the boundary must not also be filed under "no matches",
-      // which reads as a pattern that was simply wrong — and contradicts the
-      // refusal note beside it. Only a pattern that matched nothing and
-      // refused nothing says "no matches".
-      if (!refusedMatch) notes.push(`skipped (no matches): ${p}`);
-      continue;
-    }
-    for (const m of matches) {
-      const key = keyOf(m);
-      if (included.has(key)) continue;
-      included.add(key);
-      files.push({ p: m, via: p, resolved: key });
     }
   }
 
@@ -221,31 +261,68 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       continue;
     }
     const abs = resolve(cwd, p);
-    if (!existsSync(abs)) {
+    // stat BEFORE reading (#15): the size is known before a byte of the file is
+    // materialised, which is the difference between bounding a read and paying
+    // for it first. stat follows symlinks, so the kind and size are the
+    // target's own — a link cannot pose as a small regular file.
+    let st;
+    try {
+      st = statSync(abs);
+    } catch {
       notes.push(`skipped (not found): ${p}`);
+      continue;
+    }
+    // Regular files only (#15): a FIFO blocks the read forever, a device like
+    // /dev/zero is infinitely long, and neither has a size worth capping. The
+    // refusal is a note like any other — a FIFO among ten good files must not
+    // take them down with it.
+    const matchedBy = via === p ? "" : ` (matched by ${via})`;
+    if (!st.isFile()) {
+      notes.push(`refused (not a regular file): ${p}${matchedBy}`);
+      continue;
+    }
+    if (st.size > maxFileBytes) {
+      notes.push(
+        `refused (too large): ${p}${matchedBy} is ${st.size} bytes, over the ` +
+          `GLM_MCP_MAX_FILE_BYTES limit of ${maxFileBytes}`,
+      );
       continue;
     }
     let body: string;
     try {
       body = readFileSync(abs, "utf8");
-    } catch (e) {
+    } catch {
       notes.push(`skipped (unreadable): ${p}`);
       continue;
     }
-    if (total + body.length > MAX_FILE_CHARS) {
-      const room = Math.max(0, MAX_FILE_CHARS - total);
+    // #19: the header and the separator count toward the cap with the body, so
+    // 300 empty files cannot produce a five-figure prompt under an
+    // 800,000-char "cap" with no note. `total` is the assembled length so far,
+    // separators included, which is what makes text.length ≤ MAX honest.
+    const header = `--- ${p} ---\n`;
+    const sep = chunks.length > 0 ? "\n\n" : "";
+    const overhead = (sep ? 2 : 0) + header.length;
+    if (total + overhead + body.length > MAX_FILE_CHARS) {
+      // The marker makes the truncated header longer than the plain one, so the
+      // room left is measured against the header that will actually be pushed —
+      // a budget that quietly grows to fit its own bookkeeping is not a budget.
+      const theader = `--- ${p} (truncated) ---\n`;
+      const room = MAX_FILE_CHARS - total - (sep ? 2 : 0) - theader.length;
       if (room > 0) {
-        chunks.push(`--- ${p} (truncated) ---\n${body.slice(0, room)}`);
-        total += room;
+        const taken = takeUnits(body, room);
+        chunks.push(`${sep}${theader}${taken}`);
+        total += (sep ? 2 : 0) + theader.length + taken.length;
       }
       notes.push(`truncated at ${MAX_FILE_CHARS} total chars starting with: ${p}`);
       break;
     }
-    chunks.push(`--- ${p} ---\n${body}`);
-    total += body.length;
+    chunks.push(`${sep}${header}${body}`);
+    total += overhead + body.length;
   }
 
-  return { text: chunks.join("\n\n"), notes, refusedCall: false };
+  // The separators were budgeted per chunk above, so joining is the identity:
+  // `total` and text.length agree by construction.
+  return { text: chunks.join(""), notes, refusedCall: false };
 }
 
 export interface AskArgs {
