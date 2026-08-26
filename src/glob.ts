@@ -1,5 +1,6 @@
 import { readdirSync, statSync, type Dirent } from "node:fs";
 import { join, resolve } from "node:path";
+import { insideRoots, realpathish } from "./confine.js";
 
 /**
  * Glob expansion for the `files` argument of glm_ask.
@@ -187,14 +188,46 @@ function literalName(seg: string): string | undefined {
  * spells their name out as a segment, which reads as the caller asking for
  * them deliberately. The same explicitness decides symlinked directories: a
  * segment that names one is followed, a wildcard that merely matches it is not.
+ *
+ * `roots`, when given, confines the expansion: a base directory whose realpath
+ * leaves the roots is never walked, and no directory whose realpath leaves
+ * them is descended into. Containment stops the walk rather than only the
+ * read, so a pattern rooted at the top of the volume cannot traverse it before
+ * its matches are refused one by one. Without `roots` the expansion is
+ * unconfined, exactly as it was before confinement existed.
  */
-export function expandGlob(pattern: string, cwd: string): string[] {
+export function expandGlob(pattern: string, cwd: string, roots?: string[]): string[] {
   const found = new Set<string>();
-  for (const p of expandBraces(pattern)) collect(p, cwd, found);
+  for (const p of expandBraces(pattern)) collect(p, cwd, found, roots ?? null);
   return [...found].sort();
 }
 
-function collect(pattern: string, cwd: string, found: Set<string>): void {
+/**
+ * The directory a pattern's expansion is anchored at: its leading literal
+ * segments — `.` and `..` included — resolved against `cwd`, or against the
+ * pattern's own root when it is absolute. A fully literal pattern anchors at
+ * the file it names. buildFileContext checks this before expanding so a
+ * pattern rooted outside the confinement roots is refused before any walking
+ * happens; it says where a walk would start, not what it would match.
+ */
+export function patternAnchor(pattern: string, cwd: string): string {
+  return anchorOf(pattern, cwd)?.base ?? resolve(cwd, pattern);
+}
+
+/** Everything `collect` needs to know about where a pattern is anchored. */
+interface Anchor {
+  /** The walk's start directory, leading literal segments resolved. */
+  base: string;
+  /** Those segments as display text, kept for the paths that get emitted. */
+  prefix: string[];
+  /** The segments after the leading literal run — the ones matched by walk. */
+  rest: string[];
+  /** `C:/`, `//` or `/` for absolute patterns; "" for relative ones. */
+  root: string;
+}
+
+/** Resolve a pattern's leading literal run into the anchor its walk starts from. */
+function anchorOf(pattern: string, cwd: string): Anchor | null {
   // On Windows a drive prefix (`C:/repo`) or a UNC one (`//server/share`)
   // spells an absolute pattern as surely as a leading `/` does. Only the
   // forward-slash forms are honoured: a backslashed pattern is a native path,
@@ -206,7 +239,7 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
   const absolute = pattern.startsWith("/") || drive !== null || unc;
 
   const segments = (drive ? drive[2] : pattern).split("/").filter((s) => s.length > 0);
-  if (segments.length === 0) return;
+  if (segments.length === 0) return null;
 
   // Every emitted path grows this root — `C:/`, `//`, `/`, or nothing at all
   // for a relative pattern — and the walk is anchored at the same text.
@@ -232,14 +265,29 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
     }
     base = resolve(base, name);
   }
+  return { base, prefix, rest: segments.slice(first), root };
+}
+
+function collect(pattern: string, cwd: string, found: Set<string>, roots: string[] | null): void {
+  const anchor = anchorOf(pattern, cwd);
+  if (anchor === null) return; // a bare root ("/", "C:/") names no segment to match
+  const { base, prefix, rest, root } = anchor;
   const start = prefix.join("/");
+
+  // Containment stops the walk, not only the read (#13/#14): a base whose
+  // realpath leaves the roots is never entered, so an absolute pattern is
+  // refused where it starts instead of traversing the volume to be refused
+  // match by match. buildFileContext has already said why in notes by the time
+  // it gets here; this is the same rule enforced where the walking happens.
+  if (roots && !insideRoots(realpathish(base), roots)) return;
+
   const emit = (rel: string) => {
     found.add(root + rel);
   };
 
   // A pattern that stays literal the whole way through names a single path:
   // one file, or nothing — directories are traversed, never listed.
-  if (first === segments.length) {
+  if (rest.length === 0) {
     try {
       if (statSync(base).isFile()) emit(start);
     } catch {
@@ -248,7 +296,6 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
     return;
   }
 
-  const rest = segments.slice(first);
   const compiled: Segment[] = rest.map((s) => (s === "**" ? "**" : compileSegment(s)));
   // An ignored directory is entered only where the pattern spells its name out
   // as a whole segment: `node_modules/foo/**` is an explicit request, while the
@@ -257,6 +304,11 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
   const names: (string | undefined)[] = rest.map((s) => (s === "**" ? undefined : literalName(s)));
   const ignored = globIgnoreSet();
   const skip = (name: string, i: number) => ignored.has(name) && names[i] !== name;
+  // A directory the walk may enter. Under confinement a directory whose
+  // realpath leaves the roots is not descended into however it was matched —
+  // named literally by a segment, reached by a wildcard, or found by `**` —
+  // because resolving first is what closes the symlink escape.
+  const enterable = (dir: string): boolean => !roots || insideRoots(realpathish(dir), roots);
 
   const walk = (dir: string, rel: string, i: number): void => {
     const seg = compiled[i];
@@ -295,7 +347,9 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
         // Real directories only: a '**'-matched symlink could point anywhere,
         // including back up this very walk, and never terminate it.
         if (e.isDirectory()) {
-          if (!skip(e.name, i)) walk(join(dir, e.name), child(e.name), i);
+          if (!skip(e.name, i) && enterable(join(dir, e.name))) {
+            walk(join(dir, e.name), child(e.name), i);
+          }
         } else if (last && kind(e) === "file") emit(child(e.name));
       }
       return;
@@ -310,7 +364,8 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
         // A symlinked directory is descended into only where the segment
         // spells its name out — an explicit request, as with the ignore
         // bypass — never where a wildcard happened to match it.
-        if ((e.isDirectory() || names[i] === e.name) && !skip(e.name, i)) {
+        if ((e.isDirectory() || names[i] === e.name) && !skip(e.name, i)
+          && enterable(join(dir, e.name))) {
           walk(join(dir, e.name), child(e.name), i + 1);
         }
       }
