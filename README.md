@@ -93,13 +93,15 @@ Lists the model ids available on the configured account.
   expanded set and truncates with a note rather than failing. Missing or unreadable files are
   skipped and reported, not fatal.
 - Request timeout defaults to 10 minutes (`GLM_MCP_TIMEOUT_MS`).
+- Requests go to `https://api.z.ai/api/anthropic` unless `ZAI_BASE_URL` says otherwise —
+  your key is sent to whatever host it names, so only point it at endpoints you trust.
 - z.ai's coded errors are translated into actionable messages — `1113` (no balance),
   `1210` (reasoning required), `3007` (wrong credential type).
 
 ## Testing
 
 ```bash
-npm test               # unit tests for glob expansion (builds first)
+npm test               # unit tests for glob expansion and key resolution (builds first)
 npm run smoke          # drives the server over stdio as a real MCP client (needs a z.ai key)
 npm run verify:ignore  # acceptance gate for the glob ignore semantics
 ```

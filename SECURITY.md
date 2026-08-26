@@ -20,20 +20,25 @@ Worth stating plainly, since this server holds an API key:
 - **The key is read from the machine running the server**, in this order:
   `ZAI_API_KEY` → `~/.config/zai/api-key` → the key ZCode stores, and that last one only
   when `GLM_MCP_ALLOW_ZCODE_KEY=1` is explicitly set.
-- **It is never transmitted anywhere except z.ai.** The only outbound destinations in the
-  source are `https://api.z.ai/api/anthropic` and `https://api.z.ai/api/paas/v4/models`.
-  There is no telemetry and no phone-home.
+- **Where the key is sent.** Requests go to the configured z.ai endpoint:
+  `https://api.z.ai/api/anthropic` for the tools and
+  `https://api.z.ai/api/paas/v4/models` for the model list. `ZAI_BASE_URL` replaces that
+  destination — if you set it, your key is transmitted to whatever host it names, so only
+  point it at endpoints you trust. There is no telemetry and no phone-home beyond the
+  configured endpoint.
 - **Your key, your account, your billing.** Nothing routes through the maintainer.
 
 ## Supply chain
 
-Releases are published from CI using npm trusted publishing (OIDC). There is no long-lived
-npm token. Every release carries [provenance](https://docs.npmjs.com/generating-provenance-statements),
-which cryptographically ties the published tarball to this repository and the workflow that
-built it, and each release must be approved by a maintainer with 2FA before it becomes
-installable.
+This repository holds no npm token or any other publish credential, and nothing in a
+checkout needs one to build or test. The published tarball is limited by `package.json`'s
+`files` list to the compiled JavaScript, the README and the licence, and installing it runs
+no repository code.
 
-If you are auditing a release, check that its provenance points at this repository.
+Release publishing is moving to CI with npm trusted publishing (OIDC), provenance
+statements and a maintainer approval step; until that workflow is merged, releases carry
+no provenance to audit — compare a tarball's contents against the `files` list instead.
+Once provenance is being published, check that it points at this repository.
 
 ## Scope
 
