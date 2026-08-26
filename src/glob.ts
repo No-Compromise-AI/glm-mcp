@@ -202,7 +202,10 @@ function literalName(seg: string): string | undefined {
  * reads as complete — the silent narrowing decision 1 rules out — and what it
  * would be hiding is a hostile symlink. The same directory can be reached by
  * several routes (`**` more than once, or one brace branch per route), so it is
- * reported once per expansion, not once per route.
+ * reported once per expansion, not once per route. Once means by identity, not
+ * by spelling: an absolute branch prefixes what a relative one leaves bare, so
+ * the de-duplication key is the directory's resolved path — the same value the
+ * containment check compared — and the first route's spelling is the one kept.
  */
 export function expandGlob(
   pattern: string,
@@ -212,9 +215,9 @@ export function expandGlob(
 ): string[] {
   const found = new Set<string>();
   const said = new Set<string>();
-  const refuse = onRefused === undefined ? undefined : (p: string) => {
-    if (said.has(p)) return;
-    said.add(p);
+  const refuse = onRefused === undefined ? undefined : (p: string, key: string) => {
+    if (said.has(key)) return;
+    said.add(key);
     onRefused(p);
   };
   for (const p of expandBraces(pattern)) collect(p, cwd, found, roots ?? null, refuse);
@@ -303,7 +306,7 @@ function collect(
   cwd: string,
   found: Set<string>,
   roots: string[] | null,
-  onRefused?: (refused: string) => void,
+  onRefused?: (refused: string, key: string) => void,
 ): void {
   const anchor = anchorOf(pattern, cwd);
   if (anchor === null) return; // a bare root ("/", "C:/") names no segment to match
@@ -346,10 +349,14 @@ function collect(
   // because resolving first is what closes the symlink escape. Refusing one
   // is reported through `onRefused` with the same spelling a match would
   // carry, so a pruned directory becomes the caller's note instead of
-  // context that quietly narrows.
+  // context that quietly narrows. The resolved path rides along as the
+  // de-duplication key: routes that spell one directory differently must
+  // still be speaking about it once.
   const enterable = (dir: string, rel: string): boolean => {
-    if (!roots || insideRoots(realpathish(dir), roots)) return true;
-    onRefused?.(rel);
+    if (!roots) return true;
+    const real = realpathish(dir);
+    if (insideRoots(real, roots)) return true;
+    onRefused?.(rel, real);
     return false;
   };
 

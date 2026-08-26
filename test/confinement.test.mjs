@@ -453,6 +453,36 @@ test('expandGlob does not descend into a directory whose realpath leaves the roo
   );
 });
 
+test('a pruned directory is refused once however its routes spell it', (t) => {
+  pin(t, { roots: A });
+  // `{A/**,**}` meets the same hostile symlink twice: the absolute branch
+  // reports it with the whole prefix attached, the relative branch bare — two
+  // spellings of one directory. De-duplication keys on the directory's
+  // resolved identity (the value the containment check itself compared), not
+  // on the display string a route happened to emit, so the sink fires once.
+  const refused = [];
+  expandGlob(`{${A}/**,**}/docs/*.txt`, A, [A], (r) => refused.push(r));
+  assert.equal(refused.length, 1, JSON.stringify(refused));
+
+  // The joined spellings can differ even when the rels match: a cwd reached
+  // through the /var -> /private/var prefix link anchors the relative branch
+  // somewhere the absolute branch never spells. One identity, one note still.
+  const throughPrefix = [];
+  expandGlob(`{${A}/**,**}/docs/*.txt`, join(RAW, 'rootA'), [A], (r) => throughPrefix.push(r));
+  assert.equal(throughPrefix.length, 1, JSON.stringify(throughPrefix));
+
+  // And through buildFileContext the caller sees one refusal, not a pair that
+  // reads as two hostile links where there is one.
+  const ctx = buildFileContext([`{${A}/**,**}/docs/*.txt`], A);
+  assert.ok(!ctx.text.includes('DEEP_SECRET'), JSON.stringify(ctx.notes));
+  assert.ok(ctx.text.includes('HONEST-DOCS'), JSON.stringify(ctx.notes));
+  assert.equal(
+    ctx.notes.filter((n) => /refused/.test(n) && n.includes('docs')).length,
+    1,
+    JSON.stringify(ctx.notes),
+  );
+});
+
 test('an in-root symlinked directory is still descended when a segment names it', (t) => {
   // Containment is additional to the #3 rules, not a replacement for them.
   symlinkSync(at('rootA/src'), at('rootA/srclink'), 'dir');
