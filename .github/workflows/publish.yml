@@ -1,0 +1,88 @@
+# Publishes to npm using trusted publishing (OIDC). No NPM_TOKEN exists anywhere:
+# authentication is a short-lived token minted per run, and provenance is generated
+# automatically — cryptographic proof the tarball was built from this repo.
+#
+# This STAGES the release. Nothing reaches a user's machine until a maintainer
+# approves it with 2FA. That human gate is the last line of defence if everything
+# upstream is compromised.
+#
+# The trusted publisher on npmjs.com is bound to this file's NAME. Renaming this
+# file breaks publishing until that setting is updated to match.
+#
+# SECURITY: the credentialed job never runs repository code. `npm ci` executes the
+# `prepare` lifecycle script, so running it in a job holding `id-token: write` would
+# let a merged change to `prepare` mint an OIDC token and publish arbitrary content
+# before any validation. Build and verify happen unprivileged; the publish job only
+# uploads an artifact it did not build.
+name: publish
+
+on:
+  release:
+    types: [published]   # never on push or PR: a fork PR must not reach the publish path
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        node: ['20', '22', '24']   # 20 is the floor declared in engines
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm test
+      - run: npm run verify:ignore
+
+  build:
+    # Deliberately NO id-token here. This job runs repository code; it must not
+    # hold a credential while doing so.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+      - run: npm ci
+      - name: Fail if the release tag does not match package.json
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "release tag '$TAG' != package.json version '$PKG'" >&2
+            exit 1
+          fi
+      - run: npm pack
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tarball
+          path: '*.tgz'
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [test, build]   # nothing publishes unless the matrix is green and the tag matches
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write      # required to mint the OIDC token
+    steps:
+      # No checkout. This job must never execute repository code.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'      # trusted publishing needs >= 22.14
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm install -g npm@latest   # trusted publishing needs npm >= 11.5.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tarball
+      - name: Stage the prebuilt tarball
+        # --ignore-scripts: even the packaged artifact gets no lifecycle execution here.
+        run: npm stage publish ./*.tgz --ignore-scripts
