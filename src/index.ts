@@ -29,7 +29,10 @@ server.registerTool(
         .array(z.string())
         .optional()
         .describe(
-          "Optional file paths to include as context. Relative paths resolve against 'cwd'.",
+          "Optional files to include as context: literal paths and/or glob patterns " +
+            '(e.g. "src/**/*.ts"). Each glob expands to its matching files, sorted and ' +
+            "de-duplicated; a pattern that matches nothing is reported in the response notes. " +
+            "Relative paths resolve against 'cwd'.",
         ),
       cwd: z
         .string()

@@ -44,6 +44,19 @@ show(
 );
 
 show(
+  "glm_ask + glob file context",
+  await client.callTool({
+    name: "glm_ask",
+    arguments: {
+      cwd: root,
+      files: ["src/**/*.ts"],
+      prompt: "Name the files given above, comma separated.",
+      reasoning: "low",
+    },
+  }),
+);
+
+show(
   "reasoning:none auto-raised on glm-5.3",
   await client.callTool({
     name: "glm_ask",

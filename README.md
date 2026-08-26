@@ -52,7 +52,7 @@ Plan or credit on it.
 | arg | type | default | notes |
 | --- | --- | --- | --- |
 | `prompt` | string | — | required |
-| `files` | string[] | — | file paths to include as context |
+| `files` | string[] | — | files to include as context: literal paths and/or globs (`src/**/*.ts`, `*.md`, `{lib,src}/*.ts`) |
 | `cwd` | string | server cwd | what relative `files` resolve against |
 | `model` | string | `glm-5.3` | any id from `glm_models` |
 | `reasoning` | `none`\|`low`\|`high`\|`max` | `low` | higher is slower |
@@ -70,8 +70,15 @@ Lists the model ids available on the configured account.
   (`glm-5.2`, `glm-5-turbo`, `glm-4.6`, `glm-4.7`) have no such constraint.
 - Thinking budgets: `low` 2048, `high` 8192, `max` 24576 tokens. `max_tokens` is automatically
   raised to leave headroom for the answer on top of the budget.
-- File context is capped at 800,000 characters (`GLM_MCP_MAX_FILE_CHARS`) and truncates with a
-  note rather than failing. Missing or unreadable files are skipped and reported, not fatal.
+- File context accepts literal paths and glob patterns. Each glob expands to the files it
+  matches — sorted, de-duplicated, directories traversed but never listed, hidden (dot)
+  entries skipped unless the pattern spells the dot out. Supported syntax: `*`, `**`, `?`,
+  `[a-z]`/`[!a-z]`, `{a,b}` and `\` escapes. A pattern that matches nothing is reported in
+  `Notes`, exactly like a missing file. Globs do not descend through symlinked directories
+  (literal paths still follow symlinks).
+- File context is capped at 800,000 characters (`GLM_MCP_MAX_FILE_CHARS`) across the whole
+  expanded set and truncates with a note rather than failing. Missing or unreadable files are
+  skipped and reported, not fatal.
 - Request timeout defaults to 10 minutes (`GLM_MCP_TIMEOUT_MS`).
 - z.ai's coded errors are translated into actionable messages — `1113` (no balance),
   `1210` (reasoning required), `3007` (wrong credential type).
@@ -83,4 +90,5 @@ npm run smoke
 ```
 
 Drives the server over stdio as a real MCP client, covering the tool list, model list,
-reasoning, file context, the `none`-to-`low` correction, and missing-file handling.
+reasoning, file context, glob expansion, the `none`-to-`low` correction, and missing-file
+handling.

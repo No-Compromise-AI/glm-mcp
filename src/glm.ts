@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { expandGlob, isGlobPattern } from "./glob.js";
 
 export const DEFAULT_MODEL = "glm-5.3";
 export const BASE_URL = process.env.ZAI_BASE_URL ?? "https://api.z.ai/api/anthropic";
@@ -69,7 +70,30 @@ export function buildFileContext(paths: string[], cwd: string): { text: string; 
   const chunks: string[] = [];
   let total = 0;
 
+  // Glob entries expand to the files they match, sorted and de-duplicated against
+  // everything already listed; literal paths go through exactly as given.
+  const files: string[] = [];
+  const included = new Set<string>();
   for (const p of paths) {
+    if (!isGlobPattern(p)) {
+      included.add(resolve(cwd, p));
+      files.push(p);
+      continue;
+    }
+    const matches = expandGlob(p, cwd);
+    if (matches.length === 0) {
+      notes.push(`skipped (no matches): ${p}`);
+      continue;
+    }
+    for (const m of matches) {
+      const key = resolve(cwd, m);
+      if (included.has(key)) continue;
+      included.add(key);
+      files.push(m);
+    }
+  }
+
+  for (const p of files) {
     const abs = resolve(cwd, p);
     if (!existsSync(abs)) {
       notes.push(`skipped (not found): ${p}`);
