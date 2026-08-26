@@ -19,6 +19,29 @@ export function isGlobPattern(path: string): boolean {
 /** Escape a character so it matches literally inside a RegExp body. */
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+/** Directories glob expansion refuses to enter: dependencies, VCS state, build output. */
+const DEFAULT_GLOB_IGNORE = [
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  "coverage",
+  ".next",
+  ".turbo",
+  "vendor",
+  "target",
+];
+
+/**
+ * The ignore set for one expansion. GLM_MCP_GLOB_IGNORE (comma-separated) replaces
+ * the default set outright; an empty value ignores nothing.
+ */
+function globIgnoreSet(): Set<string> {
+  const raw = process.env.GLM_MCP_GLOB_IGNORE;
+  const names = raw === undefined ? DEFAULT_GLOB_IGNORE : raw.split(",");
+  return new Set(names.map((n) => n.trim()).filter((n) => n.length > 0));
+}
+
 /** Index of the `]` closing the class at `i`, or the end of `s` if it never closes. */
 function closeClass(s: string, i: number): number {
   let j = i + 1;
@@ -133,7 +156,9 @@ type Segment = RegExp | "**";
 /**
  * Expand one glob pattern against `cwd` into the files it matches, sorted.
  * Directories are traversed, never listed; a pattern is only reported when it
- * has matched at least one file.
+ * has matched at least one file. Ignored directories (see globIgnoreSet) are
+ * not entered — unless the pattern spells their name out as a segment, which
+ * reads as the caller asking for them deliberately.
  */
 export function expandGlob(pattern: string, cwd: string): string[] {
   const found = new Set<string>();
@@ -147,6 +172,12 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
   if (segments.length === 0) return;
 
   const compiled: Segment[] = segments.map((s) => (s === "**" ? "**" : compileSegment(s)));
+  // Segments without metacharacters are plain directory names, so an ignored
+  // directory the pattern itself names is still entered: `node_modules/foo/**`
+  // is an explicit request, not an accident of a wildcard.
+  const named = new Set(segments.filter((s) => !isGlobPattern(s)));
+  const ignored = globIgnoreSet();
+  const skip = (name: string) => ignored.has(name) && !named.has(name);
   const emit = (rel: string) => {
     found.add(absolute ? `/${rel}` : rel);
   };
@@ -172,8 +203,9 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
       for (const e of entries) {
         // '**' never spells a dot out, so hidden directories stay hidden.
         if (e.name.startsWith(".")) continue;
-        if (e.isDirectory()) walk(join(dir, e.name), child(e.name), i);
-        else if (last && isFile(e)) emit(child(e.name));
+        if (e.isDirectory()) {
+          if (!skip(e.name)) walk(join(dir, e.name), child(e.name), i);
+        } else if (last && isFile(e)) emit(child(e.name));
       }
       return;
     }
@@ -182,7 +214,7 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
       if (!seg.test(e.name)) continue;
       if (last) {
         if (isFile(e)) emit(child(e.name));
-      } else if (e.isDirectory()) {
+      } else if (e.isDirectory() && !skip(e.name)) {
         walk(join(dir, e.name), child(e.name), i + 1);
       }
     }

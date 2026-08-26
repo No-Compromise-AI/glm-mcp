@@ -76,6 +76,14 @@ Lists the model ids available on the configured account.
   `[a-z]`/`[!a-z]`, `{a,b}` and `\` escapes. A pattern that matches nothing is reported in
   `Notes`, exactly like a missing file. Globs do not descend through symlinked directories
   (literal paths still follow symlinks).
+- **Glob expansion skips dependency and output directories** — `node_modules`, `.git`,
+  `dist`, `build`, `coverage`, `.next`, `.turbo`, `vendor`, `target` — so `**/*.ts` matches
+  your source instead of 1,700 dependency type definitions crowding out the context budget.
+  This applies to glob expansion only; a literal path such as `node_modules/foo/x.d.ts` goes
+  through untouched. Naming a directory in the pattern itself also overrides the skip:
+  `node_modules/foo/**/*.d.ts` matches as expected, because the caller asked for it by name.
+  Set `GLM_MCP_GLOB_IGNORE` to a comma-separated list to **replace** the default set entirely
+  (e.g. `GLM_MCP_GLOB_IGNORE=dist,.venv`); an empty value disables the skipping.
 - File context is capped at 800,000 characters (`GLM_MCP_MAX_FILE_CHARS`) across the whole
   expanded set and truncates with a note rather than failing. Missing or unreadable files are
   skipped and reported, not fatal.
@@ -86,9 +94,11 @@ Lists the model ids available on the configured account.
 ## Testing
 
 ```bash
-npm run smoke
+npm run smoke          # drives the server over stdio as a real MCP client (needs a z.ai key)
+npm run verify:ignore  # asserts glob expansion skips node_modules but honours explicit patterns
 ```
 
-Drives the server over stdio as a real MCP client, covering the tool list, model list,
-reasoning, file context, glob expansion, the `none`-to-`low` correction, and missing-file
-handling.
+`smoke` covers the tool list, model list, reasoning, file context, glob expansion, the
+`none`-to-`low` correction, and missing-file handling. `verify:ignore` checks the ignore
+semantics: `**/*.ts` stays clean of `node_modules`, own source still matches, and an explicit
+`node_modules/...` pattern still matches.
