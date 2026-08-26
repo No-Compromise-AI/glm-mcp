@@ -35,6 +35,12 @@ for (const [pattern, expected, what] of [
 
 // Fixture tree for the dedupe, metacharacter and symlink cases.
 const root = mkdtempSync(join(tmpdir(), 'glm-globs-verify-'));
+// buildFileContext confines reads to the operator's roots, which default to the
+// server's own startup cwd — this repository when the gate runs. The fixture
+// tree lives under tmpdir, so the operator's side of the boundary has to name
+// it or every read below is correctly refused. Only the configuration is
+// declared here; every assertion is the one #3 settled.
+process.env.GLM_MCP_ROOTS = root;
 const put = (dir, name, body = 'x') => {
   mkdirSync(join(root, dir), { recursive: true });
   writeFileSync(join(root, dir, name), body);
@@ -122,6 +128,7 @@ try {
     const realPlatform = process.platform;
     const realCwd = process.cwd();
     const drive = mkdtempSync(join(tmpdir(), 'glm-globs-drive-verify-'));
+    process.env.GLM_MCP_ROOTS = `${root}:${drive}`;
     mkdirSync(join(drive, 'C:', 'repo', 'src'), { recursive: true });
     writeFileSync(join(drive, 'C:', 'repo', 'src', 'a.ts'), 'W');
     process.chdir(drive);

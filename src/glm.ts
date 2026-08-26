@@ -2,7 +2,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { readFileSync, existsSync, lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { expandGlob, isGlobPattern } from "./glob.js";
+import { expandGlob, isGlobPattern, patternAnchors } from "./glob.js";
+import { confineRoots, deniedCredentials, insideRoots, realpathish } from "./confine.js";
 
 export const DEFAULT_MODEL = "glm-5.3";
 export const BASE_URL = process.env.ZAI_BASE_URL ?? "https://api.z.ai/api/anthropic";
@@ -69,11 +70,47 @@ export function getClient(): Anthropic {
 
 const MAX_FILE_CHARS = Number(process.env.GLM_MCP_MAX_FILE_CHARS ?? 800_000);
 
-/** Read files into a single prompt block, guarding against blowing the context window. */
-export function buildFileContext(paths: string[], cwd: string): { text: string; notes: string[] } {
+export interface FileContext {
+  text: string;
+  notes: string[];
+  /**
+   * True when the whole call was refused because `cwd` resolved outside every
+   * root: nothing was read and `text` is empty. A refused path inside an
+   * otherwise-good call is a note, not a refused call — this flag is only for
+   * the caller choosing ground it was never allowed to stand on.
+   */
+  refusedCall: boolean;
+}
+
+/**
+ * Read files into a single prompt block, guarding against blowing the context
+ * window. Paths are confined to the operator's roots (see confine.ts): every
+ * file's realpath must land inside one, which is what closes the ../ and
+ * symlink escapes, and the server's own credentials are refused regardless of
+ * roots. A refused path is a note like any other — one bad entry must not
+ * fail a request that also names ten good files — so this never throws for a
+ * refusal. `cwd` outside every root is the one refusal that cannot proceed:
+ * narrowing it to a root would return an empty-but-successful read, the exact
+ * silent-failure shape this project has spent the most effort removing.
+ */
+export function buildFileContext(paths: string[], cwd: string): FileContext {
   const notes: string[] = [];
   const chunks: string[] = [];
   let total = 0;
+
+  const roots = confineRoots();
+  if (roots && !insideRoots(realpathish(cwd), roots)) {
+    return {
+      text: "",
+      notes: [
+        `refused: cwd ${cwd} resolves outside the allowed roots; the call was not executed`,
+      ],
+      refusedCall: true,
+    };
+  }
+  // Decision 3 is unconditional — GLM_MCP_ALLOW_ANY_PATH widens the roots, it
+  // does not re-open the server's own credentials.
+  const denied = deniedCredentials();
 
   // Glob entries expand to the files they match, sorted and de-duplicated against
   // everything already listed; literal paths go through exactly as given. Every
@@ -105,31 +142,84 @@ export function buildFileContext(paths: string[], cwd: string): { text: string; 
       return false;
     }
   };
-  const files: string[] = [];
+  // `resolved` is the on-disk identity the dedupe and the boundary share, so
+  // containment costs one comparison on a value already computed. `via` keeps
+  // the caller's own spelling for the entry — an argument it sent — so refusal
+  // notes name which of its arguments was dropped, never a resolved path that
+  // would widen what notes already disclose.
+  const files: Array<{ p: string; via: string; resolved: string }> = [];
   const included = new Set<string>();
   for (const p of paths) {
-    if (!isGlobPattern(p) || namesSomething(p)) {
-      const key = keyOf(p);
-      if (!included.has(key)) {
-        included.add(key);
-        files.push(p);
-      }
+    // The credential rule runs before any existence check (decision 3), so
+    // /proc/self/environ is reported as refused, not missing, where it does
+    // not exist. A path that exists on disk is then read literally — judged
+    // by the file's own resolved identity, never by where a pattern reading
+    // of its metacharacters would anchor, because report[final].md and
+    // {..,safe} exist as themselves before they exist as patterns (#3). Only
+    // a genuine pattern is judged by its brace branches' anchors — refusing
+    // a pattern before it walks is what keeps an absolute pattern from
+    // traversing the volume first, and each expansion is probed on its own
+    // because the anchor of a brace pattern as written is the anchor of none
+    // of its branches.
+    const resolved = keyOf(p);
+    if (denied.has(resolved)) {
+      notes.push(`refused (credential path): ${p}`);
       continue;
     }
-    const matches = expandGlob(p, cwd);
+    if (!isGlobPattern(p) || namesSomething(p)) {
+      if (included.has(resolved)) continue;
+      if (roots && !insideRoots(resolved, roots)) {
+        notes.push(`refused: ${p} resolves outside the allowed roots`);
+        included.add(resolved);
+        continue;
+      }
+      included.add(resolved);
+      files.push({ p, via: p, resolved });
+      continue;
+    }
+    if (roots && patternAnchors(p, cwd).some((a) => !insideRoots(realpathish(a), roots))) {
+      notes.push(`refused: ${p} resolves outside the allowed roots`);
+      continue;
+    }
+    // A directory the walk prunes for leaving the roots is a refusal like any
+    // other: expandGlob reports each reported path once, with the spelling a
+    // match would carry, so the note names both it and the pattern that
+    // reached it.
+    let refusedMatch = false;
+    const matches = expandGlob(p, cwd, roots ?? undefined, (refused) => {
+      refusedMatch = true;
+      notes.push(
+        `refused: ${refused} (matched by ${p}) resolves outside the allowed roots`,
+      );
+    });
     if (matches.length === 0) {
-      notes.push(`skipped (no matches): ${p}`);
+      // Refused is not the same as absent: a pattern whose matches were all
+      // stopped at the boundary must not also be filed under "no matches",
+      // which reads as a pattern that was simply wrong — and contradicts the
+      // refusal note beside it. Only a pattern that matched nothing and
+      // refused nothing says "no matches".
+      if (!refusedMatch) notes.push(`skipped (no matches): ${p}`);
       continue;
     }
     for (const m of matches) {
       const key = keyOf(m);
       if (included.has(key)) continue;
       included.add(key);
-      files.push(m);
+      files.push({ p: m, via: p, resolved: key });
     }
   }
 
-  for (const p of files) {
+  for (const { p, via, resolved } of files) {
+    // Re-checked at read time because a glob match may be a symlink whose
+    // target leaves the roots only once resolved; the anchor could not see it.
+    if (denied.has(resolved)) {
+      notes.push(`refused (credential path): ${p}${via === p ? "" : ` (matched by ${via})`}`);
+      continue;
+    }
+    if (roots && !insideRoots(resolved, roots)) {
+      notes.push(`refused: ${p}${via === p ? "" : ` (matched by ${via})`} resolves outside the allowed roots`);
+      continue;
+    }
     const abs = resolve(cwd, p);
     if (!existsSync(abs)) {
       notes.push(`skipped (not found): ${p}`);
@@ -155,7 +245,7 @@ export function buildFileContext(paths: string[], cwd: string): { text: string; 
     total += body.length;
   }
 
-  return { text: chunks.join("\n\n"), notes };
+  return { text: chunks.join("\n\n"), notes, refusedCall: false };
 }
 
 export interface AskArgs {

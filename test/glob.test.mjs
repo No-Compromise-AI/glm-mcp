@@ -110,6 +110,11 @@ const occurrences = (ctx, marker) => ctx.text.split(marker).length - 1;
 before(() => {
   delete process.env.GLM_MCP_GLOB_IGNORE;
   fx = mkdtempSync(join(tmpdir(), 'glm-glob-issue3-'));
+  // The reads below go through buildFileContext, which confines to the
+  // operator's roots — by default the process's own startup cwd, this
+  // repository. The fixture is under tmpdir, so the root is declared over it.
+  // Configuration only: every assertion is unchanged from #3.
+  process.env.GLM_MCP_ROOTS = fx;
   const put = (dir, name, body = 'x') => {
     mkdirSync(join(fx, dir), { recursive: true });
     writeFileSync(join(fx, dir, name), body);
@@ -134,7 +139,10 @@ before(() => {
   symlinkSync(join(fx, 'src'), join(fx, 'dirlink'), 'dir');
   symlinkSync(join(fx, 'src', 'a.ts'), join(fx, 'filelink'), 'file');
 });
-after(() => rmSync(fx, { recursive: true, force: true }));
+after(() => {
+  delete process.env.GLM_MCP_ROOTS;
+  rmSync(fx, { recursive: true, force: true });
+});
 
 test('a ./ prefix resolves against the expansion cwd', () => {
   const expected = ['src/a.ts', 'src/b.ts', 'src/glm.ts'];

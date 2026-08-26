@@ -64,6 +64,21 @@ server.registerTool(
       if (files?.length) {
         const ctx = buildFileContext(files, cwd ?? process.cwd());
         notes.push(...ctx.notes);
+        // A refused call read nothing. Sending the prompt anyway would answer
+        // the question with none of the material it asked about — a silent
+        // failure wearing a success — so the refusal is the whole result and
+        // GLM is never asked.
+        if (ctx.refusedCall) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: `Refused: no file context was read.\n\n${ctx.notes.join("; ")}`,
+              },
+            ],
+          };
+        }
         if (ctx.text) finalPrompt = `${ctx.text}\n\n---\n\n${prompt}`;
       }
 
