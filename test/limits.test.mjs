@@ -407,7 +407,10 @@ test('a character device is refused as not a regular file', (t) => {
 });
 
 test('a unix socket is refused as not a regular file, its neighbour survives', (t) => {
-  if (socketError) t.skip(`could not create one here: ${socketError.code ?? socketError.message}`);
+  if (socketError) {
+    t.skip(`could not create one here: ${socketError.code ?? socketError.message}`);
+    return;
+  }
   let r;
   try {
     r = childCtx(t, { paths: ['the-sock', 'small.txt'], timeoutMs: 8_000 });
