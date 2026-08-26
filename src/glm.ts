@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { readFileSync, existsSync, lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { expandGlob, isGlobPattern, patternAnchor } from "./glob.js";
+import { expandGlob, isGlobPattern, patternAnchors } from "./glob.js";
 import { confineRoots, deniedCredentials, insideRoots, realpathish } from "./confine.js";
 
 export const DEFAULT_MODEL = "glm-5.3";
@@ -98,7 +98,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   const chunks: string[] = [];
   let total = 0;
 
-  const roots = confineRoots(cwd);
+  const roots = confineRoots();
   if (roots && !insideRoots(realpathish(cwd), roots)) {
     return {
       text: "",
@@ -154,13 +154,16 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     // /proc/self/environ is reported as refused, not missing, where it does
     // not exist. Containment probes where a literal resolves to or a pattern's
     // walk would be anchored — refusing a pattern before it walks is what
-    // keeps an absolute pattern from traversing the volume first.
+    // keeps an absolute pattern from traversing the volume first. Each brace
+    // expansion is probed on its own, because the anchor of a brace pattern as
+    // written is the anchor of none of its branches, and a branch that leaves
+    // the roots would otherwise vanish inside expandGlob without a word.
     const resolved = keyOf(p);
     if (denied.has(resolved)) {
       notes.push(`refused (credential path): ${p}`);
       continue;
     }
-    if (roots && !insideRoots(realpathish(patternAnchor(p, cwd)), roots)) {
+    if (roots && patternAnchors(p, cwd).some((a) => !insideRoots(realpathish(a), roots))) {
       notes.push(`refused: ${p} resolves outside the allowed roots`);
       continue;
     }

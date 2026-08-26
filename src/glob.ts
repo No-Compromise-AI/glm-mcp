@@ -214,6 +214,17 @@ export function patternAnchor(pattern: string, cwd: string): string {
   return anchorOf(pattern, cwd)?.base ?? resolve(cwd, pattern);
 }
 
+/**
+ * The anchors of every walk `pattern` would start, one per brace expansion.
+ * buildFileContext checks these before expanding so a branch that escapes the
+ * roots is refused up front — with braces, the anchor of the pattern as written
+ * is the anchor of none of its branches, and the branch that leaves the roots
+ * would otherwise vanish inside `collect` without a word.
+ */
+export function patternAnchors(pattern: string, cwd: string): string[] {
+  return [...new Set(expandBraces(pattern).map((p) => patternAnchor(p, cwd)))];
+}
+
 /** Everything `collect` needs to know about where a pattern is anchored. */
 interface Anchor {
   /** The walk's start directory, leading literal segments resolved. */

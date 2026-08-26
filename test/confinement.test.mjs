@@ -6,13 +6,16 @@
 // can tell which of its arguments was dropped.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import {
   mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, realpathSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { buildFileContext } from '../dist/glm.js';
-import { expandGlob, patternAnchor } from '../dist/glob.js';
+import { expandGlob, patternAnchor, patternAnchors } from '../dist/glob.js';
+import { insideRoots, splitRoots } from '../dist/confine.js';
 
 // mkdtemp lands under a symlinked prefix on macOS (/var -> /private/var), so
 // RAW is the spelling an operator would paste into GLM_MCP_ROOTS and ROOT is
@@ -73,6 +76,10 @@ before(() => {
   put('rootB/b.txt', 'BBB-IN-ROOT-B');
   put('rootC/c.txt', 'CCC-IN-ROOT-C');
   put('rootA-evil/e.txt', 'EVIL-SIBLING-PREFIX');
+  // A directory tree a `C:/…`-spelled root can be anchored at: on Windows that
+  // is a drive, off Windows a directory literally named `C:`. Off Windows the
+  // spelling is relative, so the test that uses it chdirs into the fixture.
+  put('C:/repo/drive.txt', 'DRIVE-LOOKING-ROOT-BODY');
   put('outside/secret.env', 'TOPSECRET=hunter2');
   put('outside/secret.md', 'PRIVATE_KEY_MATERIAL=leaked');
   put('outside/secretdir/leak.txt', 'DEEP_SECRET=exfiltrated');
@@ -158,14 +165,86 @@ test('a root is resolved before comparison: through a symlink, with a trailing s
   assert.ok(buildFileContext(['a.txt'], A).text.includes('AAA-IN-ROOT-A'));
 });
 
-test('with GLM_MCP_ROOTS unset the call cwd is the boundary', (t) => {
-  pin(t); // no roots: confine to the cwd the call resolves against
-  const inside = buildFileContext(['a.txt', 'src/one.ts'], A);
-  assert.ok(inside.text.includes('AAA-IN-ROOT-A'));
-  assert.deepEqual(inside.notes, []);
-  const outside = buildFileContext(['../outside/secret.env'], A);
-  assert.ok(!outside.text.includes('TOPSECRET'));
-  assert.ok(refusedNote(outside, '../outside/secret.env'), JSON.stringify(outside.notes));
+// A colon that carries a drive prefix (`C:/repo`, `C:\repo`) is the only way to
+// spell a root on Windows, and the globber already treats `C:/…` patterns as
+// absolute there — so it must survive the colon that separates roots. Off
+// Windows the same spelling is a directory named `C:`, and it must survive too.
+test('GLM_MCP_ROOTS splits on colons but keeps drive prefixes whole', () => {
+  assert.deepEqual(splitRoots('C:/repo'), ['C:/repo']);
+  assert.deepEqual(splitRoots('C:\\repo'), ['C:\\repo']);
+  assert.deepEqual(splitRoots('C:'), ['C:']);
+  assert.deepEqual(splitRoots('C:/a:C:/b'), ['C:/a', 'C:/b']);
+  // Every colon that is not a drive prefix still separates, as before —
+  // including a root whose final segment is a single letter, the POSIX shape
+  // (/mnt/c, /mnt/d) that looks most like a drive and must not merge.
+  assert.deepEqual(splitRoots('/srv/a:/srv/b'), ['/srv/a', '/srv/b']);
+  assert.deepEqual(splitRoots('/mnt/c:/mnt/d'), ['/mnt/c', '/mnt/d']);
+  assert.deepEqual(splitRoots(`${A}:${B}`), [A, B]);
+  assert.deepEqual(splitRoots(' /srv/a : /srv/b '), ['/srv/a', '/srv/b']);
+  assert.deepEqual(splitRoots('/srv/a:C'), ['/srv/a', 'C']); // a lone root still ends there
+  assert.deepEqual(splitRoots(''), []);
+  assert.deepEqual(splitRoots('::'), []);
+});
+
+test('a drive-letter root is one root, not two', (t) => {
+  // `C:/repo` is how a Windows operator must spell a root. Off Windows the same
+  // spelling is relative, so the process stands in the fixture to resolve it —
+  // the same trick glob.test.mjs uses for its drive patterns.
+  if (process.platform === 'win32') t.skip('covered by splitRoots here: C:/ would name the real drive');
+  const realCwd = process.cwd();
+  process.chdir(ROOT);
+  t.after(() => process.chdir(realCwd));
+  pin(t, { roots: 'C:/repo' });
+  const ctx = buildFileContext(['drive.txt'], at('C:/repo'));
+  assert.ok(ctx.text.includes('DRIVE-LOOKING-ROOT-BODY'), JSON.stringify(ctx.notes));
+  assert.deepEqual(ctx.notes, []);
+});
+
+// The default boundary is read from the process's own working directory when
+// the module loads — the only honest way to test it is a child process started
+// in the directory that should be the root, since env and cwd have to be set
+// before the module loads to be tested at all (the acceptance gate does the
+// same). The child runs both calls so the two share one startup cwd.
+const CHILD = `
+import { buildFileContext } from ${JSON.stringify(pathToFileURL(new URL('../dist/glm.js', import.meta.url).pathname).href)};
+const one = (paths, cwd) => {
+  const r = buildFileContext(paths, cwd);
+  return { leaked: r.text.includes('TOPSECRET=hunter2'), notes: r.notes, refusedCall: r.refusedCall === true };
+};
+process.stdout.write(JSON.stringify({
+  standing: one(['a.txt'], process.argv[1]),
+  elsewhere: one(['secret.env'], process.argv[2]),
+}));
+`;
+
+test('with GLM_MCP_ROOTS unset the boundary is the startup cwd, not the caller’s cwd', (t) => {
+  pin(t); // no roots, no escape hatch: the default boundary
+  const out = JSON.parse(execFileSync(
+    process.execPath,
+    ['--input-type=module', '-e', CHILD, A, at('outside')],
+    { cwd: A, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+  ));
+  // Standing where the process started: readable, no notes.
+  assert.equal(out.standing.refusedCall, false, JSON.stringify(out.standing));
+  assert.equal(out.standing.notes.length, 0, JSON.stringify(out.standing));
+  // Naming /etc (or any directory) as `cwd` must not move the boundary there:
+  // the call is refused outright rather than answered from the caller's ground.
+  assert.equal(out.elsewhere.refusedCall, true, JSON.stringify(out.elsewhere));
+  assert.equal(out.elsewhere.leaked, false, JSON.stringify(out.elsewhere));
+  assert.ok(refusedNote(out.elsewhere, at('outside'), 'cwd'), JSON.stringify(out.elsewhere.notes));
+});
+
+test('a caller-chosen cwd cannot widen the default boundary in-process either', (t) => {
+  pin(t); // no roots: the boundary is this process's own startup cwd
+  // Skipped only where the fixture happens to live inside the process's own
+  // working directory (TMPDIR inside the checkout); there the call is legal.
+  const own = realpathSync.native(process.cwd());
+  if (insideRoots(realpathSync.native(at('outside')), [own])) t.skip('fixture is inside the process cwd');
+  const ctx = buildFileContext(['secret.env'], at('outside'));
+  assert.equal(ctx.refusedCall, true);
+  assert.equal(ctx.text, '');
+  assert.ok(!ctx.text.includes('TOPSECRET'));
+  assert.ok(refusedNote(ctx, at('outside'), 'cwd'), JSON.stringify(ctx.notes));
 });
 
 test('a cwd outside every root refuses the call outright', (t) => {
@@ -254,6 +333,49 @@ test('a pattern anchored at an escaping directory symlink is refused before it w
   const ctx = buildFileContext(['docs/**/*.txt'], A);
   assert.ok(!ctx.text.includes('DEEP_SECRET'));
   assert.ok(refusedNote(ctx, 'docs'), JSON.stringify(ctx.notes));
+});
+
+// Braces are expanded before the anchor is judged: the anchor of `{a,b}` as
+// written is the anchor of neither branch, so a branch that escapes would
+// otherwise be dropped inside expandGlob with no note at all — the silent
+// narrowing decision 1 exists to prevent.
+test('a brace branch that escapes the roots is refused, not silently dropped', (t) => {
+  pin(t, { roots: A });
+  // One branch in root, one out: the entry is refused and says so, rather than
+  // reading the in-root branch and reporting nothing about the other.
+  const mixed = buildFileContext(['{a.txt,../outside/secret.env}'], A);
+  assert.ok(!mixed.text.includes('TOPSECRET'), JSON.stringify(mixed.notes));
+  assert.ok(!mixed.text.includes('AAA-IN-ROOT-A'), 'the whole entry is refused, not half-read');
+  assert.ok(refusedNote(mixed, '{a.txt,../outside/secret.env}'), JSON.stringify(mixed.notes));
+  assert.equal(mixed.refusedCall, false);
+
+  // A single-member brace whose branch escapes must be called a refusal, not
+  // "skipped (no matches)" — a refusal that depends on how many branches the
+  // pattern happened to have is not a reportable boundary.
+  const alone = buildFileContext(['{../outside/secret.env}'], A);
+  assert.ok(!alone.text.includes('TOPSECRET'));
+  assert.ok(refusedNote(alone, '{../outside/secret.env}'), JSON.stringify(alone.notes));
+  assert.ok(!alone.notes.some((n) => n.includes('skipped (no matches)')), JSON.stringify(alone.notes));
+
+  // An absolute branch, the form a caller is most likely to reach for.
+  const absolute = buildFileContext([`{src/one.ts,${at('outside/secret.env')}}`], A);
+  assert.ok(!absolute.text.includes('TOPSECRET'));
+  assert.ok(refusedNote(absolute, 'outside/secret.env'), JSON.stringify(absolute.notes));
+});
+
+test('a brace pattern whose branches all stay in root still expands', (t) => {
+  pin(t, { roots: A });
+  const ctx = buildFileContext(['{a.txt,src/*.ts}'], A);
+  assert.ok(ctx.text.includes('AAA-IN-ROOT-A'), JSON.stringify(ctx.notes));
+  assert.ok(ctx.text.includes('ONE-TS'), JSON.stringify(ctx.notes));
+  assert.deepEqual(ctx.notes, []);
+});
+
+test('patternAnchors names where each brace branch’s walk would start', () => {
+  assert.deepEqual(patternAnchors('{src/*.ts,inner.md}', A), [join(A, 'src'), join(A, 'inner.md')]);
+  assert.deepEqual(patternAnchors(`{src/*.ts,${at('outside')}/**}`, A), [join(A, 'src'), at('outside')]);
+  // No braces, no change: the single anchor the walk would use.
+  assert.deepEqual(patternAnchors('src/**/*.ts', A), [patternAnchor('src/**/*.ts', A)]);
 });
 
 test('expandGlob with roots never walks a base outside them', (t) => {
