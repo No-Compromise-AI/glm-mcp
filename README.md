@@ -111,3 +111,11 @@ directory: wildcards skip all of them (nested ones included), an explicit segmen
 not — still enters the directory it names, a literal later in the pattern cannot unlock a
 wildcard earlier in it, and `GLM_MCP_GLOB_IGNORE` replaces the defaults, trims its entries,
 and disables skipping entirely when empty.
+
+## Author
+
+Built by **Jerold Billings**, Founder — [No Compromise AI, LLC](https://www.nocompromise.ai).
+
+Bugs and questions: open an issue. Security problems: please use
+[private reporting](https://github.com/No-Compromise-AI/glm-mcp/security/advisories/new)
+rather than a public issue.
