@@ -235,7 +235,10 @@ test('a drive-letter root is one root, not two', (t) => {
   // `C:/repo` is how a Windows operator must spell a root. Off Windows the same
   // spelling is relative, so the process stands in the fixture to resolve it —
   // the same trick glob.test.mjs uses for its drive patterns.
-  if (process.platform === 'win32') t.skip('covered by splitRoots here: C:/ would name the real drive');
+  if (process.platform === 'win32') {
+    t.skip('covered by splitRoots here: C:/ would name the real drive');
+    return;
+  }
   const realCwd = process.cwd();
   process.chdir(ROOT);
   t.after(() => process.chdir(realCwd));
@@ -284,7 +287,10 @@ test('a caller-chosen cwd cannot widen the default boundary in-process either', 
   // Skipped only where the fixture happens to live inside the process's own
   // working directory (TMPDIR inside the checkout); there the call is legal.
   const own = realpathSync.native(process.cwd());
-  if (insideRoots(realpathSync.native(at('outside')), [own])) t.skip('fixture is inside the process cwd');
+  if (insideRoots(realpathSync.native(at('outside')), [own])) {
+    t.skip('fixture is inside the process cwd');
+    return;
+  }
   const ctx = buildFileContext(['secret.env'], at('outside'));
   assert.equal(ctx.refusedCall, true);
   assert.equal(ctx.text, '');
@@ -588,6 +594,7 @@ test('a refusal carries the root an absolute pattern’s matches would', (t) => 
 test('a drive pattern’s refusal carries the `C:/` its matches would', (t) => {
   if (process.platform === 'win32') {
     t.skip('a directory literally named `C:` cannot exist beside the real drive');
+    return;
   }
   // The fixture's escaping links under a directory literally named `C:` — the
   // Windows drive form of the same walk, with the same two links to fix.
@@ -631,6 +638,7 @@ test('a drive pattern’s refusal carries the `C:/` its matches would', (t) => {
 test('a UNC pattern’s refusal carries the `//` its matches would', (t) => {
   if (process.platform === 'win32') {
     t.skip('`//` is UNC here and no POSIX fixture can stand in for its target');
+    return;
   }
   pin(t, { roots: A });
   const realPlatform = process.platform;
