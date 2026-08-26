@@ -23,6 +23,7 @@
     "verify:ignore": "node scripts/verify-ignore.mjs",
     "verify:globs": "node scripts/verify-globs.mjs",
     "verify:confinement": "node scripts/verify-confinement.mjs",
+    "verify:limits": "node scripts/verify-limits.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
