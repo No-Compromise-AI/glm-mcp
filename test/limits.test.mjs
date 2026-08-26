@@ -3,9 +3,14 @@
 // the knob — never a silent truncation. Exercised against real fixtures: a real
 // oversized file, a real FIFO, a real 30-level tree, real 60-entry directories.
 //
-// The GLM_MCP_MAX_FILE_CHARS cases run in a child process because that cap is
-// read once at module load; everything else pins the env per test the way an
-// operator pins it at startup. Each test asserts note CONTENT, not counts.
+// Two groups run in a child process rather than in-process. The
+// GLM_MCP_MAX_FILE_CHARS cases because that cap is read once at module load;
+// the regular-file cases because a build where that check has regressed blocks
+// forever inside readFileSync, and no node:test timeout can fire while the test
+// process is blocked — the child has an external timeout, and being killed at
+// it is how the regression fails in bounded time instead of hanging the suite.
+// Everything else pins the env per test the way an operator pins it at startup.
+// Each test asserts note CONTENT, not counts.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -13,6 +18,7 @@ import {
   mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync,
   openSync, ftruncateSync, closeSync,
 } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -28,7 +34,10 @@ const sparse = (rel, bytes) => {
   closeSync(fd);
 };
 
-before(() => {
+let socket;
+let socketError;
+
+before(async () => {
   mkdirSync(at('src/a'), { recursive: true });
   mkdirSync(at('src/b'), { recursive: true });
   writeFileSync(at('src/a/one.ts'), 'BRANCH-A-BODY');
@@ -60,6 +69,14 @@ before(() => {
     for (let f = 0; f < 10; f++) writeFileSync(join(dd, `f${f}.txt`), '');
   }
 
+  // One directory wide enough that scanning it is itself the expensive part.
+  // A deadline checked only on the way INTO a walk never fires here: flat/*
+  // enters once and can then run as long as the directory is wide — the entry
+  // budget bites on this shape but the wall clock has to be re-checked while
+  // the entries are being examined.
+  mkdirSync(at('flat'), { recursive: true });
+  for (let f = 0; f < 8_000; f++) writeFileSync(at('flat', `g${String(f).padStart(4, '0')}.txt`), '');
+
   // 300 empty files: zero body bytes, one header each — the #19 bypass.
   mkdirSync(at('many'), { recursive: true });
   for (let f = 0; f < 300; f++) writeFileSync(at('many', `empty-${String(f).padStart(4, '0')}.txt`), '');
@@ -69,9 +86,27 @@ before(() => {
   writeFileSync(at('emoji.txt'), '\u{1F600}'.repeat(300));
 
   execFileSync('mkfifo', [at('the-fifo')]);
+
+  // A real unix socket for the regular-file rule: it has to be refused as a
+  // FIFO is, and where one cannot exist (path too long for the platform's
+  // sun_path, say) the test says so instead of failing.
+  try {
+    socket = createServer();
+    await new Promise((resolve, reject) => {
+      socket.once('listening', resolve);
+      socket.once('error', reject);
+      socket.listen(at('the-sock'));
+    });
+  } catch (e) {
+    socketError = e;
+    socket = undefined;
+  }
 });
 
-after(() => rmSync(ROOT, { recursive: true, force: true }));
+after(() => {
+  if (socket) socket.close();
+  rmSync(ROOT, { recursive: true, force: true });
+});
 
 // Pin one call's configuration and restore it after, the way confinement.test
 // pins the operator's side of the boundary.
@@ -126,18 +161,9 @@ test('an unparsable GLM_MCP_MAX_FILE_BYTES falls back to the 5 MB default', (t) 
 });
 
 // ------------------------------------------------------ #15: regular files only
-
-test('a FIFO is refused as not a regular file, its neighbour survives', { timeout: 10_000 }, (t) => {
-  pin(t);
-  // No writer will ever open this FIFO; reading it would block forever, so the
-  // timeout is what turns a regression into a failure instead of a hang.
-  const ctx = buildFileContext(['the-fifo', 'small.txt'], ROOT);
-  assert.ok(
-    ctx.notes.some((n) => /not a regular file/i.test(n) && n.includes('the-fifo')),
-    JSON.stringify(ctx.notes),
-  );
-  assert.ok(ctx.text.includes('AAA-SMALL-BODY'), 'the FIFO must not take its neighbour down');
-});
+// The tests for it live with the other child-process cases at the bottom of
+// this file: a build where the check has regressed blocks forever inside
+// readFileSync, which an in-process test cannot even fail.
 
 // --------------------------------------------------------------- #16: walk depth
 
@@ -187,6 +213,19 @@ test('a walk past GLM_MCP_GLOB_TIMEOUT_MS stops and notes the knob', (t) => {
   );
 });
 
+test('a single wide directory cannot outlive the wall-clock budget', (t) => {
+  pin(t, { GLM_MCP_GLOB_TIMEOUT_MS: 1 });
+  // flat/* enters its one directory once, so a deadline checked only on the
+  // way in never sees it again: 8,000 entries ran hundreds of times past a
+  // 1 ms budget with nothing in notes. The check has to fire while the
+  // entries are being examined, not only between directories.
+  const ctx = buildFileContext(['flat/*'], ROOT);
+  assert.ok(
+    ctx.notes.some((n) => n.includes('GLM_MCP_GLOB_TIMEOUT_MS') && n.includes('flat/*')),
+    `8,000 entries against a 1 ms budget must be cut short with a note: ${JSON.stringify(ctx.notes)}`,
+  );
+});
+
 test('the 1,500-entry walk stays under the 200,000 default without a note', (t) => {
   pin(t);
   const ctx = buildFileContext(['wide/**/*.txt'], ROOT);
@@ -231,9 +270,28 @@ test('ordinary brace use still expands under the cap', (t) => {
   );
 });
 
-// ------------------------- #19: headers, separators, code points — child process
-// GLM_MCP_MAX_FILE_CHARS is read at module load, so the cap has to be in the
-// environment before the module is imported to be testable at all.
+test("a limit on one pattern does not swallow the next pattern's own note", (t) => {
+  pin(t, { GLM_MCP_MAX_BRACE_EXPANSIONS: 1 });
+  // The first pattern is refused by the cap; the second genuinely matches
+  // nothing. Not saying "no matches" about the first is right — it was
+  // refused, not wrong. Not saying it about the second is a second silent
+  // drop: a limit stops the pattern that hit it and leaves the call alone.
+  const ctx = buildFileContext(['src/{a,b}/*.none', 'definitely-missing-*.zzz'], ROOT);
+  assert.ok(
+    ctx.notes.some((n) => n.includes('refused (too many brace expansions): src/{a,b}/*.none')),
+    `the refused pattern keeps its refusal note: ${JSON.stringify(ctx.notes)}`,
+  );
+  assert.ok(
+    ctx.notes.some((n) => n.includes('skipped (no matches): definitely-missing-*.zzz')),
+    `the pattern after it still says it matched nothing: ${JSON.stringify(ctx.notes)}`,
+  );
+});
+
+// ----------------- child-process harness: the #15 and #19 cases below use it
+// Two reasons to leave the test process. GLM_MCP_MAX_FILE_CHARS is read at
+// module load, so that cap has to be in the environment before the module is
+// imported to be testable at all; and the regular-file cases drive the
+// synchronous read path, which a regressed build blocks inside forever.
 const CHILD = `
 import { buildFileContext } from ${JSON.stringify(pathToFileURL(new URL('../dist/glm.js', import.meta.url).pathname).href)};
 const job = JSON.parse(process.argv[1]);
@@ -241,7 +299,7 @@ const r = buildFileContext(job.paths, job.cwd);
 process.stdout.write(JSON.stringify({ text: String(r.text ?? ''), notes: (r.notes ?? []).map(String) }));
 `;
 
-const childCtx = (t, { paths, env = {} }) => {
+const childCtx = (t, { paths, env = {}, timeoutMs = 30_000 }) => {
   const childEnv = { ...process.env };
   for (const k of Object.keys(childEnv)) if (k.startsWith('GLM_MCP_')) delete childEnv[k];
   childEnv.GLM_MCP_ROOTS = ROOT;
@@ -249,10 +307,80 @@ const childCtx = (t, { paths, env = {} }) => {
   const out = execFileSync(
     process.execPath,
     ['--input-type=module', '-e', CHILD, JSON.stringify({ paths, cwd: ROOT })],
-    { cwd: ROOT, env: childEnv, encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] },
+    // A file under the byte cap is read and then truncated to the char cap,
+    // and JSON escapes a NUL to six characters, so a legitimate result can
+    // run to several MB. The 1 MB default would abort the child and the
+    // failure would read as the implementation's — the same ENOBUFS the
+    // acceptance gate guards itself against.
+    { cwd: ROOT, env: childEnv, encoding: 'utf8', timeout: timeoutMs,
+      maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] },
   );
   return JSON.parse(out);
 };
+
+// ------------------------------------------- #15: regular files only — in a child
+// These drive the synchronous read path, so against a build where the
+// regular-file check has regressed the child blocks inside readFileSync — a
+// FIFO with no writer blocks forever, /dev/zero reads forever — and the
+// external timeout is the only thing that can intervene. Being killed at it
+// is this test FAILING, in bounded time; an in-process version would instead
+// hang the whole suite, which is not a failure anyone gets to see.
+
+test('a FIFO is refused as not a regular file, its neighbour survives', (t) => {
+  // No writer will ever open this FIFO, so the refusal has to come from the
+  // stat that precedes the read — never from the read discovering it.
+  let r;
+  try {
+    r = childCtx(t, { paths: ['the-fifo', 'small.txt'], timeoutMs: 8_000 });
+  } catch (e) {
+    assert.fail(
+      'the FIFO read blocked until the child had to be killed — a FIFO must be ' +
+        `refused by stat before anything reads it (${e.killed ? 'killed at the timeout' : e.message})`,
+    );
+  }
+  assert.ok(
+    r.notes.some((n) => /not a regular file/i.test(n) && n.includes('the-fifo')),
+    JSON.stringify(r.notes),
+  );
+  assert.ok(r.text.includes('AAA-SMALL-BODY'), 'the FIFO must not take its neighbour down');
+});
+
+test('a character device is refused as not a regular file', (t) => {
+  // Rooted at '/' so the device sits inside the boundary and the only rule
+  // that can refuse it is the regular-file one.
+  let r;
+  try {
+    r = childCtx(t, { paths: ['/dev/zero'], env: { GLM_MCP_ROOTS: '/' }, timeoutMs: 8_000 });
+  } catch (e) {
+    assert.fail(
+      '/dev/zero was read rather than refused — a device has no size worth ' +
+        `capping, it must be refused by stat (${e.killed ? 'killed at the timeout' : e.message})`,
+    );
+  }
+  assert.ok(
+    r.notes.some((n) => /not a regular file/i.test(n) && n.includes('/dev/zero')),
+    JSON.stringify(r.notes),
+  );
+  assert.equal(r.text.length, 0, 'nothing of a device may enter the prompt');
+});
+
+test('a unix socket is refused as not a regular file, its neighbour survives', (t) => {
+  if (socketError) t.skip(`could not create one here: ${socketError.code ?? socketError.message}`);
+  let r;
+  try {
+    r = childCtx(t, { paths: ['the-sock', 'small.txt'], timeoutMs: 8_000 });
+  } catch (e) {
+    assert.fail(
+      'the socket was read rather than refused as not a regular file ' +
+        `(${e.killed ? 'killed at the timeout' : e.message})`,
+    );
+  }
+  assert.ok(
+    r.notes.some((n) => /not a regular file/i.test(n) && n.includes('the-sock')),
+    JSON.stringify(r.notes),
+  );
+  assert.ok(r.text.includes('AAA-SMALL-BODY'), 'the socket must not take its neighbour down');
+});
 
 test('headers and separators count toward GLM_MCP_MAX_FILE_CHARS', (t) => {
   const r = childCtx(t, { paths: ['many/*.txt'], env: { GLM_MCP_MAX_FILE_CHARS: 2000 } });

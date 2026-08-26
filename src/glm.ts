@@ -131,13 +131,17 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // The walk-wide limits of decision 5 (#16, #17), shared by every pattern of
   // this call: depth, entries and the wall clock are budgets of the call, not
   // of each pattern, and every limit note lands here. A note also means part of
-  // this entry's expansion was stopped, which is why `limited` suppresses the
-  // "no matches" note below — a pattern cut short by a limit is not a pattern
-  // that matched nothing, and reading it as one is the silent truncation
-  // decision 5 exists to end.
-  let limited = false;
+  // this entry's expansion was stopped, which is why `limitedPattern`
+  // suppresses the "no matches" note below — a pattern cut short by a limit is
+  // not a pattern that matched nothing, and reading it as one is the silent
+  // truncation decision 5 exists to end. The suppression is per pattern: the
+  // sink records WHICH pattern the limit fired against — expansion sets
+  // budget.pattern before any walk can trip — so a limit stops the pattern
+  // that hit it and leaves the rest of the call alone instead of swallowing
+  // their notes too.
+  let limitedPattern: string | undefined;
   const budget = walkBudget((msg) => {
-    limited = true;
+    limitedPattern = budget.pattern;
     notes.push(msg);
   });
   const maxFileBytes = envLimit("GLM_MCP_MAX_FILE_BYTES", DEFAULT_MAX_FILE_BYTES);
@@ -233,8 +237,10 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         // stopped at the boundary — or cut short by a limit — must not also be
         // filed under "no matches", which reads as a pattern that was simply
         // wrong and contradicts the note beside it. Only a pattern that matched
-        // nothing, refused nothing and was limited by nothing says "no matches".
-        if (!refusedMatch && !limited) notes.push(`skipped (no matches): ${p}`);
+        // nothing, refused nothing and was limited by nothing says "no matches"
+        // — and it is THIS pattern's refusal that is asked about, never
+        // whether the call has seen one at all.
+        if (!refusedMatch && limitedPattern !== p) notes.push(`skipped (no matches): ${p}`);
         continue;
       }
       for (const m of matches) {

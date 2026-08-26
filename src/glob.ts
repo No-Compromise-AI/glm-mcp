@@ -235,6 +235,16 @@ function literalName(seg: string): string | undefined {
 }
 
 /**
+ * The wall-clock limit's note (#16). One spelling shared by every site that can
+ * run out of time — walk's entry checks, its mid-scan samples, the brace-branch
+ * loop — because budgetNote de-duplicates on the message text, and two sites
+ * describing one overrun in two wordings would be two notes.
+ */
+const timeoutNote = (b: WalkBudget): string =>
+  `refused: ${b.pattern} stopped at the GLM_MCP_GLOB_TIMEOUT_MS limit of ` +
+  `${b.timeoutMs}ms; the walk was cut short`;
+
+/**
  * Expand one glob pattern against `cwd` into the files it matches, sorted.
  * Directories are traversed, never listed; a pattern is only reported when it
  * has matched at least one file. Leading `.` and `..` segments resolve against
@@ -294,7 +304,18 @@ export function expandGlob(
   };
   const expanded = expandBracesCapped(pattern, b);
   if (expanded === null) return [];
-  for (const p of expanded) collect(p, cwd, found, roots ?? null, refuse, b);
+  // A fully literal branch names one path, so collect never reaches walk's
+  // deadline check — a cap-sized run of such branches is a stat loop the wall
+  // clock never sees, bypassing #16 as thoroughly as a wide single directory.
+  // Sampled like the entry loops below: every 64th branch, not every one.
+  let branch = 0;
+  for (const p of expanded) {
+    if (++branch % 64 === 0 && Date.now() > b.deadline) {
+      budgetNote(b, timeoutNote(b));
+      break;
+    }
+    collect(p, cwd, found, roots ?? null, refuse, b);
+  }
   return [...found].sort();
 }
 
@@ -454,8 +475,6 @@ function collect(
     `${b.maxDepth}; deeper directories were not walked`;
   const entriesNote = `refused: ${b.pattern} stopped after the GLM_MCP_MAX_ENTRIES limit of ` +
     `${b.maxEntries} directory entries was reached; the walk was cut short`;
-  const timeoutNote = `refused: ${b.pattern} stopped at the GLM_MCP_GLOB_TIMEOUT_MS limit of ` +
-    `${b.timeoutMs}ms; the walk was cut short`;
 
   const walk = (dir: string, rel: string, i: number, depth: number): void => {
     const seg = compiled[i];
@@ -463,7 +482,7 @@ function collect(
     if (seg === undefined) return;
 
     if (Date.now() > b.deadline) {
-      budgetNote(b, timeoutNote);
+      budgetNote(b, timeoutNote(b));
       return;
     }
 
@@ -496,9 +515,23 @@ function collect(
     };
     const last = i === compiled.length - 1;
 
+    // The deadline is also sampled while the entries are being examined, not
+    // only on the way in: a check at walk's entry bounds how many directories
+    // are entered, so one wide directory — entered once, then scanned as long
+    // as it is wide — never re-meets it (#16). The clock is read every 64th
+    // entry rather than every entry: against a 200,000-entry budget that is
+    // three thousand reads instead of two hundred thousand, and a scan that
+    // crosses the line is still caught within 64 entries of crossing it.
+    let sampled = 0;
+    const outOfTime = (): boolean => ++sampled % 64 === 0 && Date.now() > b.deadline;
+
     if (seg === "**") {
       walk(dir, rel, i + 1, depth); // '**' may swallow zero segments
       for (const e of entries) {
+        if (outOfTime()) {
+          budgetNote(b, timeoutNote(b));
+          return;
+        }
         // '**' never spells a dot out, so hidden directories stay hidden.
         if (e.name.startsWith(".")) continue;
         // Real directories only: a '**'-matched symlink could point anywhere,
@@ -517,6 +550,10 @@ function collect(
     }
 
     for (const e of entries) {
+      if (outOfTime()) {
+        budgetNote(b, timeoutNote(b));
+        return;
+      }
       if (!seg.test(e.name)) continue;
       const k = kind(e);
       if (last) {
