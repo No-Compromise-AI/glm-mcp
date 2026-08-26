@@ -22,6 +22,7 @@
     "test": "npm run build && node --test test/glob.test.mjs test/api-key.test.mjs",
     "verify:ignore": "node scripts/verify-ignore.mjs",
     "verify:globs": "node scripts/verify-globs.mjs",
+    "verify:confinement": "node scripts/verify-confinement.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
