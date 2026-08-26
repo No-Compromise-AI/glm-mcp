@@ -17,17 +17,21 @@ Useful for:
 
 ## Install
 
+Register it once, user-scoped, and it is available in **every** project on the machine — no
+per-project setup:
+
 ```bash
-npm install && npm run build
+claude mcp add --scope user glm -- npx -y @ncai/glm-mcp
 ```
 
-Register it once, user-scoped, so it is available in **every** project on the machine:
+Or from a local checkout:
 
 ```bash
+npm install && npm run build
 claude mcp add --scope user glm -- node /absolute/path/to/glm-mcp/dist/index.js
 ```
 
-Restart Claude Code / Claude Desktop for it to be picked up.
+Restart Claude Code / Claude Desktop for it to be picked up. Verify with `claude mcp list`.
 
 ## Credentials
 
