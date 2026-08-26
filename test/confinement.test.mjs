@@ -63,6 +63,8 @@ before(() => {
   delete process.env.GLM_MCP_ALLOW_ANY_PATH;
 
   dir('rootA/src');
+  dir('rootA/teams/team1');
+  dir('rootA/teams/team2');
   dir('rootB');
   dir('rootC');
   dir('rootA-evil');
@@ -99,6 +101,11 @@ before(() => {
 
   symlinkSync(at('outside/secret.md'), at('rootA/notes.md')); // file link, wildcard-matched
   symlinkSync(at('outside/secretdir'), at('rootA/docs'));    // dir link, named literally
+  // Two distinct links in the tree to one directory outside it: the caller
+  // has two problems to fix, not one, so a refusal report that de-duplicated
+  // by where a link points would hide the second. (Same fixture as the gate.)
+  symlinkSync(at('outside/secretdir'), at('rootA/teams/team1/docs'));
+  symlinkSync(at('outside/secretdir'), at('rootA/teams/team2/docs'));
   symlinkSync(at('rootA/a.txt'), at('rootA/alias.txt'));     // in-root link: still fine
   symlinkSync(at('home/.config/zai/api-key'), at('home/link-to-key'));
   symlinkSync(at('rootA'), at('linkroot'));                   // a root spelled through a link
@@ -434,7 +441,13 @@ test('expandGlob does not descend into a directory whose realpath leaves the roo
   assert.deepEqual(expandGlob('**/docs/*.txt', A, [A]), ['sub/docs/fine.txt']);
   const refused = [];
   expandGlob('**/docs/*.txt', A, [A], (r) => refused.push(r));
-  assert.deepEqual(refused, ['docs']);
+  // Every escaping link in range says so — the rootA/docs one and the two
+  // team ones — each once.
+  assert.deepEqual(
+    [...refused].sort(),
+    ['docs', 'teams/team1/docs', 'teams/team2/docs'],
+    JSON.stringify(refused),
+  );
   // And through buildFileContext the pruned directory is a refusal note like
   // any other: partial context must not read as complete when the thing being
   // hidden is a hostile symlink.
@@ -443,44 +456,131 @@ test('expandGlob does not descend into a directory whose realpath leaves the roo
   assert.ok(ctx.text.includes('HONEST-DOCS'), JSON.stringify(ctx.notes));
   assert.ok(refusedNote(ctx, 'docs', '**/docs/*.txt'), JSON.stringify(ctx.notes));
   assert.equal(ctx.refusedCall, false);
-  // One directory refused once: each brace branch below meets `docs`, and the
-  // caller does not need it said twice.
+  // One reported path refused once: each brace branch below meets the same
+  // three escaping links, and the caller does not need any of them said twice.
   const twice = buildFileContext(['{**,**}/docs/*.txt'], A);
-  assert.equal(
-    twice.notes.filter((n) => /refused/.test(n) && n.includes('docs')).length,
-    1,
+  assert.deepEqual(
+    twice.notes.filter((n) => n.startsWith('refused: ')).sort(),
+    [
+      'docs', 'teams/team1/docs', 'teams/team2/docs',
+    ].map((x) => `refused: ${x} (matched by {**,**}/docs/*.txt) resolves outside the allowed roots`)
+      .sort(),
     JSON.stringify(twice.notes),
   );
 });
 
-test('a pruned directory is refused once however its routes spell it', (t) => {
+test('a pruned directory is refused once per reported path', (t) => {
   pin(t, { roots: A });
-  // `{A/**,**}` meets the same hostile symlink twice: the absolute branch
-  // reports it with the whole prefix attached, the relative branch bare — two
-  // spellings of one directory. De-duplication keys on the directory's
-  // resolved identity (the value the containment check itself compared), not
-  // on the display string a route happened to emit, so the sink fires once.
+  // `{A/**,**}` reaches every escaping link in range twice: once through the
+  // absolute branch, which reports it with the whole prefix attached, and
+  // once through the relative branch, bare. Two spellings of one physical
+  // link — but two REPORTED paths, and the reported path is what the caller
+  // can act on. Keying the de-duplication on the directory's resolved
+  // identity would collapse each pair (and two distinct links that merely
+  // share a target into one), hiding problems the caller then cannot see.
+  const mixed = `{${A}/**,**}/docs/*.txt`;
+  const paths = [
+    `${A}/docs`, 'docs',
+    `${A}/teams/team1/docs`, 'teams/team1/docs',
+    `${A}/teams/team2/docs`, 'teams/team2/docs',
+  ];
   const refused = [];
-  expandGlob(`{${A}/**,**}/docs/*.txt`, A, [A], (r) => refused.push(r));
-  assert.equal(refused.length, 1, JSON.stringify(refused));
+  expandGlob(mixed, A, [A], (r) => refused.push(r));
+  assert.deepEqual([...refused].sort(), [...paths].sort(), JSON.stringify(refused));
 
-  // The joined spellings can differ even when the rels match: a cwd reached
-  // through the /var -> /private/var prefix link anchors the relative branch
-  // somewhere the absolute branch never spells. One identity, one note still.
+  // A cwd reached through the /var -> /private/var prefix link anchors the
+  // relative branch at the same directories by another joined spelling; one
+  // report per path still.
   const throughPrefix = [];
-  expandGlob(`{${A}/**,**}/docs/*.txt`, join(RAW, 'rootA'), [A], (r) => throughPrefix.push(r));
-  assert.equal(throughPrefix.length, 1, JSON.stringify(throughPrefix));
+  expandGlob(mixed, join(RAW, 'rootA'), [A], (r) => throughPrefix.push(r));
+  assert.deepEqual([...throughPrefix].sort(), [...paths].sort(), JSON.stringify(throughPrefix));
 
-  // And through buildFileContext the caller sees one refusal, not a pair that
-  // reads as two hostile links where there is one.
-  const ctx = buildFileContext([`{${A}/**,**}/docs/*.txt`], A);
+  // And through buildFileContext each reported path is a note, spelled the
+  // way a match there would have been — not a collapsed pair that reads as
+  // one hostile link where there are three.
+  const ctx = buildFileContext([mixed], A);
   assert.ok(!ctx.text.includes('DEEP_SECRET'), JSON.stringify(ctx.notes));
   assert.ok(ctx.text.includes('HONEST-DOCS'), JSON.stringify(ctx.notes));
-  assert.equal(
-    ctx.notes.filter((n) => /refused/.test(n) && n.includes('docs')).length,
-    1,
+  assert.deepEqual(
+    ctx.notes.filter((n) => n.startsWith('refused: ')).sort(),
+    paths
+      .map((x) => `refused: ${x} (matched by ${mixed}) resolves outside the allowed roots`)
+      .sort(),
     JSON.stringify(ctx.notes),
   );
+});
+
+// --------------------------------------------- what the refusal reports say
+// Reporting fidelity, decided: distinct links are distinct reports, refusals
+// carry the spelling a match would, and a refused pattern is not also filed
+// under "no matches". Each test below was confirmed failing against the build
+// that exhibited the defect it names.
+
+test('two distinct links to one outside directory are two refusals, not one', (t) => {
+  pin(t, { roots: A });
+  // teams/team1/docs and teams/team2/docs are different symlinks pointing at
+  // one directory outside the root. De-duplicating by the resolved target
+  // reports one and silently drops the other: the caller is told about one
+  // link to fix and has two.
+  const refused = [];
+  expandGlob('teams/**/docs/*.txt', A, [A], (r) => refused.push(r));
+  assert.deepEqual(
+    [...refused].sort(),
+    ['teams/team1/docs', 'teams/team2/docs'],
+    JSON.stringify(refused),
+  );
+  // The notes name each link and the pattern that reached it — the content,
+  // not just the count.
+  const ctx = buildFileContext(['teams/**/docs/*.txt'], A);
+  assert.ok(!ctx.text.includes('DEEP_SECRET'), JSON.stringify(ctx.notes));
+  assert.deepEqual(
+    ctx.notes.filter((n) => n.startsWith('refused: ')).sort(),
+    [
+      'refused: teams/team1/docs (matched by teams/**/docs/*.txt) resolves outside the allowed roots',
+      'refused: teams/team2/docs (matched by teams/**/docs/*.txt) resolves outside the allowed roots',
+    ],
+    JSON.stringify(ctx.notes),
+  );
+});
+
+test('a refusal carries the root an absolute pattern’s matches would', (t) => {
+  pin(t, { roots: A });
+  // Emitted matches are `root + rel`; a refusal spelled with bare `rel`
+  // names a path that is not the caller's (`private/var/…` with no leading
+  // `/`) and the note becomes unactionable. The absolute case is checked
+  // here; drive (`C:/`) and UNC (`//`) prefixes ride along the same way,
+  // being the same `root` value.
+  const refused = [];
+  expandGlob(`${A}/teams/**/docs/*.txt`, A, [A], (r) => refused.push(r));
+  assert.deepEqual(
+    [...refused].sort(),
+    [join(A, 'teams/team1/docs'), join(A, 'teams/team2/docs')].sort(),
+    JSON.stringify(refused),
+  );
+  const ctx = buildFileContext([`${A}/teams/**/docs/*.txt`], A);
+  assert.ok(!ctx.text.includes('DEEP_SECRET'), JSON.stringify(ctx.notes));
+  for (const p of [join(A, 'teams/team1/docs'), join(A, 'teams/team2/docs')]) {
+    assert.ok(
+      ctx.notes.includes(
+        `refused: ${p} (matched by ${A}/teams/**/docs/*.txt) resolves outside the allowed roots`,
+      ),
+      `${p} missing from ${JSON.stringify(ctx.notes)}`,
+    );
+  }
+});
+
+test('a pattern whose matches were refused is not also reported as matching nothing', (t) => {
+  pin(t, { roots: A });
+  // Every match this pattern could have had was stopped at the boundary:
+  // "skipped (no matches)" beside those refusals reads as a pattern that was
+  // simply wrong, and contradicts them.
+  const ctx = buildFileContext(['teams/**/docs/*.txt'], A);
+  assert.ok(ctx.notes.some((n) => n.startsWith('refused: teams/')), JSON.stringify(ctx.notes));
+  assert.ok(!ctx.notes.some((n) => /no matches/i.test(n)), JSON.stringify(ctx.notes));
+  assert.equal(ctx.refusedCall, false);
+  // A pattern that matched nothing AND refused nothing still says so.
+  const none = buildFileContext(['nowhere/**/x.txt'], A);
+  assert.deepEqual(none.notes, ['skipped (no matches): nowhere/**/x.txt']);
 });
 
 test('an in-root symlinked directory is still descended when a segment names it', (t) => {

@@ -182,15 +182,23 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       continue;
     }
     // A directory the walk prunes for leaving the roots is a refusal like any
-    // other: expandGlob reports each one once, with the spelling a match
-    // would carry, so the note names both it and the pattern that reached it.
+    // other: expandGlob reports each reported path once, with the spelling a
+    // match would carry, so the note names both it and the pattern that
+    // reached it.
+    let refusedMatch = false;
     const matches = expandGlob(p, cwd, roots ?? undefined, (refused) => {
+      refusedMatch = true;
       notes.push(
         `refused: ${refused} (matched by ${p}) resolves outside the allowed roots`,
       );
     });
     if (matches.length === 0) {
-      notes.push(`skipped (no matches): ${p}`);
+      // Refused is not the same as absent: a pattern whose matches were all
+      // stopped at the boundary must not also be filed under "no matches",
+      // which reads as a pattern that was simply wrong — and contradicts the
+      // refusal note beside it. Only a pattern that matched nothing and
+      // refused nothing says "no matches".
+      if (!refusedMatch) notes.push(`skipped (no matches): ${p}`);
       continue;
     }
     for (const m of matches) {

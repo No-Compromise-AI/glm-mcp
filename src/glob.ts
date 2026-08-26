@@ -196,16 +196,18 @@ function literalName(seg: string): string | undefined {
  * its matches are refused one by one. Without `roots` the expansion is
  * unconfined, exactly as it was before confinement existed.
  *
- * `onRefused`, when given, is called with the pattern-relative spelling of each
- * directory the confinement prunes mid-walk. A pruned directory is a refusal
- * like any other: without this the caller would return partial context that
- * reads as complete — the silent narrowing decision 1 rules out — and what it
- * would be hiding is a hostile symlink. The same directory can be reached by
- * several routes (`**` more than once, or one brace branch per route), so it is
- * reported once per expansion, not once per route. Once means by identity, not
- * by spelling: an absolute branch prefixes what a relative one leaves bare, so
- * the de-duplication key is the directory's resolved path — the same value the
- * containment check compared — and the first route's spelling is the one kept.
+ * `onRefused`, when given, is called with the spelling a match at the same
+ * place would carry — the pattern's root and literal prefix included, so
+ * absolute, drive and UNC forms keep their prefix — for each directory the
+ * confinement prunes mid-walk. A pruned directory is a refusal like any other:
+ * without this the caller would return partial context that reads as complete
+ * — the silent narrowing decision 1 rules out — and what it would be hiding is
+ * a hostile symlink. Several routes can reach one path (`**` more than once,
+ * or one brace branch per route), so a path is reported once per expansion,
+ * not once per route. The key is the reported path itself, never the
+ * directory it resolves to: two symlinks to one outside directory are two
+ * paths the caller has to fix, and keying on the resolved target would
+ * collapse them into one report — the same silent narrowing again.
  */
 export function expandGlob(
   pattern: string,
@@ -215,9 +217,9 @@ export function expandGlob(
 ): string[] {
   const found = new Set<string>();
   const said = new Set<string>();
-  const refuse = onRefused === undefined ? undefined : (p: string, key: string) => {
-    if (said.has(key)) return;
-    said.add(key);
+  const refuse = onRefused === undefined ? undefined : (p: string) => {
+    if (said.has(p)) return;
+    said.add(p);
     onRefused(p);
   };
   for (const p of expandBraces(pattern)) collect(p, cwd, found, roots ?? null, refuse);
@@ -306,7 +308,7 @@ function collect(
   cwd: string,
   found: Set<string>,
   roots: string[] | null,
-  onRefused?: (refused: string, key: string) => void,
+  onRefused?: (refused: string) => void,
 ): void {
   const anchor = anchorOf(pattern, cwd);
   if (anchor === null) return; // a bare root ("/", "C:/") names no segment to match
@@ -348,15 +350,15 @@ function collect(
   // named literally by a segment, reached by a wildcard, or found by `**` —
   // because resolving first is what closes the symlink escape. Refusing one
   // is reported through `onRefused` with the same spelling a match would
-  // carry, so a pruned directory becomes the caller's note instead of
-  // context that quietly narrows. The resolved path rides along as the
-  // de-duplication key: routes that spell one directory differently must
-  // still be speaking about it once.
+  // carry — `emit`'s, root and literal prefix included — so a pruned directory
+  // becomes the caller's note instead of context that quietly narrows. That
+  // spelling is also the de-duplication key: distinct reported paths stay
+  // distinct reports however many of them resolve to one directory.
   const enterable = (dir: string, rel: string): boolean => {
     if (!roots) return true;
     const real = realpathish(dir);
     if (insideRoots(real, roots)) return true;
-    onRefused?.(rel, real);
+    onRefused?.(root + rel);
     return false;
   };
 
