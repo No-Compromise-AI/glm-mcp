@@ -8,6 +8,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Supersede in-flight runs for the same ref: a force-push or a quick second
+# commit should not leave two runs racing to report on the same PR.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read   # a fork PR gets a read-only token and no secrets
 
