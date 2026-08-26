@@ -11,7 +11,7 @@ import {
   mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, realpathSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { buildFileContext } from '../dist/glm.js';
 import { expandGlob, patternAnchor, patternAnchors } from '../dist/glob.js';
@@ -29,6 +29,13 @@ const put = (rel, body) => {
   writeFileSync(at(rel), body);
 };
 const dir = (rel) => mkdirSync(at(rel), { recursive: true });
+
+// A path spelled the way a pattern must be: `/` separators throughout. The
+// globber reads a backslash as an escape on every platform, never a separator,
+// so a pattern interpolated from a native `join()` path would stop being the
+// absolute pattern it is meant to be on Windows — and the paths the expander
+// emits and reports refusals by are `/`-separated everywhere regardless.
+const slashed = (p) => p.split(sep).join('/');
 
 const A = at('rootA');
 const B = at('rootB');
@@ -548,25 +555,105 @@ test('a refusal carries the root an absolute pattern’s matches would', (t) => 
   // Emitted matches are `root + rel`; a refusal spelled with bare `rel`
   // names a path that is not the caller's (`private/var/…` with no leading
   // `/`) and the note becomes unactionable. The absolute case is checked
-  // here; drive (`C:/`) and UNC (`//`) prefixes ride along the same way,
-  // being the same `root` value.
+  // here with a `/`-separated pattern and expectation — the only spelling
+  // anchorOf honours on Windows, where a native `join()` path would carry
+  // backslashes and stop being absolute at all; the drive (`C:/`) and UNC
+  // (`//`) prefixes get the same treatment in their own tests below.
+  const P = slashed(A);
+  const pattern = `${P}/teams/**/docs/*.txt`;
   const refused = [];
-  expandGlob(`${A}/teams/**/docs/*.txt`, A, [A], (r) => refused.push(r));
+  expandGlob(pattern, A, [A], (r) => refused.push(r));
   assert.deepEqual(
     [...refused].sort(),
-    [join(A, 'teams/team1/docs'), join(A, 'teams/team2/docs')].sort(),
+    [slashed(join(A, 'teams/team1/docs')), slashed(join(A, 'teams/team2/docs'))].sort(),
     JSON.stringify(refused),
   );
-  const ctx = buildFileContext([`${A}/teams/**/docs/*.txt`], A);
+  const ctx = buildFileContext([pattern], A);
   assert.ok(!ctx.text.includes('DEEP_SECRET'), JSON.stringify(ctx.notes));
-  for (const p of [join(A, 'teams/team1/docs'), join(A, 'teams/team2/docs')]) {
+  for (const p of [slashed(join(A, 'teams/team1/docs')), slashed(join(A, 'teams/team2/docs'))]) {
     assert.ok(
       ctx.notes.includes(
-        `refused: ${p} (matched by ${A}/teams/**/docs/*.txt) resolves outside the allowed roots`,
+        `refused: ${p} (matched by ${pattern}) resolves outside the allowed roots`,
       ),
       `${p} missing from ${JSON.stringify(ctx.notes)}`,
     );
   }
+});
+
+// `C:/` and `//` are `root` values anchorOf produces on Windows only, so these
+// two spellings are exercised the way glob.test.mjs exercises its drive
+// patterns: the platform is faked and the fixture is anchored at the process
+// cwd — the one place a `C:/`-rooted walk can land on a POSIX host. Both were
+// confirmed failing against a build whose refusals carried bare `rel`.
+test('a drive pattern’s refusal carries the `C:/` its matches would', (t) => {
+  if (process.platform === 'win32') {
+    t.skip('a directory literally named `C:` cannot exist beside the real drive');
+  }
+  // The fixture's escaping links under a directory literally named `C:` — the
+  // Windows drive form of the same walk, with the same two links to fix.
+  for (const team of ['team1', 'team2']) {
+    dir(`C:/w/teams/${team}`);
+    symlinkSync(at('outside/secretdir'), at(`C:/w/teams/${team}/docs`));
+  }
+  t.after(() => rmSync(at('C:/w'), { recursive: true, force: true }));
+  // The root pinned the way a Windows operator spells it — splitRoots keeps a
+  // leading `C:` whole — and resolved against the process cwd the fixture
+  // stands in, exactly like the drive-letter root test above. (Pinning
+  // at('C:/w') instead would be split at that colon: mid-path is not a drive.)
+  pin(t, { roots: 'C:/w' });
+  const realPlatform = process.platform;
+  const realCwd = process.cwd();
+  process.chdir(ROOT);
+  Object.defineProperty(process, 'platform', { value: 'win32' });
+  t.after(() => {
+    Object.defineProperty(process, 'platform', { value: realPlatform });
+    process.chdir(realCwd);
+  });
+  const pattern = 'C:/w/teams/**/docs/*.txt';
+  const refused = [];
+  expandGlob(pattern, at('C:/w'), [at('C:/w')], (r) => refused.push(r));
+  assert.deepEqual(
+    [...refused].sort(),
+    ['C:/w/teams/team1/docs', 'C:/w/teams/team2/docs'],
+    JSON.stringify(refused),
+  );
+  const ctx = buildFileContext([pattern], at('C:/w'));
+  assert.ok(!ctx.text.includes('DEEP_SECRET'), JSON.stringify(ctx.notes));
+  assert.deepEqual(
+    ctx.notes.filter((n) => n.startsWith('refused: ')).sort(),
+    ['C:/w/teams/team1/docs', 'C:/w/teams/team2/docs']
+      .map((x) => `refused: ${x} (matched by ${pattern}) resolves outside the allowed roots`)
+      .sort(),
+    JSON.stringify(ctx.notes),
+  );
+});
+
+test('a UNC pattern’s refusal carries the `//` its matches would', (t) => {
+  if (process.platform === 'win32') {
+    t.skip('`//` is UNC here and no POSIX fixture can stand in for its target');
+  }
+  pin(t, { roots: A });
+  const realPlatform = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'win32' });
+  t.after(() => Object.defineProperty(process, 'platform', { value: realPlatform }));
+  // The fixture addressed through a `//` prefix: on Windows that is UNC; on a
+  // POSIX host the filesystem reads it as the same tree while the reported
+  // spelling keeps both slashes. The links are the fixture's own team ones.
+  const pattern = `//${ROOT.slice(1)}/rootA/teams/**/docs/*.txt`;
+  const refused = [];
+  expandGlob(pattern, A, [A], (r) => refused.push(r));
+  const paths = ['team1', 'team2']
+    .map((team) => `//${ROOT.slice(1)}/rootA/teams/${team}/docs`);
+  assert.deepEqual([...refused].sort(), [...paths].sort(), JSON.stringify(refused));
+  const ctx = buildFileContext([pattern], A);
+  assert.ok(!ctx.text.includes('DEEP_SECRET'), JSON.stringify(ctx.notes));
+  assert.deepEqual(
+    ctx.notes.filter((n) => n.startsWith('refused: ')).sort(),
+    paths
+      .map((x) => `refused: ${x} (matched by ${pattern}) resolves outside the allowed roots`)
+      .sort(),
+    JSON.stringify(ctx.notes),
+  );
 });
 
 test('a pattern whose matches were refused is not also reported as matching nothing', (t) => {
