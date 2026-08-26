@@ -53,7 +53,9 @@ function ctx({ paths, cwd, roots, home, allowAny, procCwd }) {
   const env = { ...process.env };
   for (const k of ['GLM_MCP_ROOTS', 'GLM_MCP_ALLOW_ANY_PATH', 'GLM_MCP_GLOB_IGNORE']) delete env[k];
   if (roots !== undefined) env.GLM_MCP_ROOTS = roots;
-  if (home !== undefined) env.HOME = home;
+  // os.homedir() reads HOME on POSIX and USERPROFILE on Windows; setting only
+  // one would denylist the real profile while the fixtures sat under the fake.
+  if (home !== undefined) { env.HOME = home; env.USERPROFILE = home; }
   if (allowAny) env.GLM_MCP_ALLOW_ANY_PATH = '1';
   let out;
   try {
@@ -111,6 +113,11 @@ try {
   put('rootA/inner.md', 'INNER-MARKDOWN');
   put('rootA/src/one.ts', 'ONE-TS');
   put('rootA/src/nested/two.ts', 'TWO-TS');
+  put('rootA/sub/docs/fine.txt', 'HONEST-DOCS');
+  // A real file whose name is nothing but metacharacters. #3 settled that a
+  // path existing on disk is read literally; containment must not re-read it
+  // as a pattern whose synthetic '..' branch escapes.
+  put('rootA/{..,safe}', 'LITERAL-BRACE-BODY');
   put('rootB/b.txt', 'BBB-IN-ROOT-B');
   put('rootC/c.txt', 'CCC-IN-ROOT-C');
   put('rootA-evil/e.txt', 'EVIL-SIBLING-PREFIX');
@@ -148,6 +155,11 @@ try {
   r = ctx({ paths: ['one.ts'], cwd: at('rootA/src'), roots: A });
   if (!shows(r, 'ONE-TS')) fail(`a cwd narrowed below a root must be allowed — ${show(r)}`);
 
+  r = ctx({ paths: ['{..,safe}'], cwd: A, roots: A });
+  if (!shows(r, 'LITERAL-BRACE-BODY')) {
+    fail(`a real file whose name contains braces must still be read literally — ${show(r)}`);
+  }
+
   // An in-root symlink is still read, and still de-duplicates against its
   // target: containment must not disturb the #3 identity dedupe.
   r = ctx({ paths: ['a.txt', 'alias.txt'], cwd: A, roots: A });
@@ -182,6 +194,14 @@ try {
 
   r = ctx({ paths: ['docs/**/*.txt'], cwd: A, roots: A });
   refuses(r, 'DEEP_SECRET', ['docs', 'leak.txt'], 'directory symlink named as a literal segment');
+
+  // Pruned in the middle of a walk rather than at its anchor. Dropping it
+  // without a word returns partial context that reads as complete — the
+  // silent narrowing decision 1 rules out — and it is worse here than
+  // elsewhere, because the thing being hidden is a hostile symlink.
+  r = ctx({ paths: ['**/docs/*.txt'], cwd: A, roots: A });
+  refuses(r, 'DEEP_SECRET', ['docs', '**/docs/*.txt'], 'a directory symlink pruned mid-walk');
+  if (!shows(r, 'HONEST-DOCS')) fail(`the honest match beside a pruned link must survive — ${show(r)}`);
 
   // ------------------------------- 5. a cwd outside the roots refuses the call
   r = ctx({ paths: ['a.txt'], cwd: at('outside'), roots: A, procCwd: A });
