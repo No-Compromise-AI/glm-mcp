@@ -239,7 +239,10 @@ test('de-duplication tracks files, not spellings: case variants', (t) => {
   // On a case-insensitive filesystem (macOS/Windows default) case/GLOB.ts and
   // case/glob.ts name the same file; on a case-sensitive one they do not, and
   // the literal simply does not exist.
-  if (!existsSync(join(fx, 'CASE'))) t.skip('filesystem is case-sensitive');
+  if (!existsSync(join(fx, 'CASE'))) {
+    t.skip('filesystem is case-sensitive');
+    return;
+  }
   for (const paths of [['case/GLOB.ts', 'case/*.ts'], ['case/*.ts', 'case/GLOB.ts']]) {
     const ctx = buildFileContext(paths, fx);
     assert.equal(occurrences(ctx, 'CASEBODY'), 1, JSON.stringify(paths));
@@ -317,7 +320,10 @@ test('a drive-letter pattern is absolute on Windows', () => {
 });
 
 test('off Windows a `C:` segment is an ordinary directory name', (t) => {
-  if (process.platform === 'win32') t.skip('drive letters are absolute here');
+  if (process.platform === 'win32') {
+    t.skip('drive letters are absolute here');
+    return;
+  }
   const drive = driveFixture();
   try {
     assert.deepEqual(expandGlob('C:/repo/src/*.ts', drive), ['C:/repo/src/a.ts']);
