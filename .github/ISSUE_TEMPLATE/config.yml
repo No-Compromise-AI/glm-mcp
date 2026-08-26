@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/No-Compromise-AI/glm-mcp/security/advisories/new
+    about: Please report privately rather than opening a public issue. A public issue discloses the problem before there is a fix.
+  - name: Work with No Compromise AI
+    url: https://www.nocompromise.ai
+    about: Consulting, or interested in what we're building? Start here.

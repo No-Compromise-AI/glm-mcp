@@ -1,0 +1,39 @@
+name: Bug report
+description: Something behaves differently than documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >
+        The smallest thing that shows the problem — the glm_ask arguments you passed,
+        or a few lines of code calling the package. A reproduction gets this fixed far
+        faster than a description.
+      render: shell
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      placeholder: "0.1.0"
+    validations: { required: true }
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      placeholder: "node --version"
+    validations: { required: true }
+  - type: checkboxes
+    id: nokey
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have not included an API key, token, or other credential in this report.
+          required: true

@@ -39,7 +39,12 @@ The server never hardcodes a key. It resolves one from, in order:
 
 1. `ZAI_API_KEY`
 2. `~/.config/zai/api-key`
-3. the `api.z.ai` key ZCode already stores in `~/.zcode/v2/config.json`
+3. the `api.z.ai` key ZCode stores in `~/.zcode/v2/config.json` — **only** when
+   `GLM_MCP_ALLOW_ZCODE_KEY=1` is set
+
+Step 3 is opt-in on purpose. It reads a credential belonging to a different application,
+and that should be a decision you make rather than behaviour you discover. Everything runs
+on the machine doing the installing: your key, your z.ai account, your billing.
 
 Note that the ZCode **Start Plan** token is not usable here — that endpoint is captcha-locked to
 the ZCode app and rejects outside clients with `3007`. You need an `api.z.ai` key with a Coding
@@ -95,13 +100,15 @@ Lists the model ids available on the configured account.
   expanded set and truncates with a note rather than failing. Missing or unreadable files are
   skipped and reported, not fatal.
 - Request timeout defaults to 10 minutes (`GLM_MCP_TIMEOUT_MS`).
+- Requests go to `https://api.z.ai/api/anthropic` unless `ZAI_BASE_URL` says otherwise —
+  your key is sent to whatever host it names, so only point it at endpoints you trust.
 - z.ai's coded errors are translated into actionable messages — `1113` (no balance),
   `1210` (reasoning required), `3007` (wrong credential type).
 
 ## Testing
 
 ```bash
-npm test               # unit tests for glob expansion (builds first)
+npm test               # unit tests for glob expansion and key resolution (builds first)
 npm run smoke          # drives the server over stdio as a real MCP client (needs a z.ai key)
 npm run verify:ignore  # acceptance gate for the glob ignore semantics
 npm run verify:globs   # acceptance gate for the glob path handling (#3)
@@ -117,3 +124,9 @@ and disables skipping entirely when empty. `verify:globs` checks `./` and `../` 
 order-independent de-duplication, literal paths containing glob metacharacters, symlinked
 directories, and Windows drive-letter patterns (run against a faked platform), against this
 repository and fixture trees of its own.
+
+## Author
+
+Built by **Jerold Billings**, Founder — [No Compromise AI, LLC](https://www.nocompromise.ai).
+
+Bugs and questions: open an issue. Security problems: please use
