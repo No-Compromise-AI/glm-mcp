@@ -19,6 +19,7 @@
     "prepare": "npm run build",
     "start": "node dist/index.js",
     "smoke": "node scripts/smoke.mjs",
+    "test": "npm run build && node --test test/glob.test.mjs",
     "verify:ignore": "node scripts/verify-ignore.mjs",
     "prepublishOnly": "npm run build"
   },

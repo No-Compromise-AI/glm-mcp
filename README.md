@@ -94,11 +94,15 @@ Lists the model ids available on the configured account.
 ## Testing
 
 ```bash
+npm test               # unit tests for glob expansion (builds first)
 npm run smoke          # drives the server over stdio as a real MCP client (needs a z.ai key)
-npm run verify:ignore  # asserts glob expansion skips node_modules but honours explicit patterns
+npm run verify:ignore  # acceptance gate for the glob ignore semantics
 ```
 
 `smoke` covers the tool list, model list, reasoning, file context, glob expansion, the
 `none`-to-`low` correction, and missing-file handling. `verify:ignore` checks the ignore
-semantics: `**/*.ts` stays clean of `node_modules`, own source still matches, and an explicit
-`node_modules/...` pattern still matches.
+semantics against this repository and a throwaway fixture tree holding every default-ignored
+directory: wildcards skip all of them (nested ones included), an explicit segment — escaped or
+not — still enters the directory it names, a literal later in the pattern cannot unlock a
+wildcard earlier in it, and `GLM_MCP_GLOB_IGNORE` replaces the defaults, trims its entries,
+and disables skipping entirely when empty.

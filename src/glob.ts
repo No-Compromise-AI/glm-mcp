@@ -154,6 +154,28 @@ function compileSegment(seg: string): RegExp {
 type Segment = RegExp | "**";
 
 /**
+ * The one directory name a segment can match, or undefined when wildcards let
+ * it match more. Escapes are resolved the way compileSegment resolves them, so
+ * `node\_modules` names `node_modules` as plainly as an unescaped segment does;
+ * a lone trailing backslash names nothing.
+ */
+function literalName(seg: string): string | undefined {
+  let out = "";
+  for (let i = 0; i < seg.length; i++) {
+    const c = seg[i];
+    if (c === "\\") {
+      const next = seg[++i];
+      if (next === undefined) return undefined;
+      out += next;
+      continue;
+    }
+    if (c === "*" || c === "?" || c === "[") return undefined;
+    out += c;
+  }
+  return out;
+}
+
+/**
  * Expand one glob pattern against `cwd` into the files it matches, sorted.
  * Directories are traversed, never listed; a pattern is only reported when it
  * has matched at least one file. Ignored directories (see globIgnoreSet) are
@@ -172,12 +194,13 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
   if (segments.length === 0) return;
 
   const compiled: Segment[] = segments.map((s) => (s === "**" ? "**" : compileSegment(s)));
-  // Segments without metacharacters are plain directory names, so an ignored
-  // directory the pattern itself names is still entered: `node_modules/foo/**`
-  // is an explicit request, not an accident of a wildcard.
-  const named = new Set(segments.filter((s) => !isGlobPattern(s)));
+  // An ignored directory is entered only where the pattern spells its name out
+  // as a whole segment: `node_modules/foo/**` is an explicit request, while the
+  // `*` in `*/body-parser/node_modules/...` must not ride a later literal past
+  // an unrelated node_modules. `**` names nothing, so it never unlocks a skip.
+  const names: (string | undefined)[] = segments.map((s) => (s === "**" ? undefined : literalName(s)));
   const ignored = globIgnoreSet();
-  const skip = (name: string) => ignored.has(name) && !named.has(name);
+  const skip = (name: string, i: number) => ignored.has(name) && names[i] !== name;
   const emit = (rel: string) => {
     found.add(absolute ? `/${rel}` : rel);
   };
@@ -204,7 +227,7 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
         // '**' never spells a dot out, so hidden directories stay hidden.
         if (e.name.startsWith(".")) continue;
         if (e.isDirectory()) {
-          if (!skip(e.name)) walk(join(dir, e.name), child(e.name), i);
+          if (!skip(e.name, i)) walk(join(dir, e.name), child(e.name), i);
         } else if (last && isFile(e)) emit(child(e.name));
       }
       return;
@@ -214,7 +237,7 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
       if (!seg.test(e.name)) continue;
       if (last) {
         if (isFile(e)) emit(child(e.name));
-      } else if (e.isDirectory() && !skip(e.name)) {
+      } else if (e.isDirectory() && !skip(e.name, i)) {
         walk(join(dir, e.name), child(e.name), i + 1);
       }
     }
