@@ -63,10 +63,18 @@ function ctx({ paths, cwd, roots, env = {}, timeoutMs = 60_000 }) {
     out = execFileSync(
       process.execPath,
       ['--input-type=module', '-e', CHILD, JSON.stringify({ paths, cwd })],
-      { cwd, env: childEnv, encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'] },
+      // A file under the byte cap is read and then truncated to the char cap,
+      // and JSON escapes a NUL to six characters, so a legitimate result can
+      // run to several MB. The 1 MB default would abort the child and the
+      // failure would look like the implementation's.
+      { cwd, env: childEnv, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'] },
     );
   } catch (e) {
     if (e.killed) fail(`buildFileContext(${JSON.stringify(paths)}) did not return within ${timeoutMs}ms — a limit must stop it, not the clock`);
+    // Naming this separately matters: read as an implementation throw it sends
+    // the reader hunting for a bug in code that behaved correctly.
+    if (e.code === 'ENOBUFS') fail(`the gate's own harness overflowed reading the result of ${JSON.stringify(paths)} — raise maxBuffer; this is not an implementation failure`);
     fail(`buildFileContext(${JSON.stringify(paths)}) threw — limits are notes, never throws\n${e.stderr || e.message}`);
   }
   try {
