@@ -38,6 +38,9 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run verify:ignore
+      - run: npm run verify:globs
+      - run: npm run verify:confinement
+      - run: npm run verify:limits
 
   build:
     # Deliberately NO id-token here. This job runs repository code; it must not

@@ -11,7 +11,7 @@ import {
   type Reasoning,
 } from "./glm.js";
 
-const server = new McpServer({ name: "glm", version: "0.1.0" });
+const server = new McpServer({ name: "glm", version: "0.2.0" });
 
 server.registerTool(
   "glm_ask",

@@ -116,6 +116,48 @@ Lists the model ids available on the configured account.
 
 `max_tokens` is raised automatically to leave room for the answer on top of the budget.
 
+## Path confinement
+
+`glm_ask` reads only inside roots the **operator** sets. A caller may narrow
+within them; it can neither choose nor escape them.
+
+- Roots come from `GLM_MCP_ROOTS`, colon-separated absolute paths.
+- Unset, the root is **the directory the server was started in**. Claude starts
+  one server per project, so each server is confined to its own project and most
+  setups need no configuration at all.
+- `cwd` must resolve inside a root. If it does not the call is refused outright,
+  not quietly narrowed to a root — a silently empty answer is worse than an
+  error that says why.
+- Every file's **real** path must land inside a root, so a symlink inside the
+  tree pointing outside resolves outside and is refused. This is checked before
+  a glob walks, so a pattern rooted outside never traverses.
+- Refused paths appear in `Notes` exactly like missing files, naming the
+  spelling you used. One refused entry never fails a call that also names good
+  files.
+
+Whatever the roots say, the server never reads its own credentials —
+`~/.config/zai/api-key`, `~/.zcode/v2/config.json` and `/proc/self/environ` —
+compared by resolved real path rather than by spelling.
+
+`GLM_MCP_ALLOW_ANY_PATH=1` turns confinement off, deliberately and explicitly,
+the same way `GLM_MCP_ALLOW_ZCODE_KEY` works. It widens the roots; it does not
+re-open those three files.
+
+### Upgrading to 0.2.0
+
+**If you read files across more than one project, set `GLM_MCP_ROOTS` in your MCP
+registration before upgrading.** Each server is rooted at the project it was
+started in, so asking from one project about a file in another worked silently
+before 0.2.0 and is refused after it. The registration ships `env: {}`, so this
+has to be added deliberately:
+
+```json
+"env": { "GLM_MCP_ROOTS": "/Users/you/project-a:/Users/you/project-b" }
+```
+
+Absolute paths are confined too, but that breaks far less than it sounds: a
+survey of this author's own tooling found no caller that passes them.
+
 ## File context
 
 `files` accepts literal paths and glob patterns, mixed freely. Matches are sorted and
@@ -150,10 +192,24 @@ Set `GLM_MCP_GLOB_IGNORE` to a comma-separated list to **replace** the default s
 
 ### Limits
 
-- Context is capped at 800,000 characters (`GLM_MCP_MAX_FILE_CHARS`) across the expanded set,
-  and truncates with a note rather than failing.
-- Missing or unreadable files are skipped and reported, never fatal.
-- Requests time out after 10 minutes (`GLM_MCP_TIMEOUT_MS`).
+Every limit stops the operation that hit it and says so in `Notes`, naming the
+variable that set it — nothing is ever silently truncated or silently dropped.
+
+| Limit | Variable | Default |
+| --- | --- | --- |
+| Total context characters, headers and separators included | `GLM_MCP_MAX_FILE_CHARS` | 800,000 |
+| Per-file size, checked before the file is read | `GLM_MCP_MAX_FILE_BYTES` | 5 MB |
+| Glob walk depth | `GLM_MCP_MAX_DEPTH` | 24 |
+| Directory entries examined per call | `GLM_MCP_MAX_ENTRIES` | 200,000 |
+| Wall-clock budget for glob expansion | `GLM_MCP_GLOB_TIMEOUT_MS` | 10,000 |
+| Total `{a,b}` brace expansions | `GLM_MCP_MAX_BRACE_EXPANSIONS` | 1,024 |
+| Request timeout | `GLM_MCP_TIMEOUT_MS` | 600,000 |
+
+- Only regular files are read. A FIFO, device or socket is refused rather than
+  blocking the server on a read that may never return.
+- Truncation cuts on code points, so it never splits an emoji in half.
+- Missing, unreadable and refused files are skipped and reported, never fatal:
+  one bad entry does not fail a call that also names good files.
 
 ## Errors and endpoints
 
@@ -166,14 +222,21 @@ is sent to whatever host it names, so only point it at endpoints you trust.
 ## Testing
 
 ```bash
-npm test               # unit tests for glob expansion and key resolution
-npm run verify:ignore  # acceptance gate: glob ignore semantics
-npm run verify:globs   # acceptance gate: glob path handling
-npm run smoke          # drives the server over stdio as a real MCP client (needs a key)
+npm test                    # unit tests: globs, key resolution, confinement, limits
+npm run verify:ignore       # acceptance gate: glob ignore semantics
+npm run verify:globs        # acceptance gate: glob path handling
+npm run verify:confinement  # acceptance gate: the path trust boundary
+npm run verify:limits       # acceptance gate: every resource limit actually fires
+npm run smoke               # drives the server over stdio as a real MCP client (needs a key)
 ```
 
-The first three are hermetic and run in CI on Node 20, 22 and 24. `smoke` makes live API calls,
-so it is run by hand.
+Everything but `smoke` is hermetic and runs in CI on Node 20, 22 and 24. `smoke` makes live
+API calls, so it is run by hand.
+
+Each acceptance gate was written before the change it gates and failed against the code it was
+written for, so it asserts the behaviour rather than describing it. They build real fixture
+trees — real files, real symlinks, a real FIFO, a real fake `$HOME` — and run against child
+processes where a setting has to be in place before the module loads.
 
 ## Releases
 

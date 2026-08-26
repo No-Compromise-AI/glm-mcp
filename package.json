@@ -1,6 +1,6 @@
 {
   "name": "@nocompromiseai/glm-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server exposing Z.ai GLM models (GLM-5.3 and siblings) as tools inside Claude Code and Claude Desktop.",
   "type": "module",
   "bin": {
@@ -19,10 +19,11 @@
     "prepare": "npm run build",
     "start": "node dist/index.js",
     "smoke": "node scripts/smoke.mjs",
-    "test": "npm run build && node --test test/glob.test.mjs test/api-key.test.mjs test/confinement.test.mjs",
+    "test": "npm run build && node --test test/glob.test.mjs test/api-key.test.mjs test/confinement.test.mjs test/limits.test.mjs",
     "verify:ignore": "node scripts/verify-ignore.mjs",
     "verify:globs": "node scripts/verify-globs.mjs",
     "verify:confinement": "node scripts/verify-confinement.mjs",
+    "verify:limits": "node scripts/verify-limits.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

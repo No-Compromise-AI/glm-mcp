@@ -1,6 +1,7 @@
 import { readdirSync, statSync, type Dirent } from "node:fs";
 import { join, resolve } from "node:path";
 import { insideRoots, realpathish } from "./confine.js";
+import { budgetNote, envLimit, walkBudget, DEFAULT_MAX_BRACE_EXPANSIONS, type WalkBudget } from "./limits.js";
 
 /**
  * Glob expansion for the `files` argument of glm_ask.
@@ -55,8 +56,15 @@ function closeClass(s: string, i: number): number {
   return j;
 }
 
-/** Split `{a,b}` alternations into one pattern per combination. */
-function expandBraces(pattern: string): string[] {
+/** One `{a,b}` group: where it opens and closes, and its comma-separated parts. */
+interface BraceGroup {
+  start: number;
+  end: number;
+  parts: string[];
+}
+
+/** The first top-level brace group in `pattern`, or null when there is none. */
+function firstBraceGroup(pattern: string): BraceGroup | null {
   for (let i = 0; i < pattern.length; i++) {
     const c = pattern[i];
     if (c === "\\") {
@@ -72,7 +80,6 @@ function expandBraces(pattern: string): string[] {
     const parts: string[] = [];
     let depth = 1;
     let start = i + 1;
-    let closedAt = -1;
     for (let j = i + 1; j < pattern.length; j++) {
       const d = pattern[j];
       if (d === "\\") {
@@ -87,23 +94,74 @@ function expandBraces(pattern: string): string[] {
       else if (d === "}") {
         if (--depth === 0) {
           parts.push(pattern.slice(start, j));
-          closedAt = j;
-          break;
+          return { start: i, end: j, parts };
         }
       } else if (d === "," && depth === 1) {
         parts.push(pattern.slice(start, j));
         start = j + 1;
       }
     }
-    if (closedAt < 0) break; // unbalanced '{' — leave the whole pattern alone
-    const out: string[] = [];
-    for (const part of parts) {
-      out.push(...expandBraces(pattern.slice(0, i) + part + pattern.slice(closedAt + 1)));
-    }
-    return out;
+    return null; // unbalanced '{' — leave the whole pattern alone
   }
-  return [pattern];
+  return null;
 }
+
+/** Split `{a,b}` alternations into one pattern per combination. */
+function expandBraces(pattern: string): string[] {
+  const group = firstBraceGroup(pattern);
+  if (group === null) return [pattern];
+  const out: string[] = [];
+  for (const part of group.parts) {
+    out.push(
+      ...expandBraces(pattern.slice(0, group.start) + part + pattern.slice(group.end + 1)),
+    );
+  }
+  return out;
+}
+
+/**
+ * How many patterns brace expansion of `pattern` would produce, counting only
+ * up to `limit + 1` before giving up (#17). Combinatorial, so a million
+ * combinations cost a thousand stack pushes rather than a million strings —
+ * the count is what lets a caller refuse *before* expanding, and an explicit
+ * stack is what keeps a hostile nesting depth from becoming a RangeError here.
+ */
+export function braceExpansionCount(pattern: string, limit: number): number {
+  let total = 0;
+  const stack: string[] = [pattern];
+  while (stack.length > 0 && total <= limit) {
+    const p = stack.pop() as string;
+    const group = firstBraceGroup(p);
+    if (group === null) {
+      total++;
+      continue;
+    }
+    for (const part of group.parts) {
+      stack.push(p.slice(0, group.start) + part + p.slice(group.end + 1));
+    }
+  }
+  return total;
+}
+
+/**
+ * Expand braces under the GLM_MCP_MAX_BRACE_EXPANSIONS cap (#17): the patterns
+ * when they fit, null when they do not — a count that refuses before expanding
+ * is the only thing that stops both the memory blow-up and the spread-push
+ * RangeError at ~18 nested groups. Called from every route that expands caller
+ * braces, never only one of them.
+ */
+function expandBracesCapped(pattern: string, budget: WalkBudget): string[] | null {
+  if (braceExpansionCount(pattern, budget.maxBraceExpansions) > budget.maxBraceExpansions) {
+    budgetNote(
+      budget,
+      `refused (too many brace expansions): ${pattern} would expand past the ` +
+        `GLM_MCP_MAX_BRACE_EXPANSIONS limit of ${budget.maxBraceExpansions}`,
+    );
+    return null;
+  }
+  return expandBraces(pattern);
+}
+
 
 /** Translate one path segment into a RegExp over directory entry names. */
 function compileSegment(seg: string): RegExp {
@@ -177,6 +235,16 @@ function literalName(seg: string): string | undefined {
 }
 
 /**
+ * The wall-clock limit's note (#16). One spelling shared by every site that can
+ * run out of time — walk's entry checks, its mid-scan samples, the brace-branch
+ * loop — because budgetNote de-duplicates on the message text, and two sites
+ * describing one overrun in two wordings would be two notes.
+ */
+const timeoutNote = (b: WalkBudget): string =>
+  `refused: ${b.pattern} stopped at the GLM_MCP_GLOB_TIMEOUT_MS limit of ` +
+  `${b.timeoutMs}ms; the walk was cut short`;
+
+/**
  * Expand one glob pattern against `cwd` into the files it matches, sorted.
  * Directories are traversed, never listed; a pattern is only reported when it
  * has matched at least one file. Leading `.` and `..` segments resolve against
@@ -208,13 +276,25 @@ function literalName(seg: string): string | undefined {
  * directory it resolves to: two symlinks to one outside directory are two
  * paths the caller has to fix, and keying on the resolved target would
  * collapse them into one report — the same silent narrowing again.
+ *
+ * `budget`, when given, is the walk-wide limits of decision 5 (#16, #17) the
+ * caller shares across every pattern of its call: depth, entries examined and
+ * wall clock stop the walk that hit them and say so through the budget's note
+ * sink, one note per pattern per limit. Without one the expansion is bounded
+ * by the same defaults, read from the environment here — bounded either way,
+ * because a bound that only holds when the caller remembers to pass it is not
+ * a bound. Direct callers have no note sink, so their limit notes go
+ * unrecorded; the limits still hold.
  */
 export function expandGlob(
   pattern: string,
   cwd: string,
   roots?: string[],
   onRefused?: (refused: string) => void,
+  budget?: WalkBudget,
 ): string[] {
+  const b = budget ?? walkBudget();
+  b.pattern = pattern;
   const found = new Set<string>();
   const said = new Set<string>();
   const refuse = onRefused === undefined ? undefined : (p: string) => {
@@ -222,7 +302,23 @@ export function expandGlob(
     said.add(p);
     onRefused(p);
   };
-  for (const p of expandBraces(pattern)) collect(p, cwd, found, roots ?? null, refuse);
+  const expanded = expandBracesCapped(pattern, b);
+  if (expanded === null) return [];
+  // A fully literal branch names one path, so collect never reaches walk's
+  // deadline check — a cap-sized run of such branches is a stat loop the wall
+  // clock never sees, bypassing #16 as thoroughly as a wide single directory.
+  // The clock is read before the first branch — an already-expired budget is
+  // spent however few branches remain, and a stride of 64 would let 63 of
+  // them through unsampled — and then every 64th, like the entry loops below,
+  // rather than every one.
+  let branch = 0;
+  for (const p of expanded) {
+    if (branch++ % 64 === 0 && Date.now() > b.deadline) {
+      budgetNote(b, timeoutNote(b));
+      break;
+    }
+    collect(p, cwd, found, roots ?? null, refuse, b);
+  }
   return [...found].sort();
 }
 
@@ -244,9 +340,19 @@ export function patternAnchor(pattern: string, cwd: string): string {
  * roots is refused up front — with braces, the anchor of the pattern as written
  * is the anchor of none of its branches, and the branch that leaves the roots
  * would otherwise vanish inside `collect` without a word.
+ *
+ * The brace cap (#17) holds here as it does in expandGlob: this is the second
+ * route by which caller braces get expanded, and a cap on one path but not the
+ * other leaves the expansion blow-up wide open. A pattern over the cap has no
+ * anchors to check — the caller that passed a budget has already been told why
+ * in a note, and returns no anchor rather than a silently partial list.
  */
-export function patternAnchors(pattern: string, cwd: string): string[] {
-  return [...new Set(expandBraces(pattern).map((p) => patternAnchor(p, cwd)))];
+export function patternAnchors(pattern: string, cwd: string, budget?: WalkBudget): string[] {
+  const b = budget ?? walkBudget();
+  b.pattern = pattern;
+  const expanded = expandBracesCapped(pattern, b);
+  if (expanded === null) return [];
+  return [...new Set(expanded.map((p) => patternAnchor(p, cwd)))];
 }
 
 /** Everything `collect` needs to know about where a pattern is anchored. */
@@ -308,7 +414,8 @@ function collect(
   cwd: string,
   found: Set<string>,
   roots: string[] | null,
-  onRefused?: (refused: string) => void,
+  onRefused: ((refused: string) => void) | undefined,
+  b: WalkBudget,
 ): void {
   const anchor = anchorOf(pattern, cwd);
   if (anchor === null) return; // a bare root ("/", "C:/") names no segment to match
@@ -362,15 +469,35 @@ function collect(
     return false;
   };
 
-  const walk = (dir: string, rel: string, i: number): void => {
+  // The walk limits of decision 5 (#16): depth stops the descent, entries and
+  // the wall clock stop the walk. Each fires as a note naming its environment
+  // variable — once per pattern, however many directories the walk was about to
+  // be refused — and each leaves the caller's other patterns alone, exactly as a
+  // refused path does.
+  const depthNote = `refused: ${b.pattern} stopped at the GLM_MCP_MAX_DEPTH limit of ` +
+    `${b.maxDepth}; deeper directories were not walked`;
+  const entriesNote = `refused: ${b.pattern} stopped after the GLM_MCP_MAX_ENTRIES limit of ` +
+    `${b.maxEntries} directory entries was reached; the walk was cut short`;
+
+  const walk = (dir: string, rel: string, i: number, depth: number): void => {
     const seg = compiled[i];
     // The pattern ran out: only directories reach this point, and only files count.
     if (seg === undefined) return;
+
+    if (Date.now() > b.deadline) {
+      budgetNote(b, timeoutNote(b));
+      return;
+    }
 
     let entries: Dirent[];
     try {
       entries = readdirSync(dir, { withFileTypes: true });
     } catch {
+      return;
+    }
+    b.entriesSeen += entries.length;
+    if (b.entriesSeen > b.maxEntries) {
+      budgetNote(b, entriesNote);
       return;
     }
 
@@ -391,16 +518,34 @@ function collect(
     };
     const last = i === compiled.length - 1;
 
+    // The deadline is also sampled while the entries are being examined, not
+    // only on the way in: a check at walk's entry bounds how many directories
+    // are entered, so one wide directory — entered once, then scanned as long
+    // as it is wide — never re-meets it (#16). The clock is read every 64th
+    // entry rather than every entry: against a 200,000-entry budget that is
+    // three thousand reads instead of two hundred thousand, and a scan that
+    // crosses the line is still caught within 64 entries of crossing it.
+    let sampled = 0;
+    const outOfTime = (): boolean => ++sampled % 64 === 0 && Date.now() > b.deadline;
+
     if (seg === "**") {
-      walk(dir, rel, i + 1); // '**' may swallow zero segments
+      walk(dir, rel, i + 1, depth); // '**' may swallow zero segments
       for (const e of entries) {
+        if (outOfTime()) {
+          budgetNote(b, timeoutNote(b));
+          return;
+        }
         // '**' never spells a dot out, so hidden directories stay hidden.
         if (e.name.startsWith(".")) continue;
         // Real directories only: a '**'-matched symlink could point anywhere,
         // including back up this very walk, and never terminate it.
         if (e.isDirectory()) {
+          if (depth + 1 > b.maxDepth) {
+            budgetNote(b, depthNote);
+            continue;
+          }
           if (!skip(e.name, i) && enterable(join(dir, e.name), child(e.name))) {
-            walk(join(dir, e.name), child(e.name), i);
+            walk(join(dir, e.name), child(e.name), i, depth + 1);
           }
         } else if (last && kind(e) === "file") emit(child(e.name));
       }
@@ -408,21 +553,29 @@ function collect(
     }
 
     for (const e of entries) {
+      if (outOfTime()) {
+        budgetNote(b, timeoutNote(b));
+        return;
+      }
       if (!seg.test(e.name)) continue;
       const k = kind(e);
       if (last) {
         if (k === "file") emit(child(e.name));
       } else if (k === "dir") {
+        if (depth + 1 > b.maxDepth) {
+          budgetNote(b, depthNote);
+          continue;
+        }
         // A symlinked directory is descended into only where the segment
         // spells its name out — an explicit request, as with the ignore
         // bypass — never where a wildcard happened to match it.
         if ((e.isDirectory() || names[i] === e.name) && !skip(e.name, i)
           && enterable(join(dir, e.name), child(e.name))) {
-          walk(join(dir, e.name), child(e.name), i + 1);
+          walk(join(dir, e.name), child(e.name), i + 1, depth + 1);
         }
       }
     }
   };
 
-  walk(base, start, 0);
+  walk(base, start, 0, 0);
 }
