@@ -236,10 +236,29 @@ try {
   if (!shows(r, 'AAA-IN-ROOT-A')) fail(`a trailing slash on a root must not change it — ${show(r)}`);
 
   // ------------------------ 8. the default root is the server cwd at startup
+  // Emphatically NOT the cwd the caller passes. If the argument were its own
+  // boundary, the untrusted party would be choosing the boundary — and since
+  // "most users will need no configuration at all", #13 would stay open in the
+  // configuration almost everyone actually runs.
   r = ctx({ paths: ['a.txt'], cwd: A, procCwd: A });
   if (!shows(r, 'AAA-IN-ROOT-A')) fail(`with GLM_MCP_ROOTS unset the server cwd must be readable — ${show(r)}`);
   r = ctx({ paths: ['../outside/secret.env'], cwd: A, procCwd: A });
   refuses(r, 'TOPSECRET=hunter2', ['../outside/secret.env'], 'escape from the default root');
+
+  // The caller names a cwd the server was never started in.
+  r = ctx({ paths: ['secret.env'], cwd: at('outside'), procCwd: A });
+  if (!r.refusedCall) fail(`with GLM_MCP_ROOTS unset a caller must not be able to nominate its own cwd as the boundary — ${show(r)}`);
+  if (shows(r, 'TOPSECRET=hunter2')) fail(`a caller-chosen cwd read a file outside the server's own directory — ${show(r)}`);
+
+  // The whole-volume version of the same move: the shortest path from #13's
+  // repro to a full bypass is a caller that simply asks for cwd "/".
+  r = ctx({ paths: ['etc/hosts'], cwd: '/', procCwd: A });
+  if (!r.refusedCall) fail(`a caller passing cwd "/" must be refused, not handed the volume as its root — ${show(r)}`);
+  if (r.text !== '') fail(`a caller passing cwd "/" read something — ${show(r)}`);
+
+  // Narrowing below the startup cwd stays allowed: the caller may narrow.
+  r = ctx({ paths: ['one.ts'], cwd: at('rootA/src'), procCwd: A });
+  if (!shows(r, 'ONE-TS')) fail(`narrowing below the default root must still work — ${show(r)}`);
 
   // ---------------------------------------------- 9. the escape hatch (decision 4)
   const loose = { cwd: A, roots: A, allowAny: true };
