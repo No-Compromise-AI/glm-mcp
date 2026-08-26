@@ -24,6 +24,7 @@
     "verify:globs": "node scripts/verify-globs.mjs",
     "verify:confinement": "node scripts/verify-confinement.mjs",
     "verify:limits": "node scripts/verify-limits.mjs",
+    "verify:redos": "node scripts/verify-redos.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
