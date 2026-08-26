@@ -80,6 +80,7 @@ const NAMES = ['a.ts', 'b.ts', 'ab.ts', 'abc.ts', 'axb', 'a*b', 'a?b', 'a[b', '1
 
 let sem;
 let cost;
+let canary;
 let note;
 
 before(() => {
@@ -96,12 +97,21 @@ before(() => {
   put(cost, 'a'.repeat(200));
   put(cost, 'a'.repeat(30) + 'b');
   put(cost, 'ab');
+  // The in-thread canary gets its own, deliberately smaller fixture. It is the
+  // one cost assertion with no child process between it and the matcher, so a
+  // regression runs here uninterruptibly: against a×200 that is minutes and it
+  // would WEDGE `npm test` rather than fail it, which is the opposite of what a
+  // regression test is for. a×40 is the issue's own subject and cost 3.4s
+  // regressed — over the budget, so the test fails, and bounded, so it fails.
+  canary = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-redos-canary-')));
+  put(canary, 'a'.repeat(40));
+  put(canary, 'a'.repeat(30) + 'b');
   note = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-redos-note-')));
   put(note, 'ok.ts', 'OK-BODY');
 });
 
 after(() => {
-  for (const root of [sem, cost, note]) rmSync(root, { recursive: true, force: true });
+  for (const root of [sem, cost, canary, note]) rmSync(root, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------- the cost
@@ -120,7 +130,7 @@ test('the ×5 measurement runs in this thread inside the bound', () => {
   // on the test's own thread, exactly as it runs on the thread serving MCP
   // calls. On the build this suite was written against it took 3.4 seconds.
   const started = process.hrtime.bigint();
-  const matches = expandGlob('*a'.repeat(5) + 'b', cost);
+  const matches = expandGlob('*a'.repeat(5) + 'b', canary);
   const ms = Number(process.hrtime.bigint() - started) / 1e6;
   assert.ok(ms < BUDGET_MS, `*a×5+b took ${Math.round(ms)}ms in this thread`);
   assert.deepEqual(matches, ['a'.repeat(30) + 'b']);

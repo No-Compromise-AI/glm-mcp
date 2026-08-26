@@ -181,10 +181,10 @@ interface SegmentMatcher {
 
 /**
  * The segment an uncompilable character class leaves behind: `[z-a]` cannot
- * become a matcher, so the segment matches no name at all. The pattern still
- * gets its note — see compileSegment's `onUncompilable` — so an invalid branch
- * cannot hide beside a good one; what the note replaces is the thrown error
- * that used to take the whole call down (the half of #28 that lives here).
+ * become a matcher, so the segment matches no name at all. The pattern is then
+ * reported as having matched nothing — a note naming it, with the good files
+ * beside it still read — rather than a thrown error taking the call down (the
+ * half of #28 that lives here).
  */
 const MATCHES_NOTHING: SegmentMatcher = { test: () => false };
 
@@ -202,13 +202,9 @@ const MATCHES_NOTHING: SegmentMatcher = { test: () => false };
  * character and holds no quantifier, so it cannot backtrack, and keeping the
  * body text identical keeps its parsing — ranges, `[!]`/`[^]` negation,
  * escapes, the unclosed and empty forms staying literal — unchanged. One that
- * will not compile turns the whole segment into MATCHES_NOTHING, and
- * `onUncompilable` — when the caller passes one — reports it, because a
- * segment that quietly matches nothing is a pattern the caller never hears
- * about again: a `{[z-a].ts,ok.ts}` would read its good branch and drop the
- * bad one without a word, the silent narrowing this file exists to prevent.
+ * will not compile turns the whole segment into MATCHES_NOTHING.
  */
-function compileSegment(seg: string, onUncompilable?: (e: Error) => void): SegmentMatcher {
+function compileSegment(seg: string): SegmentMatcher {
   // Hidden entries only match when the pattern spells the dot out, as in minimatch.
   const allowsDot = seg.startsWith(".") || seg.startsWith("\\.");
   const kinds: number[] = [];
@@ -252,10 +248,8 @@ function compileSegment(seg: string, onUncompilable?: (e: Error) => void): Segme
       }
       try {
         push(CLASS, new RegExp(`[${negated}${inner.replace(/[\]\\^]/g, "\\$&")}]`));
-      } catch (e) {
-        // A reversed range, say — reported through the caller's sink, not thrown.
-        onUncompilable?.(e instanceof Error ? e : new Error(String(e)));
-        return MATCHES_NOTHING;
+      } catch {
+        return MATCHES_NOTHING; // a reversed range, say — reported, not thrown
       }
       i = close;
       continue;
@@ -533,18 +527,7 @@ function collect(
     return;
   }
 
-  // A class that will not compile becomes a note here — in the shape
-  // buildFileContext's catch used to lend the throw — rather than a thrown
-  // error, because a throw abandons the branches after it: `{[z-a].ts,ok.ts}`
-  // lost ok.ts to it. Reported at the sink instead, the pattern as written is
-  // named (b.pattern, braces included) and the good branches still run.
-  const compiled: Segment[] = rest.map((s) =>
-    s === "**"
-      ? "**"
-      : compileSegment(s, (e) =>
-          budgetNote(b, `refused: ${b.pattern} (expansion failed: ${e.message})`),
-        ),
-  );
+  const compiled: Segment[] = rest.map((s) => (s === "**" ? "**" : compileSegment(s)));
   // An ignored directory is entered only where the pattern spells its name out
   // as a whole segment: `node_modules/foo/**` is an explicit request, while the
   // `*` in `*/body-parser/node_modules/...` must not ride a later literal past

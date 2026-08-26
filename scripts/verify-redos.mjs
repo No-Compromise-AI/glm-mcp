@@ -171,11 +171,48 @@ process.stdout.write(JSON.stringify({ text: r.text, notes: r.notes }));
     } catch (e) {
       fail(`a reversed character class took the whole call down — it must be a note\n${e.stderr || e.message}`);
     }
-    if (!res.notes.some((n) => n.includes('[z-a].ts'))) {
-      fail(`an uncompilable pattern must be reported, naming it — notes=${JSON.stringify(res.notes)}`);
+    // Naming the pattern is not enough: "no matches" would do that too, and it
+    // is the wrong thing to say. A pattern that CANNOT match is a different
+    // report from one that merely didn't, and the caller fixes them differently.
+    const malformed = (notes, spelling) => notes.some((n) =>
+      n.includes(spelling) && /expansion failed|invalid|malformed|cannot|could not/i.test(n));
+    if (!malformed(res.notes, '[z-a].ts')) {
+      fail(`an uncompilable pattern must be reported as malformed, not merely as matching nothing — notes=${JSON.stringify(res.notes)}`);
+    }
+    if (res.notes.some((n) => n.includes('[z-a].ts') && /no matches/i.test(n))) {
+      fail(`an uncompilable pattern must not be filed under "no matches" — notes=${JSON.stringify(res.notes)}`);
     }
     if (!res.text.includes('OK-BODY')) {
       fail(`a good file beside an uncompilable pattern must still be read — text=${JSON.stringify(res.text)}`);
+    }
+
+    // The same class inside a brace alternation, where another branch succeeds.
+    // Returning the good branch and saying nothing is the silent-narrowing shape
+    // this project keeps removing — and the branch that vanished is a malformed
+    // pattern the caller almost certainly wants to know about.
+    const braced = `
+import { buildFileContext } from ${JSON.stringify(GLM)};
+process.env.GLM_MCP_ROOTS = ${JSON.stringify(bad)};
+const r = buildFileContext(['{[z-a].ts,ok.ts}', 'absent-*.zzz'], ${JSON.stringify(bad)});
+process.stdout.write(JSON.stringify({ text: r.text, notes: r.notes }));
+`;
+    let br;
+    try {
+      br = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', braced],
+        { cwd: bad, encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+    } catch (e) {
+      fail(`an uncompilable class inside braces took the call down\n${e.stderr || e.message}`);
+    }
+    if (!br.text.includes('OK-BODY')) {
+      fail(`the good brace branch must still be read — text=${JSON.stringify(br.text)}`);
+    }
+    if (!malformed(br.notes, '{[z-a].ts,ok.ts}')) {
+      fail(`an uncompilable brace branch must be reported even when another branch succeeds — notes=${JSON.stringify(br.notes)}`);
+    }
+    // And the correction must not swallow the ordinary case: a pattern that
+    // genuinely matched nothing still says so.
+    if (!br.notes.some((n) => n.includes('absent-*.zzz') && /no matches/i.test(n))) {
+      fail(`a pattern that genuinely matched nothing must still say so — notes=${JSON.stringify(br.notes)}`);
     }
   } finally {
     rmSync(bad, { recursive: true, force: true });
