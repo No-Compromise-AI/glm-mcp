@@ -212,3 +212,26 @@ test('an uncompilable class stays a note, and the files beside it are read', () 
     else delete process.env.GLM_MCP_ROOTS;
   }
 });
+
+test('an uncompilable class inside braces stays a named note, and the good branch is read', () => {
+  // The same failure reaching compileSegment through `{a,b}` expansion is the
+  // case a note per thrown pattern never covered: the old throw named the
+  // whole pattern but took the good branch's matches down with it, while a
+  // catch that only makes the segment match nothing keeps the matches and
+  // drops the note — the invalid branch vanishes without a word. Both halves
+  // have to hold at once: the pattern named, and ok.ts still read through the
+  // branch beside the uncompilable one.
+  const hadRoots = 'GLM_MCP_ROOTS' in process.env;
+  const savedRoots = process.env.GLM_MCP_ROOTS;
+  process.env.GLM_MCP_ROOTS = note;
+  try {
+    const ctx = buildFileContext(['{[z-a].ts,ok.ts}'], note);
+    assert.ok(ctx.notes.some((n) => n.includes('{[z-a].ts,ok.ts}')),
+      `the pattern must be reported by name, braces included — notes=${JSON.stringify(ctx.notes)}`);
+    assert.ok(ctx.text.includes('OK-BODY'),
+      `the good branch must still be read — text=${JSON.stringify(ctx.text)}`);
+  } finally {
+    if (hadRoots) process.env.GLM_MCP_ROOTS = savedRoots;
+    else delete process.env.GLM_MCP_ROOTS;
+  }
+});
