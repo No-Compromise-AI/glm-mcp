@@ -1,5 +1,5 @@
-import { readdirSync, type Dirent } from "node:fs";
-import { join } from "node:path";
+import { readdirSync, statSync, type Dirent } from "node:fs";
+import { join, resolve } from "node:path";
 
 /**
  * Glob expansion for the `files` argument of glm_ask.
@@ -178,9 +178,12 @@ function literalName(seg: string): string | undefined {
 /**
  * Expand one glob pattern against `cwd` into the files it matches, sorted.
  * Directories are traversed, never listed; a pattern is only reported when it
- * has matched at least one file. Ignored directories (see globIgnoreSet) are
- * not entered — unless the pattern spells their name out as a segment, which
- * reads as the caller asking for them deliberately.
+ * has matched at least one file. Leading `.` and `..` segments resolve against
+ * `cwd`, so `./src/**` and `../neighbour/src/**` start where they point.
+ * Ignored directories (see globIgnoreSet) are not entered — unless the pattern
+ * spells their name out as a segment, which reads as the caller asking for
+ * them deliberately. The same explicitness decides symlinked directories: a
+ * segment that names one is followed, a wildcard that merely matches it is not.
  */
 export function expandGlob(pattern: string, cwd: string): string[] {
   const found = new Set<string>();
@@ -193,17 +196,51 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
   const segments = pattern.split("/").filter((s) => s.length > 0);
   if (segments.length === 0) return;
 
-  const compiled: Segment[] = segments.map((s) => (s === "**" ? "**" : compileSegment(s)));
+  // Leading literal segments — `.` and `..` included — resolve into the base
+  // directory up front; `collect` would otherwise look for a directory entry
+  // literally called `.` or `..` and match nothing. The prefix mirrors what
+  // resolve() does, kept as display text for the paths that get emitted.
+  let base = absolute ? "/" : cwd;
+  const prefix: string[] = [];
+  let first = 0;
+  while (first < segments.length) {
+    const name = literalName(segments[first]);
+    if (name === undefined) break;
+    first++;
+    if (name === ".") continue;
+    if (name === "..") {
+      if (prefix.length > 0 && prefix[prefix.length - 1] !== "..") prefix.pop();
+      else if (!absolute) prefix.push(".."); // above `/` there is nowhere left to name
+    } else {
+      prefix.push(name);
+    }
+    base = resolve(base, name);
+  }
+  const start = prefix.join("/");
+  const emit = (rel: string) => {
+    found.add(absolute ? `/${rel}` : rel);
+  };
+
+  // A pattern that stays literal the whole way through names a single path:
+  // one file, or nothing — directories are traversed, never listed.
+  if (first === segments.length) {
+    try {
+      if (statSync(base).isFile()) emit(start);
+    } catch {
+      return; // a path that cannot be stat'd matches nothing
+    }
+    return;
+  }
+
+  const rest = segments.slice(first);
+  const compiled: Segment[] = rest.map((s) => (s === "**" ? "**" : compileSegment(s)));
   // An ignored directory is entered only where the pattern spells its name out
   // as a whole segment: `node_modules/foo/**` is an explicit request, while the
   // `*` in `*/body-parser/node_modules/...` must not ride a later literal past
   // an unrelated node_modules. `**` names nothing, so it never unlocks a skip.
-  const names: (string | undefined)[] = segments.map((s) => (s === "**" ? undefined : literalName(s)));
+  const names: (string | undefined)[] = rest.map((s) => (s === "**" ? undefined : literalName(s)));
   const ignored = globIgnoreSet();
   const skip = (name: string, i: number) => ignored.has(name) && names[i] !== name;
-  const emit = (rel: string) => {
-    found.add(absolute ? `/${rel}` : rel);
-  };
 
   const walk = (dir: string, rel: string, i: number): void => {
     const seg = compiled[i];
@@ -218,7 +255,20 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
     }
 
     const child = (name: string) => (rel === "" ? name : `${rel}/${name}`);
-    const isFile = (e: Dirent) => e.isFile() || e.isSymbolicLink();
+    // What an entry is on disk. A symlink is resolved to its target so a link
+    // to a directory stops posing as a file and a broken link matches nothing;
+    // only symlinks need the stat, everything else is already known.
+    const kind = (e: Dirent): "dir" | "file" | "other" => {
+      if (e.isDirectory()) return "dir";
+      if (e.isFile()) return "file";
+      if (!e.isSymbolicLink()) return "other";
+      try {
+        const target = statSync(join(dir, e.name));
+        return target.isDirectory() ? "dir" : target.isFile() ? "file" : "other";
+      } catch {
+        return "other";
+      }
+    };
     const last = i === compiled.length - 1;
 
     if (seg === "**") {
@@ -226,22 +276,30 @@ function collect(pattern: string, cwd: string, found: Set<string>): void {
       for (const e of entries) {
         // '**' never spells a dot out, so hidden directories stay hidden.
         if (e.name.startsWith(".")) continue;
+        // Real directories only: a '**'-matched symlink could point anywhere,
+        // including back up this very walk, and never terminate it.
         if (e.isDirectory()) {
           if (!skip(e.name, i)) walk(join(dir, e.name), child(e.name), i);
-        } else if (last && isFile(e)) emit(child(e.name));
+        } else if (last && kind(e) === "file") emit(child(e.name));
       }
       return;
     }
 
     for (const e of entries) {
       if (!seg.test(e.name)) continue;
+      const k = kind(e);
       if (last) {
-        if (isFile(e)) emit(child(e.name));
-      } else if (e.isDirectory() && !skip(e.name, i)) {
-        walk(join(dir, e.name), child(e.name), i + 1);
+        if (k === "file") emit(child(e.name));
+      } else if (k === "dir") {
+        // A symlinked directory is descended into only where the segment
+        // spells its name out — an explicit request, as with the ignore
+        // bypass — never where a wildcard happened to match it.
+        if ((e.isDirectory() || names[i] === e.name) && !skip(e.name, i)) {
+          walk(join(dir, e.name), child(e.name), i + 1);
+        }
       }
     }
   };
 
-  walk(absolute ? "/" : cwd, "", 0);
+  walk(base, start, 0);
 }

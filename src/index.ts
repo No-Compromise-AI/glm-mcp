@@ -31,10 +31,12 @@ server.registerTool(
         .describe(
           "Optional files to include as context: literal paths and/or glob patterns " +
             '(e.g. "src/**/*.ts"). Each glob expands to its matching files, sorted and ' +
-            "de-duplicated; a pattern that matches nothing is reported in the response notes. " +
-            "Glob expansion skips node_modules, .git and build output by default; naming a " +
-            "directory in the pattern (node_modules/foo/**/*.d.ts) or setting " +
-            "GLM_MCP_GLOB_IGNORE overrides that. Relative paths resolve against 'cwd'.",
+            "de-duplicated across the whole list; a pattern that matches nothing is reported " +
+            "in the response notes. A path that exists on disk is used literally even when it " +
+            "contains glob characters. Glob expansion skips node_modules, .git and build " +
+            "output by default; naming a directory in the pattern (node_modules/foo/**/*.d.ts) " +
+            "or setting GLM_MCP_GLOB_IGNORE overrides that. Relative paths — ./ and ../ " +
+            "prefixes included — resolve against 'cwd'.",
         ),
       cwd: z
         .string()

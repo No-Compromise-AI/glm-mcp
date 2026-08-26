@@ -71,13 +71,21 @@ export function buildFileContext(paths: string[], cwd: string): { text: string; 
   let total = 0;
 
   // Glob entries expand to the files they match, sorted and de-duplicated against
-  // everything already listed; literal paths go through exactly as given.
+  // everything already listed; literal paths go through exactly as given. Every
+  // entry — literal or expansion — is checked against what came before it, so a
+  // file named twice, directly and through a glob, appears once regardless of
+  // argument order. A path that exists on disk is used literally even when its
+  // name contains glob metacharacters: report[final].md exists as itself before
+  // it exists as a pattern.
   const files: string[] = [];
   const included = new Set<string>();
   for (const p of paths) {
-    if (!isGlobPattern(p)) {
-      included.add(resolve(cwd, p));
-      files.push(p);
+    if (!isGlobPattern(p) || existsSync(resolve(cwd, p))) {
+      const key = resolve(cwd, p);
+      if (!included.has(key)) {
+        included.add(key);
+        files.push(p);
+      }
       continue;
     }
     const matches = expandGlob(p, cwd);

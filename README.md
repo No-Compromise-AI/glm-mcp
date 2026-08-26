@@ -71,11 +71,15 @@ Lists the model ids available on the configured account.
 - Thinking budgets: `low` 2048, `high` 8192, `max` 24576 tokens. `max_tokens` is automatically
   raised to leave headroom for the answer on top of the budget.
 - File context accepts literal paths and glob patterns. Each glob expands to the files it
-  matches — sorted, de-duplicated, directories traversed but never listed, hidden (dot)
-  entries skipped unless the pattern spells the dot out. Supported syntax: `*`, `**`, `?`,
-  `[a-z]`/`[!a-z]`, `{a,b}` and `\` escapes. A pattern that matches nothing is reported in
-  `Notes`, exactly like a missing file. Globs do not descend through symlinked directories
-  (literal paths still follow symlinks).
+  matches — sorted, de-duplicated across the whole expanded list, directories traversed but
+  never listed, hidden (dot) entries skipped unless the pattern spells the dot out. Supported
+  syntax: `*`, `**`, `?`, `[a-z]`/`[!a-z]`, `{a,b}` and `\` escapes; leading `.` and `..`
+  segments resolve against `cwd`, so `./src/**` and `../neighbour/src/**` work. A path that
+  exists on disk is used literally even when its name contains glob metacharacters — a real
+  `report[final].md` is read, not pattern-matched. A pattern that matches nothing is reported
+  in `Notes`, exactly like a missing file. Glob expansion follows a symlinked directory only
+  when the pattern names it explicitly (`linked/*.ts`); wildcards never follow symlinks, and
+  a link to a directory is never listed as a file.
 - **Glob expansion skips dependency and output directories** — `node_modules`, `.git`,
   `dist`, `build`, `coverage`, `.next`, `.turbo`, `vendor`, `target` — so `**/*.ts` matches
   your source instead of 1,700 dependency type definitions crowding out the context budget.
@@ -97,6 +101,7 @@ Lists the model ids available on the configured account.
 npm test               # unit tests for glob expansion (builds first)
 npm run smoke          # drives the server over stdio as a real MCP client (needs a z.ai key)
 npm run verify:ignore  # acceptance gate for the glob ignore semantics
+npm run verify:globs   # acceptance gate for the glob path handling (#3)
 ```
 
 `smoke` covers the tool list, model list, reasoning, file context, glob expansion, the
@@ -105,4 +110,6 @@ semantics against this repository and a throwaway fixture tree holding every def
 directory: wildcards skip all of them (nested ones included), an explicit segment — escaped or
 not — still enters the directory it names, a literal later in the pattern cannot unlock a
 wildcard earlier in it, and `GLM_MCP_GLOB_IGNORE` replaces the defaults, trims its entries,
-and disables skipping entirely when empty.
+and disables skipping entirely when empty. `verify:globs` checks `./` and `../` prefixes,
+order-independent de-duplication, literal paths containing glob metacharacters, and symlinked
+directories, against this repository and a fixture tree of its own.

@@ -1,12 +1,16 @@
 // Glob ignore-directory behaviour (issue #2): default skip set, explicit-name
 // bypass, and GLM_MCP_GLOB_IGNORE override — exercised against a hermetic
 // fixture tree so the assertions don't depend on this repository's contents.
+// The suite below that covers issue #3: `./`/`../` prefixes, order-independent
+// de-duplication, literal paths containing glob metacharacters, and symlinked
+// directories.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { expandGlob } from '../dist/glob.js';
+import { buildFileContext } from '../dist/glm.js';
 
 const DEFAULT_IGNORED = [
   'node_modules', '.git', 'dist', 'build', 'coverage', '.next', '.turbo', 'vendor', 'target',
@@ -96,4 +100,106 @@ test('an empty GLM_MCP_GLOB_IGNORE disables skipping entirely', (t) => {
     'src/body-parser/node_modules/content-type/dist/index.d.ts',
     'src/node_modules/b.ts',
   ].sort());
+});
+
+// --- issue #3 ---
+
+let fx;
+const occurrences = (ctx, marker) => ctx.text.split(marker).length - 1;
+
+before(() => {
+  delete process.env.GLM_MCP_GLOB_IGNORE;
+  fx = mkdtempSync(join(tmpdir(), 'glm-glob-issue3-'));
+  const put = (dir, name, body = 'x') => {
+    mkdirSync(join(fx, dir), { recursive: true });
+    writeFileSync(join(fx, dir, name), body);
+  };
+  put('src', 'a.ts', 'A');
+  put('src', 'b.ts', 'B');
+  put('src', 'glm.ts', 'GLM');
+  put('lib', 'x.ts');
+  put('', 'report[final].md', 'FINAL REPORT');
+  put('cls', 'a.md', 'A-MD');
+  put('cls', 'b.md', 'B-MD');
+  symlinkSync(join(fx, 'src'), join(fx, 'linked'), 'dir');
+  symlinkSync(join(fx, 'src'), join(fx, 'dirlink'), 'dir');
+  symlinkSync(join(fx, 'src', 'a.ts'), join(fx, 'filelink'), 'file');
+});
+after(() => rmSync(fx, { recursive: true, force: true }));
+
+test('a ./ prefix resolves against the expansion cwd', () => {
+  const expected = ['src/a.ts', 'src/b.ts', 'src/glm.ts'];
+  assert.deepEqual(expandGlob('src/*.ts', fx), expected);
+  assert.deepEqual(expandGlob('./src/*.ts', fx), expected);
+  assert.deepEqual(expandGlob('./src/**/*.ts', fx), expandGlob('src/**/*.ts', fx));
+});
+
+test('a ../ prefix climbs out of the cwd and back in', () => {
+  const pattern = `../${basename(fx)}/src/*.ts`;
+  assert.deepEqual(expandGlob(pattern, fx), ['src/a.ts', 'src/b.ts', 'src/glm.ts'].map(
+    (f) => `../${basename(fx)}/${f}`,
+  ));
+  // The expanded names must still resolve to the files they name.
+  const ctx = buildFileContext([pattern], fx);
+  assert.equal(occurrences(ctx, '--- ../'), 3);
+  assert.ok(ctx.text.includes('GLM'), 'the climbed-out files must be read');
+  assert.deepEqual(ctx.notes, []);
+});
+
+test('dot segments inside a leading literal run resolve', () => {
+  assert.deepEqual(expandGlob('src/../lib/*.ts', fx), ['lib/x.ts']);
+  assert.deepEqual(expandGlob('./src/./glm.ts', fx), ['src/glm.ts']);
+});
+
+test('a fully literal pattern still names its file', () => {
+  // Guards the leading-literal resolution against swallowing the whole pattern.
+  assert.deepEqual(expandGlob('src/glm.ts', fx), ['src/glm.ts']);
+  assert.deepEqual(expandGlob('lib', fx), []); // directories are never listed
+});
+
+test('de-duplication does not depend on argument order', () => {
+  for (const paths of [['src/*.ts', 'src/glm.ts'], ['src/glm.ts', 'src/*.ts']]) {
+    const ctx = buildFileContext(paths, fx);
+    assert.equal(occurrences(ctx, '--- src/glm.ts ---'), 1, JSON.stringify(paths));
+    for (const f of ['src/a.ts', 'src/b.ts']) {
+      assert.ok(ctx.text.includes(`--- ${f} ---`), `${f} went missing`);
+    }
+  }
+});
+
+test('a repeated literal path appears exactly once', () => {
+  const ctx = buildFileContext(['src/glm.ts', 'src/glm.ts'], fx);
+  assert.equal(occurrences(ctx, '--- src/glm.ts ---'), 1);
+});
+
+test('a literal path wins over pattern interpretation', () => {
+  const ctx = buildFileContext(['report[final].md'], fx);
+  assert.ok(ctx.text.includes('FINAL REPORT'), 'the existing file must be read');
+  assert.deepEqual(ctx.notes, []);
+});
+
+test('metacharacter spellings without a literal file still expand as patterns', () => {
+  const ctx = buildFileContext(['cls/[ab].md'], fx);
+  assert.ok(ctx.text.includes('A-MD'));
+  assert.ok(ctx.text.includes('B-MD'));
+  assert.deepEqual(ctx.notes, []);
+});
+
+test('an explicitly named symlinked directory is followed', () => {
+  assert.deepEqual(expandGlob('linked/*.ts', fx), [
+    'linked/a.ts', 'linked/b.ts', 'linked/glm.ts',
+  ]);
+});
+
+test('wildcards still never follow symlinked directories', () => {
+  assert.deepEqual(expandGlob('*/a.ts', fx), ['src/a.ts']);
+});
+
+test('a symlink to a directory is not listed as a file', () => {
+  assert.deepEqual(expandGlob('dirlink', fx), []);
+  assert.deepEqual(expandGlob('dir*', fx), []);
+});
+
+test('a symlink to a file still matches', () => {
+  assert.deepEqual(expandGlob('filelink', fx), ['filelink']);
 });
