@@ -39,7 +39,12 @@ The server never hardcodes a key. It resolves one from, in order:
 
 1. `ZAI_API_KEY`
 2. `~/.config/zai/api-key`
-3. the `api.z.ai` key ZCode already stores in `~/.zcode/v2/config.json`
+3. the `api.z.ai` key ZCode stores in `~/.zcode/v2/config.json` — **only** when
+   `GLM_MCP_ALLOW_ZCODE_KEY=1` is set
+
+Step 3 is opt-in on purpose. It reads a credential belonging to a different application,
+and that should be a decision you make rather than behaviour you discover. Everything runs
+on the machine doing the installing: your key, your z.ai account, your billing.
 
 Note that the ZCode **Start Plan** token is not usable here — that endpoint is captcha-locked to
 the ZCode app and rejects outside clients with `3007`. You need an `api.z.ai` key with a Coding
