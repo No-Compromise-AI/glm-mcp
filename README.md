@@ -21,7 +21,7 @@ Register it once, user-scoped, and it is available in **every** project on the m
 per-project setup:
 
 ```bash
-claude mcp add --scope user glm -- npx -y @ncai/glm-mcp
+claude mcp add --scope user glm -- npx -y @nocompromiseai/glm-mcp
 ```
 
 Or from a local checkout:
