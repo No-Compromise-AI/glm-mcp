@@ -6,9 +6,11 @@
 // keep naming is the caller's own spelling: that is its argument coming back.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { buildFileContext, resolveApiKey } from '../dist/glm.js';
 
 // chmod 000 denies a read to every account but root — and root is exactly the
@@ -479,6 +481,8 @@ test('the same argument list answers the same whether the named file exists', (t
     ['decoy.txt', 'probe[.]txt'],
     ['probe*.txt'],
     ['probe*.txt', 'probe.txt'],              // a match the pattern claims before the literal names it
+    ['probe[.]txt', 'probe[.]txt'],           // the same spelling twice: one note per ARGUMENT, so
+    ['probe.txt', 'probe.txt'],               // the count of notes is not itself the answer
   ]) {
     const present = probe(true, paths);
     const absent = probe(false, paths);
@@ -494,6 +498,73 @@ test('the same argument list answers the same whether the named file exists', (t
   const named = probe(false, ['probe[.]txt']);
   assert.ok(named.notes.some((n) => n.includes('probe[.]txt')),
     `the note must still name the spelling the caller sent — ${JSON.stringify(named.notes)}`);
+});
+
+test('a cap that cuts the reads short still answers every argument alike', (t) => {
+  // The same property with the char cap in play. A cap that fills mid-list
+  // stops the reads outright, and the round before this one let the literals
+  // after the cut keep a silence the patterns among them were never granted —
+  // another distinction decided by whether the named file exists, which is
+  // the oracle in a different hat. GLM_MCP_MAX_FILE_CHARS is read at module
+  // load, so each probe runs in a child that carries the cap from birth.
+  const check = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-cap-0-')));
+  writeFileSync(join(check, 'canary'), 'X');
+  const denied = deniesRead(join(check, 'canary'));
+  rmSync(check, { recursive: true, force: true });
+  if (!denied) {
+    t.skip('chmod 000 did not deny the read (running as root?) — the cap case cannot be exercised here');
+    return;
+  }
+  const CHILD = `
+import { buildFileContext } from ${JSON.stringify(pathToFileURL(new URL('../dist/glm.js', import.meta.url).pathname).href)};
+const job = JSON.parse(process.argv[1]);
+const r = buildFileContext(job.paths, job.cwd);
+process.stdout.write(JSON.stringify({ text: r.text, notes: r.notes }));`;
+  const probe = (present, paths) => {
+    const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-cap-')));
+    try {
+      // Readable, and over the cap on its own, so the cut always lands here.
+      writeFileSync(join(dir, 'big.txt'), 'B'.repeat(200));
+      if (present) {
+        for (const name of ['probe[.]txt', 'probe.txt']) {
+          const f = join(dir, name);
+          writeFileSync(f, 'S');
+          chmodSync(f, 0o000);
+        }
+      }
+      const childEnv = { ...process.env };
+      for (const k of Object.keys(childEnv)) if (/^(GLM_MCP_|ZAI_)/.test(k)) delete childEnv[k];
+      childEnv.GLM_MCP_ROOTS = dir;
+      childEnv.GLM_MCP_MAX_FILE_CHARS = '80';
+      return JSON.parse(execFileSync(
+        process.execPath,
+        ['--input-type=module', '-e', CHILD, JSON.stringify({ paths, cwd: dir })],
+        { encoding: 'utf8', env: childEnv, timeout: 30_000, maxBuffer: 16 * 1024 * 1024 },
+      ));
+    } finally {
+      for (const name of ['probe[.]txt', 'probe.txt']) {
+        try { chmodSync(join(dir, name), 0o600); } catch { /* absent */ }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  for (const paths of [
+    ['big.txt', 'probe[.]txt'],                // a metacharacter-named entry after the cut
+    ['big.txt', 'probe[.]txt', 'probe[.]txt'], // ...and repeated, so the count cannot tell either
+    ['probe[.]txt', 'big.txt'],                // the cut entry ahead of the cap-filling file
+    ['big.txt', 'probe.txt'],                  // a plain spelling after the cut
+    ['big.txt', 'probe*.txt'],                 // a pattern after the cut, as it always answered
+  ]) {
+    const present = probe(true, paths);
+    const absent = probe(false, paths);
+    assert.ok(present.notes.some((n) => /truncated/i.test(n)),
+      `the fixture must actually cut the reads for ${JSON.stringify(paths)} — ${JSON.stringify(present.notes)}`);
+    assert.ok(!present.text.includes('S'),
+      `the unreadable body leaked for ${JSON.stringify(paths)}`);
+    assert.deepEqual(present.notes, absent.notes,
+      `${JSON.stringify(paths)} under the cap tells a caller whether the file exists — ${JSON.stringify({
+        present: present.notes, absent: absent.notes })}`);
+  }
 });
 
 test('an uncompilable pattern is refused in this project\'s words, not V8\'s', () => {  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-pattern-')));

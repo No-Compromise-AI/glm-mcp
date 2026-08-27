@@ -470,11 +470,13 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // Every pattern of this call and the resolved matches it found — the
   // de-duplicated ones too, because the note these exist to write asks the
   // pattern a question (did it contribute anything?) that a match claimed by
-  // an earlier entry still answers. A Map, so a pattern repeated in the
-  // argument list is one entry and says its one note once; the value carries
-  // the argument that first sent the pattern, which is where that note is
-  // filed.
-  const patternMatches = new Map<string, { arg: number; found: Set<string> }>();
+  // an earlier entry still answers. A Map, so a spelling repeated in the
+  // argument list pools one found-set instead of walking twice — but the note
+  // is owed to every argument that sent the spelling, not to the spelling,
+  // because the literal route answers each repetition separately and the count
+  // of answers is itself an answer: merge them and a caller learns whether a
+  // repeated spelling named a file by counting what came back.
+  const patternMatches = new Map<string, { found: Set<string> }>();
   // The files this result already speaks for, by resolved identity: one
   // delivered its content, was truncated, or was refused in a note naming
   // it. A file that yielded nothing readable is deliberately not here — that
@@ -556,12 +558,11 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       // Every match is recorded against the pattern, de-duplicated or not;
       // a pattern that matched nothing is recorded the same way, with no
       // matches. The answer this feeds is written after the reads, because
-      // whether an argument contributed anything is known only then.
+      // whether an argument contributed anything is known only then. A pending
+      // per argument that sent the spelling — see patternMatches above.
       let rec = patternMatches.get(p);
-      if (!rec) {
-        patternMatches.set(p, (rec = { arg, found: new Set<string>() }));
-        pendings.push({ arg, via: p, kind: "pattern", found: rec.found });
-      }
+      if (!rec) patternMatches.set(p, (rec = { found: new Set<string>() }));
+      pendings.push({ arg, via: p, kind: "pattern", found: rec.found });
       for (const m of matches) {
         const key = keyOf(m);
         rec.found.add(key);
@@ -582,11 +583,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     }
   }
 
-  // Literal file entries the char cap cut the loop short of, by resolved
-  // identity — filled at the break below, read at the answer after it.
-  const neverReached = new Set<string>();
-
-  for (const [i, { p, via, resolved, arg }] of files.entries()) {
+  for (const { p, via, resolved, arg } of files) {
     // Re-checked at read time because a glob match may be a symlink whose
     // target leaves the roots only once resolved; the anchor could not see it.
     if (denied.has(resolved)) {
@@ -667,14 +664,11 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         msg: `truncated at ${MAX_FILE_CHARS} total chars starting with: ${p}`,
       });
       // The cap cut the loop here, so the entries after this one were never
-      // attempted. A literal among them keeps the silence it has always had:
-      // the truncation note already says why nothing further was read, and
-      // "no matches" would claim a file the call simply never reached was
-      // wrong. A pattern after the cut is still answered below, as it always
-      // has been.
-      for (const later of files.slice(i + 1)) {
-        if (later.via === later.p) neverReached.add(later.resolved);
-      }
+      // attempted — and each is still answered below, exactly as a pattern
+      // after the cut always was. Silencing the literals among them was this
+      // oracle wearing the cap's hat: which branch an entry took is decided
+      // by whether the file exists, so a literal silenced where a pattern
+      // would be noted tells a caller the named file is there.
       break;
     }
     chunks.push(`${sep}${header}${body}`);
@@ -698,7 +692,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // beside it would claim it was simply wrong.
   for (const pending of pendings) {
     if (pending.kind === "literal") {
-      if (!neverReached.has(pending.key) && !spokenFor.has(pending.key)) {
+      if (!spokenFor.has(pending.key)) {
         notes.push({ arg: pending.arg, msg: skipNote(pending.via) });
       }
       continue;
