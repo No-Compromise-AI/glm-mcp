@@ -740,6 +740,61 @@ function isBinary(raw: Buffer): boolean {
   return false;
 }
 
+/**
+ * A `:first-last` line-range suffix on a `files` entry (#53):
+ * `src/auth/session.ts:40-120` asks for lines 40 through 120 of that file,
+ * both ends inclusive. Only the END of an argument is claimed, and only when
+ * the whole spelling names nothing on disk — a path that exists is read
+ * literally whatever its name could be parsed into, the rule it already has
+ * against glob characters (#13), so `weird:10-20.txt` is a filename. A range
+ * whose path names nothing is not an error either: the argument falls through
+ * to the ordinary branches under its whole spelling, so the answer it gets
+ * names what the caller sent (#40).
+ */
+const RANGE_SUFFIX = /:(\d+)-(\d+)$/;
+
+function rangeOf(p: string): { path: string; first: number; last: number } | undefined {
+  const m = RANGE_SUFFIX.exec(p);
+  if (m === null || m.index === 0) return undefined;
+  const first = Number(m[1]);
+  const last = Number(m[2]);
+  // A range runs forward from a real line of the file. Anything else is left
+  // to the ordinary reading of the argument rather than reinterpreted, so a
+  // typo is answered in the spelling that contains it.
+  if (first < 1 || first > last) return undefined;
+  return { path: p.slice(0, m.index), first, last };
+}
+
+/**
+ * A body's lines, counted the way `cat -n` counts them (#53): a trailing
+ * newline ends the last line rather than opening an empty one, and an empty
+ * file has no lines at all — there is nothing to number and no number to
+ * cite, so it still contributes a header and no body, exactly as before.
+ */
+function splitLines(body: string): string[] {
+  if (body === "") return [];
+  const lines = body.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+/**
+ * An excerpt as the model receives it (#53): every line prefixed with its own
+ * number, right-aligned to the width of the last number shown and followed by
+ * a tab — `cat -n`'s shape. The numbers are the FILE's own: an excerpt taken
+ * by range keeps them (lines 40-120 are numbered 40 to 120, never 1 to 81),
+ * because the README's example answer is `session.ts:88` and a citation off
+ * an excerpt renumbered from 1 points confidently at the wrong place, which
+ * is worse than no numbers at all — the caller cannot tell.
+ */
+function numberLines(lines: string[], first: number): string {
+  if (lines.length === 0) return "";
+  const width = String(first + lines.length - 1).length;
+  return lines
+    .map((line, i) => `${String(first + i).padStart(width, " ")}\t${line}`)
+    .join("\n");
+}
+
 export interface FileContext {
   text: string;
   notes: string[];
@@ -757,7 +812,11 @@ export interface FileContext {
  * window — the window of the `model` the request will actually use (#59),
  * which defaults to DEFAULT_MODEL when the caller names none; the argument is
  * optional because two-argument callers exist (verify:capacity) and
- * MAX_FILE_CHARS keeps its meaning as the default model's budget. Paths are
+ * MAX_FILE_CHARS keeps its meaning as the default model's budget. Every line
+ * of every file carries its own number, `cat -n` style, so an answer can cite
+ * `session.ts:88` and mean it; a literal entry may name an inclusive line
+ * range (`src/auth/session.ts:40-120`), which sends that region numbered with
+ * the FILE's line numbers rather than the whole file (#53). Paths are
  * confined to the operator's roots (see confine.ts): every file's realpath
  * must land inside one, which is what closes the ../ and symlink escapes, and
  * the server's own credentials are refused regardless of roots. A refused
@@ -896,7 +955,26 @@ export function buildFileContext(
   // notes name which of its arguments was dropped, never a resolved path that
   // would widen what notes already disclose. `arg` is the position of that
   // argument, so the notes the reads push are filed under it too.
-  const files: Array<{ p: string; via: string; resolved: string; arg: number }> = [];
+  //
+  // A ranged excerpt (#53) widens the entry: `key` is the resolved file WITH
+  // its range, because two ranges of one file are two asks and must both be
+  // delivered while the same range twice is the duplicate the set exists to
+  // catch — a NUL cannot occur in a resolved path on any platform, so the
+  // suffix can never collide with a real file that happens to be named like
+  // one. `read` is the path to read, the caller's spelling for everything
+  // else and the range-stripped path for an excerpt, whose whole spelling
+  // stays in `p`/`via` for the header and the notes. `first`/`last` name the
+  // inclusive line range; absent, the whole file.
+  const files: Array<{
+    p: string;
+    via: string;
+    resolved: string;
+    arg: number;
+    key: string;
+    read?: string;
+    first?: number;
+    last?: number;
+  }> = [];
   const included = new Set<string>();
   // The ARGUMENT POSITIONS this result already speaks for: the position's
   // own entry — the one its spelling created, never one an earlier argument
@@ -957,6 +1035,48 @@ export function buildFileContext(
       notes.push({ arg, msg: `refused (credential path): ${p}` });
       continue;
     }
+    // A line range (#53), read only when the whole spelling names nothing —
+    // what exists on disk is a literal path before it is a syntax (#13), so
+    // the existence question is asked of the whole argument first. The
+    // credential rule runs on the range-stripped path too, before anything
+    // asks whether that path exists, for the same reason it ran above: an
+    // unreadable thing is refused, never reported missing.
+    if (!namesSomething(p)) {
+      const range = rangeOf(p);
+      if (range !== undefined) {
+        const rresolved = keyOf(range.path);
+        if (denied.has(rresolved)) {
+          notes.push({ arg, msg: `refused (credential path): ${p}` });
+          continue;
+        }
+        if (namesSomething(range.path)) {
+          const key = `${rresolved}\0${range.first}-${range.last}`;
+          if (!included.has(key)) {
+            if (roots && !insideRoots(rresolved, roots)) {
+              notes.push({ arg, msg: `refused: ${p} resolves outside the allowed roots` });
+              included.add(key);
+              continue;
+            }
+            included.add(key);
+            files.push({
+              p,
+              via: p,
+              resolved: rresolved,
+              arg,
+              key,
+              read: range.path,
+              first: range.first,
+              last: range.last,
+            });
+          }
+          pendings.push({ arg, via: p });
+          continue;
+        }
+        // The range names no file. The argument falls through under its whole
+        // spelling, so whatever answers it — `no matches`, most likely — says
+        // the thing the caller actually sent (#40).
+      }
+    }
     if (!isGlobPattern(p) || namesSomething(p)) {
       if (!included.has(resolved)) {
         if (roots && !insideRoots(resolved, roots)) {
@@ -970,7 +1090,7 @@ export function buildFileContext(
           continue;
         }
         included.add(resolved);
-        files.push({ p, via: p, resolved, arg });
+        files.push({ p, via: p, resolved, arg, key: resolved });
       }
       // Registered whether this argument created the file entry or was
       // de-duplicated into an earlier one — see pendings.
@@ -1007,7 +1127,7 @@ export function buildFileContext(
         const key = keyOf(m);
         if (included.has(key)) continue;
         included.add(key);
-        files.push({ p: m, via: p, resolved: key, arg });
+        files.push({ p: m, via: p, resolved: key, arg, key });
       }
     } catch (e) {
       // #28: whatever the engine said — V8's wording describes its regex
@@ -1029,7 +1149,7 @@ export function buildFileContext(
   // was read and yielded nothing.
   let capCutAt = -1;
 
-  for (const { p, via, resolved, arg } of files) {
+  for (const { p, via, resolved, arg, read, first, last } of files) {
     // Re-checked at read time because a glob match may be a symlink whose
     // target leaves the roots only once resolved; the anchor could not see it.
     if (denied.has(resolved)) {
@@ -1050,7 +1170,7 @@ export function buildFileContext(
       spokenArgs.add(arg);
       continue;
     }
-    const abs = resolve(cwd, p);
+    const abs = resolve(cwd, read ?? p);
     // stat BEFORE reading (#15): the size is known before a byte of the file is
     // materialised, which is the difference between bounding a read and paying
     // for it first. stat follows symlinks, so the kind and size are the
@@ -1101,6 +1221,26 @@ export function buildFileContext(
       continue;
     }
     const body = raw.toString("utf8");
+    // The excerpt is cut to the range BEFORE it is numbered (#53), so the
+    // numbers it carries are the file's own and nothing outside the range is
+    // delivered. A range that selected no line — one past the end of the file,
+    // say — delivered nothing on this argument's behalf, so it is answered
+    // below like any argument that matched nothing, in the caller's spelling;
+    // an excerpt header standing over no lines would read as content that
+    // never came. A whole-file read of an empty file is different: the file's
+    // entire content did arrive, and its header still counts against the cap
+    // exactly as it did before there were numbers.
+    let excerpt = splitLines(body);
+    let startNo = 1;
+    if (first !== undefined && last !== undefined) {
+      excerpt = excerpt.slice(first - 1, last);
+      startNo = first;
+      if (excerpt.length === 0) continue;
+    }
+    // The lines carry their numbers from here on, so everything downstream —
+    // the cap, the truncation, `total` — measures the text that is EMITTED,
+    // never the bytes that were read.
+    const shown = numberLines(excerpt, startNo);
     // Content will be delivered — in full or truncated — so the result
     // speaks for this argument either way: THIS entry was read on its
     // behalf, and an entry read on an argument's behalf is the one thing
@@ -1108,19 +1248,23 @@ export function buildFileContext(
     spokenArgs.add(arg);
     // #19: the header and the separator count toward the cap with the body, so
     // 300 empty files cannot produce a five-figure prompt under a
-    // multimillion-char "cap" with no note. `total` is the assembled length so
-    // far, separators included, which is what makes text.length ≤ MAX honest.
+    // multimillion-char "cap" with no note. #53: the line numbers count too,
+    // for the same reason — numbering makes the text longer than the bytes
+    // read, and a cap measured against the raw body would overshoot by the
+    // width of every number added, silently. `total` is the assembled length
+    // so far, separators included, which is what makes text.length ≤ MAX
+    // honest.
     const header = `--- ${p} ---\n`;
     const sep = chunks.length > 0 ? "\n\n" : "";
     const overhead = (sep ? 2 : 0) + header.length;
-    if (total + overhead + body.length > cap) {
+    if (total + overhead + shown.length > cap) {
       // The marker makes the truncated header longer than the plain one, so the
       // room left is measured against the header that will actually be pushed —
       // a budget that quietly grows to fit its own bookkeeping is not a budget.
       const theader = `--- ${p} (truncated) ---\n`;
       const room = cap - total - (sep ? 2 : 0) - theader.length;
       if (room > 0) {
-        const taken = takeUnits(body, room);
+        const taken = takeUnits(shown, room);
         chunks.push(`${sep}${theader}${taken}`);
         total += (sep ? 2 : 0) + theader.length + taken.length;
       }
@@ -1153,8 +1297,8 @@ export function buildFileContext(
       capCutAt = arg;
       break;
     }
-    chunks.push(`${sep}${header}${body}`);
-    total += overhead + body.length;
+    chunks.push(`${sep}${header}${shown}`);
+    total += overhead + shown.length;
   }
 
   // The reads have settled, so every argument can be answered now, in the
