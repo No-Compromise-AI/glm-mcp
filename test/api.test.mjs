@@ -11,6 +11,10 @@
 //   #20  max_tokens is a cap: never exceeded, the thinking budget scaled down
 //        to fit beneath it, and a cap too small to reason on a model that
 //        always reasons refused before anything is sent.
+//   #60  every request states its own thinking intent. `reasoning: "none"`
+//        used to OMIT the `thinking` parameter, and z.ai documents the default
+//        as `enabled` — so the caller asking for no reasoning got reasoning,
+//        silently. "none" now sends a disabled block, with no budget on it.
 //   #42  getClient() re-reads the configuration per call; a credential that
 //        stops resolving mid-life serves the call from the last good client
 //        with the reason on stderr — a warning that must send the operator to
@@ -782,7 +786,63 @@ test('#20 with reasoning off on a model that permits it, max_tokens goes through
   assert.ok(sent, `a request must have been captured — ${JSON.stringify(r.threw ?? upstreamSeen)}`);
   assert.equal(sent.max_tokens, 100,
     `with reasoning off, max_tokens must be exactly what was asked — got ${sent.max_tokens}`);
-  assert.equal(sent.thinking, undefined, 'reasoning "none" must send no thinking block');
+  // #60: "none" is outside #20's arithmetic — there is no budget to scale and
+  // no answer room to prefer, so a cap far below the reasoning threshold goes
+  // through exactly. But outside the arithmetic is not absent from the body:
+  // the request still states its intent, because omitting `thinking` is what
+  // z.ai's documented `enabled` default feeds on.
+  assert.equal(sent.thinking?.type, 'disabled',
+    `reasoning "none" must send a disabled block, not no block — got ${JSON.stringify(sent.thinking)}`);
+  assert.equal(sent.thinking?.budget_tokens, undefined,
+    `a disabled block carries no budget — disabled and a budget are contradictory — got ${JSON.stringify(sent.thinking)}`);
+});
+
+// ------------------------------------------ #60: the request states its intent
+
+test('#60 every reasoning level states its thinking intent, whatever was asked', async () => {
+  // The defect was an ABSENT parameter. `reasoning: "none"` omitted `thinking`
+  // from the body, and z.ai documents the default as `enabled`, so the
+  // package's largest advertised latency lever selected the opposite of what
+  // the caller asked for — silently, with nothing in the footer to tell a
+  // reasoned answer from one that was meant to skip reasoning. Measured on
+  // glm-4.6, same prompt and cap: 124 output tokens with the parameter omitted
+  // against 2 with an explicit disabled setting. So the matrix below asserts
+  // on the body that actually leaves, for every level the tool offers, on a
+  // model of each kind: glm-4.6 can honour "none" as asked, while glm-5.3
+  // cannot stop reasoning and has its "none" raised to a real enabled budget
+  // before anything is sent.
+  const BUDGETS = { low: 2048, high: 8192, max: 24576 };
+  const r = await child(`
+process.env.ZAI_BASE_URL = origin;
+out.rows = [];
+for (const model of ['glm-4.6', 'glm-5.3']) {
+  for (const level of ['none', 'low', 'high', 'max']) {
+    const before = seen.length;
+    await glm.ask({ prompt: 'hi', model, reasoning: level });
+    out.rows.push({ model, level, thinking: seen[before] ? seen[before].body.thinking : null });
+  }
+}`);
+  assert.equal(r.threw, undefined,
+    `every level must be askable on both kinds of model — ${JSON.stringify(r.threw)}`);
+  assert.equal(r.rows.length, 8, 'two models × four levels must all have been sent');
+  for (const row of r.rows ?? []) {
+    assert.ok(row.thinking,
+      `${row.model} at "${row.level}" sent no thinking parameter at all — the decision fell to z.ai, whose documented default is "enabled"`);
+    if (row.level === 'none' && row.model === 'glm-4.6') {
+      assert.equal(row.thinking.type, 'disabled',
+        `glm-4.6 can stop reasoning, so its "none" must say disabled — got ${JSON.stringify(row.thinking)}`);
+      assert.equal(row.thinking.budget_tokens, undefined,
+        `a disabled block carries no budget_tokens — got ${JSON.stringify(row.thinking)}`);
+    } else {
+      // Every other level asks for reasoning, and glm-5.3's "none" was raised
+      // to "low" (#54): an enabled block with the level's own budget.
+      const expected = row.level === 'none' ? BUDGETS.low : BUDGETS[row.level];
+      assert.equal(row.thinking.type, 'enabled',
+        `${row.model} at "${row.level}" must send an enabled block — got ${JSON.stringify(row.thinking)}`);
+      assert.equal(row.thinking.budget_tokens, expected,
+        `${row.model} at "${row.level}" must send that level's own budget of ${expected} — got ${JSON.stringify(row.thinking)}`);
+    }
+  }
 });
 
 test('#20 every cap sends a request the API accepts, or is refused before sending', async () => {

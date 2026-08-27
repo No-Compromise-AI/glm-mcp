@@ -41,6 +41,7 @@ jobs:
       - run: npm run verify:release
       - run: npm run verify:routing
       - run: npm run verify:budget
+      - run: npm run verify:thinking
       - run: npm run verify:api
       - run: npm run verify:capacity
       - run: npm run verify:disclosure

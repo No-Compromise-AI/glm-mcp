@@ -120,8 +120,15 @@ to `"low"` for it. glm-5.3-flash cannot disable thinking either — z.ai's docs 
 block without erroring — so its `"none"` is raised to `"low"` too, before anything is
 sent. `glm-4.6` and `glm-4.7` genuinely run with reasoning off.
 
+`"none"` is a setting the request states, not the absence of one. z.ai documents an
+omitted `thinking` parameter as defaulting to `enabled`, so for two versions of this
+package `"none"` and unspecified were the same thing and the answer came back reasoned
+either way — silently, with nothing in the footer to tell a reasoned answer from one
+that was meant to skip reasoning. The request now says `disabled` out loud.
+
 | `reasoning` | thinking budget |
 | --- | --- |
+| `none` | sent as an explicit `disabled` block — the request states it, never omits `thinking` |
 | `low` | 2,048 tokens |
 | `high` | 8,192 tokens |
 | `max` | 24,576 tokens |

@@ -1155,7 +1155,21 @@ export async function ask(args: AskArgs): Promise<AskResult> {
   };
   if (system) body.system = system;
 
-  if (reasoning !== "none") {
+  // #60: every request states its own thinking intent, whatever the caller
+  // asked. "none" used to be sent by OMITTING the parameter, and z.ai
+  // documents the default as `enabled` — so the package's largest advertised
+  // latency lever selected the opposite of what the caller asked for,
+  // silently: measured on glm-4.6, 124 output tokens against 2 on the same
+  // trivial prompt. The only way to turn thinking off is to say so. A
+  // disabled block carries no budget_tokens, because disabled and a budget
+  // are contradictory. THINKING_REQUIRED models never reach here — "none"
+  // was raised to "low" above — and this branch deliberately has no part in
+  // #20's arithmetic below: a disabled request has no budget to scale, no
+  // answer room to prefer, and nothing to refuse the cap over, so a small
+  // max_tokens goes through exactly as asked.
+  if (reasoning === "none") {
+    body.thinking = { type: "disabled" };
+  } else {
     // #20: max_tokens is documented as an output cap, so it is one. The
     // thinking budget scales DOWN to fit beneath it — never up, and never the
     // cap raised to fit the budget, which is how a requested cap of 1 used to
