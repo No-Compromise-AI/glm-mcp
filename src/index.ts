@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { readFileSync } from "node:fs";
 import { z } from "zod";
 import {
   ask,
@@ -14,7 +15,14 @@ import {
   type Reasoning,
 } from "./glm.js";
 
-const server = new McpServer({ name: "glm", version: "0.2.0" });
+// Read rather than repeated: a literal here drifts from package.json on every
+// release, and the only symptom is a server quietly misreporting itself. From
+// dist/index.js this resolves to the package root, published and local alike.
+const { version } = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+) as { version: string };
+
+const server = new McpServer({ name: "glm", version });
 
 server.registerTool(
   "glm_ask",

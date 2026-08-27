@@ -25,7 +25,7 @@ Register it once, user-scoped, and it is available in **every** project on the m
 per-project setup:
 
 ```bash
-claude mcp add --scope user glm -- npx -y @nocompromiseai/glm-mcp@0.2.0
+claude mcp add --scope user glm -- npx -y @nocompromiseai/glm-mcp@0.3.0
 ```
 
 The version is pinned on purpose: a bare `npx` resolves `latest` at run time, while the package

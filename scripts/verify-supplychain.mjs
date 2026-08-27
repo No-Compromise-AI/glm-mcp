@@ -94,4 +94,14 @@ for (const v of new Set(shown)) {
   }
 }
 
+// ------------------------------------- 4. the version lives in one place
+// A literal version in the server drifts from the manifest on every release,
+// and a server misreporting itself is the kind of thing nobody notices until
+// they are debugging something else.
+const indexSrc = read('src/index.ts');
+const literal = /version:\s*["']\d+\.\d+\.\d+["']/.exec(indexSrc);
+if (literal) {
+  fail(`#45: src/index.ts hardcodes ${literal[0]} — read it from package.json so a bump cannot leave it behind`);
+}
+
 console.log('SUPPLY OK');
