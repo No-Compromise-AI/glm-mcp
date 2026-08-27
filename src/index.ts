@@ -13,8 +13,10 @@ import {
   outputLimits,
   MIN_BUDGET_TOKENS,
   MIN_ANSWER_TOKENS,
+  type AskResult,
   type Reasoning,
 } from "./glm.js";
+import { buildReviewPrompt, minSubstance, substanceOf, verdictOf } from "./review.js";
 
 // Read rather than repeated: a literal here drifts from package.json on every
 // release, and the only symptom is a server quietly misreporting itself. From
@@ -24,6 +26,27 @@ const { version } = JSON.parse(
 ) as { version: string };
 
 const server = new McpServer({ name: "glm", version });
+
+/**
+ * The cost line every tool that reaches GLM appends, in the brackets callers
+ * already read: what answered, what it cost, and whether the answer actually
+ * finished. glm_ask and glm_review share it so the two cannot drift into
+ * footers a caller has to parse twice.
+ */
+const usageFooter = (result: AskResult): string =>
+  [
+    result.model,
+    `in ${result.usage.input} / out ${result.usage.output} tok`,
+    result.usage.cacheRead ? `cached ${result.usage.cacheRead}` : null,
+    result.thinkingChars ? `reasoned ${result.thinkingChars} chars` : null,
+    // #41: an answer the output cap severed mid-reply is not a finished
+    // one, and this footer is where the caller already reads what the
+    // answer cost — so the marker sits beside it. A normally finished
+    // answer says nothing: flagging it would cry wolf on every reply.
+    result.stopReason === "max_tokens" ? "stopped at max_tokens" : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
 server.registerTool(
   "glm_ask",
@@ -160,24 +183,286 @@ server.registerTool(
         maxTokens: max_tokens,
       });
 
-      const footer = [
-        `[${result.model}`,
-        `in ${result.usage.input} / out ${result.usage.output} tok`,
-        result.usage.cacheRead ? `cached ${result.usage.cacheRead}` : null,
-        result.thinkingChars ? `reasoned ${result.thinkingChars} chars` : null,
-        // #41: an answer the output cap severed mid-reply is not a finished
-        // one, and this footer is where the caller already reads what the
-        // answer cost — so the marker sits beside it. A normally finished
-        // answer says nothing: flagging it would cry wolf on every reply.
-        result.stopReason === "max_tokens" ? "stopped at max_tokens" : null,
-      ]
-        .filter(Boolean)
-        .join(" · ");
+      const footer = usageFooter(result);
 
       const body = [
         result.text || "(empty response)",
         "",
-        `${footer}]`,
+        `[${footer}]`,
+        ...(notes.length ? ["", `Notes: ${notes.join("; ")}`] : []),
+      ].join("\n");
+
+      return { content: [{ type: "text" as const, text: body }] };
+    } catch (e) {
+      return {
+        isError: true,
+        content: [{ type: "text" as const, text: `GLM request failed.\n\n${explainError(e)}` }],
+      };
+    }
+  },
+);
+
+server.registerTool(
+  "glm_review",
+  {
+    title: "Review with GLM",
+    // #65: the description's first job is to promise the output shape — a
+    // review tool whose result is a surprise can only be read by a human
+    // skimming prose, and everything downstream of this tool (bin/glm-review
+    // included) greps for the verdict line instead.
+    description:
+      "Review a change with a Z.ai GLM model (default GLM-5.3) and return a " +
+      "VERDICT: the reply is the reviewer's analysis and always ends with a " +
+      "final line that is exactly VERDICT: PASS or VERDICT: CHANGES_REQUIRED — " +
+      "the same vocabulary bin/glm-review reads, so a shell pipeline can consume " +
+      "the result. Pass the change as a unified diff and the requirement it was " +
+      "meant to implement as spec: review against intent is what catches silent " +
+      "scope-narrowing, and the reviewer is warned off both recorded pathologies " +
+      "— findings that are padded or fabricated, and work that is stubbed, mocked " +
+      "or hardcoded rather than implemented. A reply that is a bare verdict with " +
+      "no analysis behind it comes back as an error, never as a clean review. " +
+      "This server never runs git and inspects no repository state on its own: " +
+      "the diff comes from the caller, and files resolve exactly as glm_ask " +
+      "resolves them. Reviews default to reasoning 'high' — the depth the glm_ask " +
+      "routing guidance reserves for review and bug-hunting — and a different " +
+      "model than the one that wrote the code is worth choosing where you can, " +
+      "because a model re-reading its own work reliably under-reports.",
+    inputSchema: {
+      diff: z
+        .string()
+        .optional()
+        .describe(
+          "The unified diff to review, as your tooling produced it. The server " +
+            "never runs git — the caller supplies the change under review, and this " +
+            "argument is how. Either diff or files must be present; with neither, " +
+            "the call is refused rather than answered with a verdict about nothing.",
+        ),
+      files: z
+        .array(z.string())
+        .optional()
+        .describe(
+          // The same resolution glm_ask performs, stated as such: the promise
+          // is a function call against buildFileContext, not a paraphrase,
+          // and a caller who has learned glm_ask's behaviour has learned all
+          // of this too.
+          "Optional files as review context, resolved exactly as glm_ask resolves " +
+            "them (same confinement to the operator's roots, same per-model " +
+            "character budget, same notes): literal paths and/or glob patterns " +
+            '(e.g. "src/**/*.ts"). Each glob expands to its matching files, sorted ' +
+            "and de-duplicated across the whole list; a pattern that matches " +
+            "nothing is reported in the response notes. A path that exists on disk " +
+            "is used literally even when it contains glob characters. Glob " +
+            "expansion skips node_modules, .git and build output by default; naming " +
+            "a directory in the pattern (node_modules/foo/**/*.d.ts) or setting " +
+            "GLM_MCP_GLOB_IGNORE overrides that. Relative paths — ./ and ../ " +
+            "prefixes included — resolve against 'cwd'.",
+        ),
+      spec: z
+        .string()
+        .optional()
+        .describe(
+          "What the change was meant to do — the requirement, ticket or plan it " +
+            "was written against. Reaches the reviewer verbatim. Review against " +
+            "intent is the only check on silent scope-narrowing, this loop's " +
+            "recorded failure mode; with no spec the reviewer can only infer " +
+            "intent from the diff itself.",
+        ),
+      cwd: z
+        .string()
+        .optional()
+        .describe("Directory that relative file paths resolve against. Defaults to the server's cwd."),
+      model: z
+        .string()
+        .optional()
+        .describe(
+          `GLM model id. Defaults to ${DEFAULT_MODEL} (the frontier flagship); ` +
+            "glm-5.3-flash and glm-4.6 are the fast routes, and glm_models lists every id " +
+            "the account offers with a one-line role.",
+        ),
+      reasoning: z
+        .enum(["none", "low", "high", "max"])
+        .optional()
+        .describe(
+          "Reasoning depth — same levels as glm_ask, but the default here is " +
+            "'high' rather than 'low': a review is the work the routing guidance " +
+            "reserves 'high' for, and a reviewer skimming on the 2,048-token " +
+            "'low' budget is the rubber stamp with extra steps. Use 'max' " +
+            "(24,576 tokens) for a large or subtle change, and 'low' only for a " +
+            "re-check you expect to be mechanical. GLM-5.3 and glm-5.3-flash " +
+            "always reason, so 'low' is their shallowest setting.",
+        ),
+      max_tokens: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Max output tokens — a hard cap. The request never exceeds it; the thinking " +
+            "budget scales down to fit beneath it, always leaving room for the answer, " +
+            `but never below the API minimum of ${MIN_BUDGET_TOKENS}. A cap below ` +
+            `${MIN_BUDGET_TOKENS + MIN_ANSWER_TOKENS} — the API's budget minimum plus ` +
+            "the least room that still constitutes an answer — cannot hold both and " +
+            "is refused rather than silently raised; on GLM-5.3 and glm-5.3-flash, " +
+            "which always reason, the only fix is a higher cap. " +
+            "A cap over the model's published ceiling is likewise refused before " +
+            `anything is sent (${outputLimits(DEFAULT_MODEL).max!.toLocaleString("en-US")} for GLM-5.3). ` +
+            "Omit it and the model's own default applies " +
+            `(${outputLimits(DEFAULT_MODEL).def.toLocaleString("en-US")} for GLM-5.3). ` +
+            "A review severed by too small a cap loses its verdict line and is " +
+            "returned as an error, so size it for the analysis plus the verdict.",
+        ),
+    },
+  },
+  async ({ diff, files, spec, cwd, model, reasoning, max_tokens }) => {
+    try {
+      // The refusal comes before anything else, and before GLM is ever asked
+      // (#65): with neither a diff nor files there is no material in front of
+      // the reviewer, and a verdict about nothing is not an empty review but
+      // a fabricated one — the 14-byte rubber stamp this tool exists to make
+      // impossible. Reviewing nothing and reporting a pass is the failure
+      // mode of the whole delegate → review loop.
+      if (!diff?.trim() && !files?.length) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "Refused: nothing to review. Pass the change as a diff, or name the " +
+                "code it touches in files — a review with no material in front of it " +
+                "would return a verdict with nothing behind it, which is worse than " +
+                "no review at all.",
+            },
+          ],
+        };
+      }
+
+      // Resolved once, used twice, exactly as glm_ask does it (#59): the file
+      // context is sized for the model the request will actually use.
+      const chosenModel = model ?? DEFAULT_MODEL;
+      const notes: string[] = [];
+      let fileContext = "";
+      if (files?.length) {
+        // The same buildFileContext glm_ask calls — not a reimplementation —
+        // so confinement, de-duplication, binary skips and the cap and its
+        // notes are all of it inherited, once, here.
+        const ctx = buildFileContext(files, cwd ?? process.cwd(), chosenModel);
+        notes.push(...ctx.notes);
+        // A refused call read nothing; sending the review anyway would have
+        // the model opine about code it was never shown — a silent failure
+        // wearing a success, the same refusal glm_ask makes for the same
+        // reason.
+        if (ctx.refusedCall) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: `Refused: no file context was read.\n\n${ctx.notes.join("; ")}`,
+              },
+            ],
+          };
+        }
+        fileContext = ctx.text;
+      }
+
+      // The same refusal, one step later: files that named nothing readable
+      // leave the reviewer exactly where no diff and no files leave it —
+      // staring at a spec with nothing to check it against. GLM is never
+      // asked.
+      if (!diff?.trim() && !fileContext.trim()) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "Refused: nothing to review — no diff was supplied and the files " +
+                `resolved to no readable content (${notes.join("; ") || "nothing matched"}). ` +
+                "Ask again with the change itself, or with files that name code " +
+                "that exists.",
+            },
+          ],
+        };
+      }
+
+      const result = await ask({
+        prompt: buildReviewPrompt({ diff, spec, fileContext }),
+        model: chosenModel,
+        // glm_ask defaults to 'low' because a question is usually mechanical;
+        // a review is the work the #54 routing guidance reserves 'high' for,
+        // and a reviewer skimming on 2,048 thinking tokens is how a rubber
+        // stamp acquires a footer. The caller can still spend less by
+        // saying so.
+        reasoning: (reasoning ?? "high") as Reasoning,
+        maxTokens: max_tokens,
+      });
+
+      // A reply with no verdict is a shape error, not a review: every
+      // consumer of this tool — bin/glm-review's grep included — reads the
+      // verdict line first and the analysis second, so relaying a
+      // verdict-less reply as a clean result would make the output shape a
+      // surprise, which is the one thing the description promises it never
+      // is.
+      if (verdictOf(result.text) === undefined) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "The review came back without a verdict: no line reading VERDICT: PASS " +
+                "or VERDICT: CHANGES_REQUIRED, so nothing downstream can consume it." +
+                // #41: a severed reply never reached its own final line — say
+                // why, rather than let the caller blame the model's manners.
+                (result.stopReason === "max_tokens"
+                  ? " The reply was cut off by the output cap (stopped at max_tokens) " +
+                    "before the verdict could be written — raise max_tokens and ask again."
+                  : "") +
+                ` The model's reply was: ${JSON.stringify(result.text)}`,
+            },
+          ],
+        };
+      }
+
+      // The substance floor (#65), carried across from bin/glm-review
+      // because it is the part of that script most worth keeping: a verdict
+      // with nothing behind it is a rubber stamp whatever it says, and
+      // relaying it converts an unexamined change into one with a clean bill
+      // of health. substanceOf measures the REPLY — never the prompt, the
+      // diff or the request — because a floor computed from anything the
+      // caller sent is satisfied by exactly the long prompts that most need
+      // checking, and passes every rubber stamp ever written while looking
+      // fixed.
+      const substance = substanceOf(result.text);
+      const floor = minSubstance();
+      if (substance < floor) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Refused: the verdict came back with no analysis behind it — ` +
+                `${substance} characters of review beside the verdict line, under ` +
+                `the GLM_REVIEW_MIN_SUBSTANCE floor of ${floor}. A bare verdict is ` +
+                "a rubber stamp, not a review, and relaying it would convert an " +
+                "unexamined change into one with a clean bill of health. The " +
+                `model's entire reply was: ${JSON.stringify(result.text)} Ask again ` +
+                'with more reasoning depth (reasoning "max"), or with more material ' +
+                "to examine.",
+            },
+          ],
+        };
+      }
+
+      // The verdict stays the last line of the relayed analysis — in
+      // bin/glm-review's vocabulary, where the shell tools already grep for
+      // it — and the footer follows it rather than replacing it.
+      const body = [
+        result.text,
+        "",
+        `[${usageFooter(result)}]`,
         ...(notes.length ? ["", `Notes: ${notes.join("; ")}`] : []),
       ].join("\n");
 
