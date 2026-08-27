@@ -118,8 +118,9 @@ Lists the model ids available on the configured account.
 Where the budget above would not fit beneath it, the thinking budget is reduced to leave room
 for the answer — so a small `max_tokens` buys less reasoning rather than a bigger bill.
 
-Set it below what any reasoning needs, on a model that always reasons, and the call is refused
-rather than quietly enlarged. Raise `max_tokens` or lower `reasoning`.
+Set it below what any reasoning needs at all — the API's minimum thinking budget plus room for
+an answer — and the call is refused rather than quietly enlarged. The refusal names the smallest
+cap that would work. Raise `max_tokens`, or lower `reasoning` on a model that permits it.
 
 ## Path confinement
 

@@ -253,15 +253,11 @@ try {
 
   // A cap smaller than the requested budget: the cap wins, and the budget is
   // scaled to fit beneath it. It must never be raised to meet the budget.
-  // 6,000 rather than 5,000: the sweep below refuses anything under
-  // MIN_BUDGET + ANSWER_ROOM, so a 5,000 cap has no honest request to capture
-  // and asking for one here contradicted that. 6,000 still exercises the
-  // scaling — the requested 24,576 comes down to 1,904.
-  r = ask({ prompt: 'hi', model: 'glm-5.3', reasoning: 'max', maxTokens: 6_000 });
+  r = ask({ prompt: 'hi', model: 'glm-5.3', reasoning: 'max', maxTokens: 5_000 });
   sent = r.seen?.[0]?.body;
   if (!sent) fail(`#20: no request was captured for the small-cap case — ${JSON.stringify(r.threw ?? r)}`);
-  if (sent.max_tokens > 6_000) {
-    fail(`#20: a requested cap of 6000 was sent as ${sent.max_tokens} — the cap is a ceiling, not a floor`);
+  if (sent.max_tokens > 5_000) {
+    fail(`#20: a requested cap of 5000 was sent as ${sent.max_tokens} — the cap is a ceiling, not a floor`);
   }
   if (sent.thinking && sent.thinking.budget_tokens >= sent.max_tokens) {
     fail(`#20: the thinking budget (${sent.thinking.budget_tokens}) must leave room under max_tokens (${sent.max_tokens})`);
@@ -284,14 +280,20 @@ try {
   // cap but falls under the minimum the API accepts — a payload that is invalid
   // on arrival is not a cap being honoured, it is a 400 with extra steps.
   const MIN_BUDGET = 1024;   // Messages API minimum for thinking.budget_tokens
-  // The headroom the file has always reserved for the answer. Honouring a cap
-  // by leaving one token for the reply is not honouring it; a reasoning model
-  // that cannot finish a sentence has produced nothing the caller can use.
+  // Two different numbers, and conflating them was a mistake worth naming.
+  // ANSWER_ROOM is the headroom the file PREFERS to leave for the answer when
+  // the cap is generous. MIN_ANSWER is the least that still constitutes an
+  // answer, and it alone decides whether a request can be made at all.
+  // Refusing everything under MIN_BUDGET + ANSWER_ROOM turned away caps that
+  // work perfectly well — a 5,000 cap leaves 3,976 tokens for the reply — and
+  // the decision recorded for this issue was to refuse only a cap "too small
+  // to allow any reasoning", not one that merely reasons less than the default.
   const ANSWER_ROOM = 4096;
+  const MIN_ANSWER = 1024;
   const sweep = child(`
 process.env.ZAI_BASE_URL = origin;
 out.cases = [];
-for (const cap of ${JSON.stringify([1, 100, 1024, 2000, 4096, 4097, 4200, 5000, 5119, 5120, 5200, 8192, 30000])}) {
+for (const cap of ${JSON.stringify([1, 100, 1024, 2047, 2048, 2049, 3000, 4096, 5000, 5120, 8192, 30000])}) {
   const before = seen.length;
   try {
     await glm.ask({ prompt: 'hi', model: 'glm-5.3', reasoning: 'max', maxTokens: cap });
@@ -312,8 +314,14 @@ for (const cap of ${JSON.stringify([1, 100, 1024, 2000, 4096, 4097, 4200, 5000, 
       if (b < MIN_BUDGET) {
         fail(`#20: cap ${c.cap} sent budget_tokens ${b}, under the API minimum of ${MIN_BUDGET} — a request that is invalid on arrival is not a cap being honoured; refuse instead`);
       }
-      if (c.sent.max_tokens - b < ANSWER_ROOM) {
-        fail(`#20: cap ${c.cap} sent budget_tokens ${b} with max_tokens ${c.sent.max_tokens}, leaving ${c.sent.max_tokens - b} for the answer — below the ${ANSWER_ROOM} this file reserves. Refuse instead of answering in a token.`);
+      if (c.sent.max_tokens - b < MIN_ANSWER) {
+        fail(`#20: cap ${c.cap} sent budget_tokens ${b} with max_tokens ${c.sent.max_tokens}, leaving ${c.sent.max_tokens - b} for the answer — under ${MIN_ANSWER} there is no answer to give. Refuse instead.`);
+      }
+      // Where the cap can afford the preferred headroom, it must be taken:
+      // scaling reasoning down further than necessary would be its own quiet
+      // narrowing.
+      if (c.cap >= 24_576 + ANSWER_ROOM && c.sent.max_tokens - b < ANSWER_ROOM) {
+        fail(`#20: cap ${c.cap} is generous enough for the full ${ANSWER_ROOM} of headroom but left ${c.sent.max_tokens - b}`);
       }
     }
   }
@@ -321,12 +329,12 @@ for (const cap of ${JSON.stringify([1, 100, 1024, 2000, 4096, 4097, 4200, 5000, 
   // a number: below the minimum budget plus the answer room, no honest request
   // exists, so the call must be refused.
   for (const c of sweep.cases ?? []) {
-    const viable = c.cap >= MIN_BUDGET + ANSWER_ROOM;
+    const viable = c.cap >= MIN_BUDGET + MIN_ANSWER;
     if (!viable && c.sent && c.sent.thinking) {
-      fail(`#20: cap ${c.cap} cannot fit ${MIN_BUDGET} of reasoning plus ${ANSWER_ROOM} of answer, yet a request was sent`);
+      fail(`#20: cap ${c.cap} cannot fit ${MIN_BUDGET} of reasoning plus ${MIN_ANSWER} of answer, yet a request was sent`);
     }
     if (viable && c.refused !== undefined) {
-      fail(`#20: cap ${c.cap} can fit ${MIN_BUDGET} + ${ANSWER_ROOM} and must not be refused — ${c.refused}`);
+      fail(`#20: cap ${c.cap} can fit ${MIN_BUDGET} + ${MIN_ANSWER} and must not be refused — ${c.refused}`);
     }
   }
   if (!(sweep.cases ?? []).some((c) => c.refused !== undefined)) {

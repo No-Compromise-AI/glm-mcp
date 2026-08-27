@@ -69,6 +69,16 @@ export const ANSWER_ROOM = 4096;
 export const MIN_BUDGET_TOKENS = 1024;
 
 /**
+ * The least room that still constitutes an answer, and the only number that
+ * decides whether a capped request can be made at all. Distinct from
+ * ANSWER_ROOM, which is what a generous cap PREFERS to leave: requiring the
+ * preference turned away caps that work perfectly well — 5,000 leaves 3,976
+ * tokens for the reply — and the decision for #20 was to refuse a cap too
+ * small to allow any reasoning, not one that simply reasons less than default.
+ */
+export const MIN_ANSWER_TOKENS = 1024;
+
+/**
  * Resolve the z.ai key without ever hardcoding it:
  *   ZAI_API_KEY  ->  ~/.config/zai/api-key  ->  (opt-in) the key ZCode already stores.
  *
@@ -426,20 +436,27 @@ export async function ask(args: AskArgs): Promise<AskResult> {
     // way out — it buys the answer's room and leaves a reply that cannot
     // happen — so a cap under the two added is refused here, before a request
     // exists to send, naming the least cap that would work.
-    if (args.maxTokens < MIN_BUDGET_TOKENS + ANSWER_ROOM) {
+    if (args.maxTokens < MIN_BUDGET_TOKENS + MIN_ANSWER_TOKENS) {
       throw new Error(
         `max_tokens ${args.maxTokens} cannot hold both a thinking budget and an ` +
           `answer: the budget cannot be scaled below the API minimum of ` +
-          `${MIN_BUDGET_TOKENS}, and ${ANSWER_ROOM} of the cap must remain above ` +
-          `it for the answer, so max_tokens must be at least ` +
-          `${MIN_BUDGET_TOKENS + ANSWER_ROOM}` +
+          `${MIN_BUDGET_TOKENS}, and ${MIN_ANSWER_TOKENS} of the cap must remain ` +
+          `above it for the answer, so max_tokens must be at least ` +
+          `${MIN_BUDGET_TOKENS + MIN_ANSWER_TOKENS}` +
           (THINKING_REQUIRED.has(model)
             ? `. ${model} always reasons and cannot run with reasoning off — raise ` +
               `max_tokens, or switch to a model that permits it (e.g. glm-4.6).`
             : ` or reasoning must be "none".`),
       );
     }
-    const budget = Math.min(BUDGET[reasoning], args.maxTokens - ANSWER_ROOM);
+    // Prefer to leave ANSWER_ROOM, but never at the price of an invalid budget:
+    // where the cap cannot afford both, the budget sits at the API's floor and
+    // the answer takes the rest, which is still more than MIN_ANSWER_TOKENS
+    // because the refusal above has already excluded the caps where it is not.
+    const budget = Math.max(
+      MIN_BUDGET_TOKENS,
+      Math.min(BUDGET[reasoning], args.maxTokens - ANSWER_ROOM),
+    );
     body.thinking = { type: "enabled", budget_tokens: budget };
   }
 

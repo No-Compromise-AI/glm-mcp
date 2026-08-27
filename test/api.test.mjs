@@ -457,7 +457,7 @@ test('#20 a cap without room for the API budget minimum and the answer is refuse
   // constants added — never asserted as a number — and the sweep crosses it on
   // both sides: every cap under it refused before anything is sent, every cap
   // at or above it leaving ANSWER_ROOM above a budget the API accepts.
-  const caps = [1, 100, 1024, 1025, 2000, 4096, 4097, 5000, 5119, 5120, 5121, 8192];
+  const caps = [1, 100, 1024, 2047, 2048, 2049, 3000, 4096, 5000, 5120, 8192, 30000];
   const r = await child(`
 process.env.ZAI_BASE_URL = origin;
 out.cases = [];
@@ -474,15 +474,19 @@ for (const cap of ${JSON.stringify(caps)}) {
   // the test then fails on the behaviour, not on a missing export, and the
   // threshold stays a derivation of the two constants rather than a number.
   const MIN_BUDGET = 1024;  // the Messages API minimum for thinking.budget_tokens
-  const ANSWER_ROOM = 4096; // the headroom src/glm.ts reserves for the answer
-  const threshold = MIN_BUDGET + ANSWER_ROOM;
+  const MIN_ANSWER = 1024;  // the least room that is still an answer
+  const ANSWER_ROOM = 4096; // the headroom a generous cap prefers to leave
+  // Viability is MIN_ANSWER, not ANSWER_ROOM. Requiring the preference refused
+  // caps that work: 5,000 leaves 3,976 tokens for the reply, which is an
+  // answer by any reading.
+  const threshold = MIN_BUDGET + MIN_ANSWER;
   let below = 0;
   let atOrAbove = 0;
   for (const c of r.cases ?? []) {
     if (c.cap < threshold) {
       below++;
       assert.ok(c.refused !== undefined,
-        `cap ${c.cap} is below ${MIN_BUDGET} + ${ANSWER_ROOM} and must be refused — got ${JSON.stringify(c.sent)}`);
+        `cap ${c.cap} is below ${MIN_BUDGET} + ${MIN_ANSWER} and must be refused — got ${JSON.stringify(c.sent)}`);
       assert.ok(!c.reached,
         `cap ${c.cap} was refused only after reaching the API — a refusal must come before a request exists`);
       assert.match(c.refused, new RegExp(`at least ${threshold}`),
@@ -495,8 +499,12 @@ for (const cap of ${JSON.stringify(caps)}) {
     const b = c.sent.thinking.budget_tokens;
     assert.ok(b >= MIN_BUDGET,
       `cap ${c.cap} sent budget_tokens ${b}, under the API minimum of ${MIN_BUDGET}`);
-    assert.ok(c.sent.max_tokens - b >= ANSWER_ROOM,
-      `cap ${c.cap} sent budget_tokens ${b} under max_tokens ${c.sent.max_tokens}, leaving ${c.sent.max_tokens - b} for the answer — the room is not the cap's to spend`);
+    assert.ok(c.sent.max_tokens - b >= MIN_ANSWER,
+      `cap ${c.cap} sent budget_tokens ${b} under max_tokens ${c.sent.max_tokens}, leaving ${c.sent.max_tokens - b} for the answer — under ${MIN_ANSWER} there is no answer to give`);
+    if (c.cap >= 24_576 + ANSWER_ROOM) {
+      assert.ok(c.sent.max_tokens - b >= ANSWER_ROOM,
+        `cap ${c.cap} can afford the full ${ANSWER_ROOM} of headroom but left ${c.sent.max_tokens - b}`);
+    }
   }
   assert.ok(below > 0 && atOrAbove > 0,
     'the sweep must cross the threshold in both directions to prove anything');
