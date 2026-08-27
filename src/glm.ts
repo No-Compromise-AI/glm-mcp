@@ -8,11 +8,71 @@ import {
   envLimit,
   walkBudget,
   DEFAULT_MAX_FILE_BYTES,
-  DEFAULT_MAX_FILE_CHARS,
   DEFAULT_TIMEOUT_MS,
 } from "./limits.js";
 
 export const DEFAULT_MODEL = "glm-5.3";
+
+/**
+ * z.ai's published output limits, per model: the default max_tokens and the
+ * ceiling, exactly as their parameter documentation lists them (#36). One
+ * number for every model was the original mistake — the vision models stop at
+ * 32,768 and the 4.5 family at 98,304, so a global default either starved the
+ * text models or broke the rest.
+ */
+const OUTPUT_LIMITS = new Map<string, { def: number; max: number }>([
+  // The 5.x generation and the 4.6/4.7 text models: 65,536 of a 131,072 ceiling.
+  ["glm-5.3", { def: 65_536, max: 131_072 }],
+  ["glm-5.3-flash", { def: 65_536, max: 131_072 }],
+  ["glm-5.2", { def: 65_536, max: 131_072 }],
+  ["glm-5.1", { def: 65_536, max: 131_072 }],
+  ["glm-5", { def: 65_536, max: 131_072 }],
+  ["glm-5-turbo", { def: 65_536, max: 131_072 }],
+  ["glm-5v-turbo", { def: 65_536, max: 131_072 }],
+  ["glm-4.7", { def: 65_536, max: 131_072 }],
+  ["glm-4.6", { def: 65_536, max: 131_072 }],
+  // The 4.5 text family: the same default against a lower ceiling.
+  ["glm-4.5", { def: 65_536, max: 98_304 }],
+  ["glm-4.5-air", { def: 65_536, max: 98_304 }],
+  ["glm-4.5-x", { def: 65_536, max: 98_304 }],
+  ["glm-4.5-airx", { def: 65_536, max: 98_304 }],
+  ["glm-4.5-flash", { def: 65_536, max: 98_304 }],
+  // The 4.6 vision family: a quarter of the ceiling above.
+  ["glm-4.6v", { def: 16_384, max: 32_768 }],
+  ["glm-4.6v-flash", { def: 16_384, max: 32_768 }],
+  ["glm-4.6v-flashx", { def: 16_384, max: 32_768 }],
+  // The 4.5 vision model and the 128k 4-32b, where the default IS the ceiling.
+  ["glm-4.5v", { def: 16_384, max: 16_384 }],
+  ["glm-4-32b-0414-128k", { def: 16_384, max: 16_384 }],
+]);
+
+/**
+ * The output size handed to a model the table does not know: z.ai's most
+ * common default. A model released tomorrow is z.ai's to size — it gets a
+ * usable default and no ceiling, never a refusal against a table that cannot
+ * know it exists.
+ */
+export const DEFAULT_MAX_TOKENS = 65_536;
+
+export interface OutputLimits {
+  /** The model's published default max_tokens. */
+  def: number;
+  /**
+   * The model's published max_tokens ceiling, or undefined for a model the
+   * table does not know — such a model is not capped locally; z.ai is the
+   * authority on its own ceiling.
+   */
+  max?: number;
+}
+
+/**
+ * The output limits for a model id, from z.ai's published table (#36). An
+ * unknown id is not an error and not a refusal: it resolves to a reasonable
+ * default with no ceiling, and the request is sent for z.ai to judge.
+ */
+export function outputLimits(model: string): OutputLimits {
+  return OUTPUT_LIMITS.get(model) ?? { def: DEFAULT_MAX_TOKENS };
+}
 
 const DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic";
 // A different host AND a different path prefix from the Anthropic-compatible
@@ -129,9 +189,65 @@ export function getClient(): Anthropic {
   return client;
 }
 
+// ------------------------------------------- the input budget, derived (#35) —
+// The old flat 800,000 was a round guess from the first commit, derived from
+// nothing. The tool's own description sells GLM-5.3's million-token window and
+// then handed it roughly a quarter of one. The budget below is what remains of
+// that window after the reply and the prompt are provided for.
+
+/**
+ * The context window the input budget is sized against, in tokens. z.ai does
+ * NOT publish a context length; this figure is from model listings, so it is
+ * an assumption and must read as one — overridable with GLM_MCP_CONTEXT_TOKENS
+ * when it proves wrong, which is also how a caller on a model with a smaller
+ * window sizes the budget down.
+ */
+export const CONTEXT_WINDOW_TOKENS = 1_048_576;
+
+/**
+ * Tokens of the window held back for the reply: the default model's own
+ * default max_tokens (see {@link outputLimits}) — the answer shares the window
+ * with the input, so the input budget is what remains after it.
+ */
+const OUTPUT_RESERVE_TOKENS = outputLimits(DEFAULT_MODEL).def;
+
+/**
+ * Tokens held back for everything the caller sends that is not file context —
+ * the system prompt, the question itself, the per-file headers. A few thousand
+ * is plenty: these are bounded by the tool, not by the files.
+ */
+export const PROMPT_RESERVE_TOKENS = 8_192;
+
+/**
+ * The token↔character exchange rate of the budget. 3.0 targets English and
+ * code deliberately — this repository's stated audience. Other scripts are
+ * denser: Chinese runs nearer 1 char/token, so a CJK-heavy caller may need to
+ * lower GLM_MCP_MAX_FILE_CHARS. The English default is not lowered to
+ * accommodate that case: overshooting surfaces as a loud context-length error
+ * from z.ai, while undersizing silently starves every English caller of the
+ * window the tool sells.
+ */
+export const CHARS_PER_TOKEN = 3.0;
+
+/**
+ * The input budget in characters for a given window: the window minus the
+ * output and prompt reserves, converted at {@link CHARS_PER_TOKEN}. A function
+ * of the window rather than a constant so the derivation is the contract —
+ * moving the window moves the budget with it.
+ */
+export function deriveMaxFileChars(contextTokens: number): number {
+  const inputBudget = Math.max(0, contextTokens - OUTPUT_RESERVE_TOKENS - PROMPT_RESERVE_TOKENS);
+  return Math.floor(inputBudget * CHARS_PER_TOKEN);
+}
+
 // Resolved once per process, so the cap is pinned by the environment the server
 // started with — like the client's, this is a knob of the process, not of a call.
-const MAX_FILE_CHARS = envLimit("GLM_MCP_MAX_FILE_CHARS", DEFAULT_MAX_FILE_CHARS);
+// GLM_MCP_MAX_FILE_CHARS still overrides the derived value outright (#35), and
+// an unparsable value still falls back to it (#24).
+const DEFAULT_MAX_FILE_CHARS = deriveMaxFileChars(
+  envLimit("GLM_MCP_CONTEXT_TOKENS", CONTEXT_WINDOW_TOKENS),
+);
+export const MAX_FILE_CHARS = envLimit("GLM_MCP_MAX_FILE_CHARS", DEFAULT_MAX_FILE_CHARS);
 
 /**
  * The first `maxUnits` UTF-16 units of `s`, cut where it cannot split a
@@ -367,9 +483,9 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       continue;
     }
     // #19: the header and the separator count toward the cap with the body, so
-    // 300 empty files cannot produce a five-figure prompt under an
-    // 800,000-char "cap" with no note. `total` is the assembled length so far,
-    // separators included, which is what makes text.length ≤ MAX honest.
+    // 300 empty files cannot produce a five-figure prompt under a
+    // multimillion-char "cap" with no note. `total` is the assembled length so
+    // far, separators included, which is what makes text.length ≤ MAX honest.
     const header = `--- ${p} ---\n`;
     const sep = chunks.length > 0 ? "\n\n" : "";
     const overhead = (sep ? 2 : 0) + header.length;
@@ -401,7 +517,11 @@ export interface AskArgs {
   model: string;
   reasoning: Reasoning;
   system?: string;
-  maxTokens: number;
+  /**
+   * The caller's output cap. Omitted, the model's own published default
+   * applies (see {@link outputLimits}) — not a constant of ours.
+   */
+  maxTokens?: number;
 }
 
 export interface AskResult {
@@ -418,9 +538,25 @@ export async function ask(args: AskArgs): Promise<AskResult> {
   let reasoning = args.reasoning;
   if (reasoning === "none" && THINKING_REQUIRED.has(model)) reasoning = "low";
 
+  // #36: the model's own default when the caller is silent, and its own
+  // ceiling when the caller is not — a cap over it is refused here, naming the
+  // number, rather than learned from a 400 after the round trip. A model the
+  // table does not know gets no ceiling at all: z.ai ships models faster than
+  // any table can track, and blocking tomorrow's model to protect a stale
+  // guess is the mistake this fixes, in a new place.
+  const limits = outputLimits(model);
+  const maxTokens = args.maxTokens ?? limits.def;
+  if (limits.max !== undefined && maxTokens > limits.max) {
+    throw new Error(
+      `max_tokens ${maxTokens} is over ${model}'s published ceiling of ${limits.max} — ` +
+        `the request is refused here rather than rejected by z.ai. Ask for ` +
+        `${limits.max} or fewer output tokens.`,
+    );
+  }
+
   const body: Record<string, unknown> = {
     model,
-    max_tokens: args.maxTokens,
+    max_tokens: maxTokens,
     messages: [{ role: "user", content: prompt }],
   };
   if (system) body.system = system;
@@ -436,9 +572,9 @@ export async function ask(args: AskArgs): Promise<AskResult> {
     // way out — it buys the answer's room and leaves a reply that cannot
     // happen — so a cap under the two added is refused here, before a request
     // exists to send, naming the least cap that would work.
-    if (args.maxTokens < MIN_BUDGET_TOKENS + MIN_ANSWER_TOKENS) {
+    if (maxTokens < MIN_BUDGET_TOKENS + MIN_ANSWER_TOKENS) {
       throw new Error(
-        `max_tokens ${args.maxTokens} cannot hold both a thinking budget and an ` +
+        `max_tokens ${maxTokens} cannot hold both a thinking budget and an ` +
           `answer: the budget cannot be scaled below the API minimum of ` +
           `${MIN_BUDGET_TOKENS}, and ${MIN_ANSWER_TOKENS} of the cap must remain ` +
           `above it for the answer, so max_tokens must be at least ` +
@@ -455,7 +591,7 @@ export async function ask(args: AskArgs): Promise<AskResult> {
     // because the refusal above has already excluded the caps where it is not.
     const budget = Math.max(
       MIN_BUDGET_TOKENS,
-      Math.min(BUDGET[reasoning], args.maxTokens - ANSWER_ROOM),
+      Math.min(BUDGET[reasoning], maxTokens - ANSWER_ROOM),
     );
     body.thinking = { type: "enabled", budget_tokens: budget };
   }

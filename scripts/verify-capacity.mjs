@@ -149,8 +149,14 @@ out.len = c.text.length; out.notes = c.notes; out.cap = glm.MAX_FILE_CHARS;`, en
   if (!(dflt.cap >= 2_500_000)) {
     fail(`#35: the default input budget is ${dflt.cap} chars — at ~3 chars/token that is ~${Math.round(dflt.cap / 3 / 1000)}k of a 1,048,576-token window. Size it to the window.`);
   }
-  if (dflt.len !== 1_500_000) {
-    fail(`#35: a 1.5M-char file was truncated to ${dflt.len} under the new default — ${JSON.stringify(dflt.notes)}`);
+  // Not an equality: #19 made the `--- big.txt ---` header part of the
+  // assembled text, so an untruncated read is the body plus 16 characters.
+  // What matters is that nothing was cut.
+  if (dflt.len < 1_500_000) {
+    fail(`#35: a 1.5M-char file came back as ${dflt.len} under the new default — ${JSON.stringify(dflt.notes)}`);
+  }
+  if ((dflt.notes ?? []).some((n) => /truncat/i.test(n))) {
+    fail(`#35: 1.5M chars must fit under a budget sized for a million-token window — ${JSON.stringify(dflt.notes)}`);
   }
 
   // Derived, not a new magic number: moving the window moves the budget.

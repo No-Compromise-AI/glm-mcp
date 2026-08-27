@@ -8,6 +8,7 @@ import {
   DEFAULT_MODEL,
   explainError,
   listModels,
+  outputLimits,
   ANSWER_ROOM,
   MIN_BUDGET_TOKENS,
   type Reasoning,
@@ -67,7 +68,11 @@ server.registerTool(
             `${MIN_BUDGET_TOKENS + ANSWER_ROOM} — the API's budget minimum plus the room ` +
             "the answer needs — cannot hold both and is refused rather than silently " +
             "raised; on GLM-5.3, which always reasons, the only fix is a higher cap. " +
-            "Default 8192.",
+            "A cap over the model's published ceiling is likewise refused before " +
+            // DEFAULT_MODEL is an OUTPUT_LIMITS key, so its ceiling is defined.
+            `anything is sent (${outputLimits(DEFAULT_MODEL).max!.toLocaleString("en-US")} for GLM-5.3). ` +
+            "Omit it and the model's own default applies " +
+            `(${outputLimits(DEFAULT_MODEL).def.toLocaleString("en-US")} for GLM-5.3).`,
         ),
     },
   },
@@ -102,7 +107,9 @@ server.registerTool(
         model: model ?? DEFAULT_MODEL,
         reasoning: (reasoning ?? "low") as Reasoning,
         system,
-        maxTokens: max_tokens ?? 8192,
+        // #36: omitted, ask() applies the model's own published default — not a
+        // constant of ours.
+        maxTokens: max_tokens,
       });
 
       const footer = [

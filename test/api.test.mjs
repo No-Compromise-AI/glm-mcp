@@ -35,12 +35,12 @@ import { explainError } from '../dist/glm.js';
 
 const GLM = pathToFileURL(new URL('../dist/glm.js', import.meta.url).pathname).href;
 
-// A throwaway tree holding one 900,000-char file — over the 800,000 default cap
-// but under the 5 MB byte cap, so the only limit that can stop it is the one
-// under test.
+// A throwaway tree holding one 4,000,000-char file — over the derived default
+// char budget (#35) but under the 5 MB byte cap, so the only limit that can
+// stop it is the one under test.
 const RAW = mkdtempSync(join(tmpdir(), 'glm-api-test-'));
 const FIXTURE = realpathSync.native(RAW);
-writeFileSync(join(FIXTURE, 'big.txt'), 'x'.repeat(900_000));
+writeFileSync(join(FIXTURE, 'big.txt'), 'x'.repeat(4_000_000));
 
 // The stand-in for z.ai: every request that reaches it is recorded verbatim,
 // and it answers the shape `ask` and `listModels` expect.
@@ -165,14 +165,17 @@ test('#24 an unparsable GLM_MCP_TIMEOUT_MS leaves the documented default in plac
 });
 
 test('#24 a mistyped GLM_MCP_MAX_FILE_CHARS must not remove the cap', async () => {
+  // The fallback default is the derived budget (#35), read from the module
+  // rather than restated here, so this test pins the fallback behaviour, not
+  // any particular budget.
   const ctx = `
 process.env.GLM_MCP_ROOTS = ${JSON.stringify(FIXTURE)};
 const c = glm.buildFileContext(['big.txt'], ${JSON.stringify(FIXTURE)});
-out.len = c.text.length; out.notes = c.notes;`;
+out.len = c.text.length; out.notes = c.notes; out.cap = glm.MAX_FILE_CHARS;`;
   for (const value of ['abc', '', '-1']) {
     const r = await child(ctx, { GLM_MCP_MAX_FILE_CHARS: value });
-    assert.ok(r.len <= 800_100,
-      `GLM_MCP_MAX_FILE_CHARS=${JSON.stringify(value)} removed the cap — ${r.len} of 900,000 chars came through`);
+    assert.ok(r.len <= r.cap,
+      `GLM_MCP_MAX_FILE_CHARS=${JSON.stringify(value)} removed the cap — ${r.len} of 4,000,000 chars came through against a ${r.cap}-char default`);
     assert.ok((r.notes ?? []).some((n) => /truncat/i.test(n)),
       `GLM_MCP_MAX_FILE_CHARS=${JSON.stringify(value)} must fall back to the default AND still say it truncated — notes=${JSON.stringify(r.notes)}`);
   }
