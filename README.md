@@ -294,6 +294,10 @@ processes where a setting has to be in place before the module loads.
 
 ## Releases
 
+`npm-shrinkwrap.json` carries the version too, so a release bump regenerates it
+(`npm shrinkwrap`) alongside `package.json`. `verify:supplychain` fails if the two
+drift, in CI and again at release, so it cannot ship half-done.
+
 Published from CI with [provenance](https://docs.npmjs.com/generating-provenance-statements)
 via npm trusted publishing — there is no long-lived npm token. Every release is staged and
 requires a maintainer to approve it with 2FA before it becomes installable, and its provenance
