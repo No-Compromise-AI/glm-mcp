@@ -173,6 +173,11 @@ out.notes = c.notes; out.text = c.text;`);
     ['probe.txt', 'probe[.]txt'],
     ['decoy.txt', 'probe[.]txt'],
     ['probe*.txt'],
+    // The same argument twice. "One note per argument" has to mean it: with
+    // the file absent, de-duplication swallowed the second and the caller
+    // could read existence off the note COUNT alone.
+    ['probe[.]txt', 'probe[.]txt'],
+    ['probe.txt', 'probe.txt'],
   ]) {
     const yes = oracleProbe(true, paths);
     const no = oracleProbe(false, paths);
