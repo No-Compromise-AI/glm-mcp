@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# Delegate a coding task to a headless GLM-5.3 agent, verify it independently,
+# have a DIFFERENT model review it against the spec, and record the outcome.
+#
+#   glm-task -v "npm test" "Implement github issue 123"
+#   glm-task -C ~/proj -v "pnpm check" -r codex "Work phase 1 of docs/11-engineering-plan.md"
+#
+#   -C <dir>   working directory (default: cwd)
+#   -v <cmd>   verify command, run AFTER the agent; its exit code is what gets recorded
+#   -r <who>   review with codex|claude|glm|agy|none   (default: codex, none if unavailable)
+#   -x <n>     max fix rounds after a failed review (default 1, 0 disables)
+#   -W         run in an isolated git worktree on its own branch, so several
+#              delegations can run at once without sharing a checkout
+#   -b <name>  as -W, with an explicit branch name
+#   -t <tools> override the tool allowlist
+#
+# Outcomes append to $GLM_TASK_LEDGER (default ~/.claude-glm/outcomes.jsonl).
+set -uo pipefail
+
+DIR="$PWD"; VERIFY=""; TOOLS_OVERRIDE=""; REVIEWER="${GLM_REVIEWER:-codex}"; FIXES=1
+ISOLATE=0; BRANCH=""
+while getopts "C:v:t:r:x:Wb:h" opt; do
+  case "$opt" in
+    C) DIR="$OPTARG" ;; v) VERIFY="$OPTARG" ;; t) TOOLS_OVERRIDE="$OPTARG" ;;
+    r) REVIEWER="$OPTARG" ;; x) FIXES="$OPTARG" ;;
+    W) ISOLATE=1 ;; b) BRANCH="$OPTARG"; ISOLATE=1 ;;
+    h) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -14; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -ge 1 ]] || { echo 'usage: glm-task [-C dir] [-v cmd] [-r reviewer] "<task>"' >&2; exit 2; }
+TASK="$*"
+command -v codex >/dev/null || [[ "$REVIEWER" != "codex" ]] || REVIEWER="none"
+
+DEFAULT_TOOLS=(
+  "Bash(node:*)" "Bash(npm:*)" "Bash(pnpm:*)" "Bash(yarn:*)"
+  "Bash(python3:*)" "Bash(pytest:*)" "Bash(make:*)" "Bash(dotnet:*)"
+  "Bash(cargo:*)" "Bash(go:*)" "Bash(git:*)" "Bash(gh:*)" "Bash(az:*)" "Bash(printf:*)"
+  Read Edit Write Glob Grep
+)
+if [[ -n "$TOOLS_OVERRIDE" ]]; then read -r -a TOOLS <<< "$TOOLS_OVERRIDE"
+elif [[ -n "${GLM_TASK_TOOLS:-}" ]]; then read -r -a TOOLS <<< "$GLM_TASK_TOOLS"
+else TOOLS=("${DEFAULT_TOOLS[@]}"); fi
+
+STAMP="$(date +%Y%m%d-%H%M%S)-$$"   # PID suffix: same-second launches must not share paths
+LOG="${GLM_TASK_LOG:-${TMPDIR:-/tmp}/glm-task-$STAMP.jsonl}"
+LEDGER="${GLM_TASK_LEDGER:-$HOME/.claude-glm/outcomes.jsonl}"
+SPECF="${TMPDIR:-/tmp}/glm-spec-$STAMP.txt"
+NOTES="${GLM_NOTES:-${TMPDIR:-/tmp}/glm-notes-$STAMP.jsonl}"
+REVF="${TMPDIR:-/tmp}/glm-review-$STAMP.txt"
+mkdir -p "$(dirname "$LEDGER")"
+printf '%s\n' "$TASK" > "$SPECF"
+
+
+ESCALATION="
+
+---
+Reaching the human: append ONE line of JSON to $NOTES when — and only when — something
+genuinely needs their attention. Use:
+
+  printf '%s\\n' '{\"level\":\"blocked\",\"msg\":\"...\"}' >> $NOTES
+
+Levels:
+  blocked    you have stopped and need a decision before you can continue
+  scope      the spec is wrong, self-contradictory, or impossible as written
+  discovery  you found something outside this task they would want to know about
+             — a real bug, a security problem, a data-loss risk
+  decision   you proceeded on an assumption that could turn out to be wrong
+
+Do NOT write a note for: progress, what you are about to do, files you edited, tests
+passing, routine choices with an obvious default, or anything they will read in your
+final report anyway.
+
+Default to silence. A note spends their attention. Spend it only when the alternative
+is them finding out too late to act."
+
+# Concurrency: agents sharing one checkout will commit to whatever branch happens
+# to be current and overwrite each other. A worktree gives each run its own
+# directory and branch over the same object store.
+PARENT_DIR="$DIR"; WORKTREE=""
+if [[ $ISOLATE -eq 1 ]]; then
+  git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1 || { echo "glm-task: -W needs a git repo" >&2; exit 2; }
+  BRANCH="${BRANCH:-glm/$STAMP}"
+  WORKTREE="${GLM_WORKTREE_ROOT:-${TMPDIR:-/tmp}}/glm-wt-$STAMP"
+  if ! git -C "$DIR" worktree add -q -b "$BRANCH" "$WORKTREE" HEAD 2>&1; then
+    echo "glm-task: could not create worktree $WORKTREE on $BRANCH" >&2; exit 2
+  fi
+  # Share installed deps rather than reinstalling per run.
+  if [[ -d "$PARENT_DIR/node_modules" && ! -e "$WORKTREE/node_modules" ]]; then
+    ln -s "$PARENT_DIR/node_modules" "$WORKTREE/node_modules"
+  fi
+  echo "glm-task: isolated worktree=$WORKTREE branch=$BRANCH" >&2
+  DIR="$WORKTREE"
+fi
+
+cd "$DIR" || exit 1
+BASE="$(git rev-parse HEAD 2>/dev/null || echo '')"
+echo "glm-task: dir=$DIR base=${BASE:0:8} reviewer=$REVIEWER" >&2
+echo "glm-task: log=$LOG" >&2
+echo "glm-task: notes=$NOTES" >&2
+
+trace() {
+  python3 -u -c "
+import json,sys
+for line in sys.stdin:
+    try:
+        e=json.loads(line)
+        t=e.get('type')
+        if t=='assistant':
+            for c in e.get('message',{}).get('content',[]):
+                if c.get('type')=='text' and c.get('text','').strip():
+                    sys.stderr.write('  '+c['text'].strip()[:200]+chr(10))
+                elif c.get('type')=='tool_use':
+                    sys.stderr.write('  . '+str(c.get('name'))+chr(10))
+        elif t=='result':
+            sys.stderr.write('  -- '+str(e.get('num_turns'))+' turns, '+str((e.get('duration_ms') or 0)//1000)+'s'+chr(10))
+        sys.stderr.flush()
+    except Exception: continue
+"
+}
+
+run_agent() { # $1 = prompt, $2 = log path
+  # The notes file lives outside the repo, so its directory must be an allowed
+  # working directory or every escalation write is silently denied.
+  /Users/jerry/z.ai/claude-glm -p "$1" \
+    --permission-mode acceptEdits --allowedTools "${TOOLS[@]}" \
+    --add-dir "$(dirname "$NOTES")" \
+    --output-format stream-json --verbose 2>&1 | tee "$2" | trace
+}
+
+do_verify() {
+  [[ -n "$VERIFY" ]] || { VSTATUS="skipped"; VRC=""; return 0; }
+  echo "glm-task: verifying -> $VERIFY" >&2
+  if eval "$VERIFY" >/dev/null 2>&1; then VSTATUS="pass"; VRC=0
+  else VRC=$?; VSTATUS="fail"; fi
+  echo "glm-task: verify=$VSTATUS" >&2
+}
+
+: > "$NOTES"
+# Levels that interrupt the human. Blocked halts the agent, so it is the one that
+# actually needs them; widen with GLM_NOTIFY_LEVELS if you want more.
+NOTIFY_LEVELS="${GLM_NOTIFY_LEVELS:-blocked}"
+( tail -f "$NOTES" 2>/dev/null | while IFS= read -r n; do
+    lvl=$(printf '%s' "$n" | sed -n 's/.*"level":"\([a-z]*\)".*/\1/p')
+    msg=$(printf '%s' "$n" | sed -n 's/.*"msg":"\(.*\)"}.*/\1/p')
+    case "$lvl" in
+      blocked|scope|discovery) echo "  >>> GLM [$lvl]: $msg" >&2 ;;
+    esac
+    if printf '%s' "$NOTIFY_LEVELS" | grep -qw "$lvl"; then
+      short=$(printf '%s' "$msg" | cut -c1-180)
+      osascript -e "display notification \"$(printf '%s' "$short" | sed 's/"/\\"/g')\" with title \"GLM is blocked\" subtitle \"$(basename "$DIR")\" sound name \"Ping\"" >/dev/null 2>&1 || true
+      printf '\a' >&2
+    fi
+  done ) & TAILPID=$!
+# tail -f never exits on its own; without this the watcher outlives the run.
+cleanup_tail() {
+  [[ -n "${TAILPID:-}" ]] || return 0
+  pkill -P "$TAILPID" 2>/dev/null
+  kill "$TAILPID" 2>/dev/null
+  TAILPID=""
+}
+trap cleanup_tail EXIT INT TERM
+
+run_agent "$TASK$ESCALATION" "$LOG"
+sleep 1; cleanup_tail
+do_verify
+
+REVIEW_VERDICT="skipped"; ROUNDS=0
+if [[ "$REVIEWER" != "none" && -n "$BASE" ]]; then
+  /Users/jerry/z.ai/glm-review -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>/dev/null
+  rc=$?
+  case $rc in 0) REVIEW_VERDICT="pass" ;; 1) REVIEW_VERDICT="changes_required" ;;
+             3) REVIEW_VERDICT="no_capacity" ;; *) REVIEW_VERDICT="error" ;; esac
+  echo "glm-task: review=$REVIEW_VERDICT" >&2
+  sed 's/^/  | /' "$REVF" | head -30 >&2
+
+  while [[ "$REVIEW_VERDICT" == "changes_required" && $ROUNDS -lt $FIXES ]]; do
+    ROUNDS=$((ROUNDS+1))
+    echo "glm-task: fix round $ROUNDS" >&2
+    FIXLOG="${LOG%.jsonl}-fix$ROUNDS.jsonl"
+    run_agent "A reviewer examined your change against the original task and asked for changes.
+
+Reviewers are often wrong. In measured testing one reviewer's findings were 40% false
+positives. Treat every finding below as a CLAIM TO BE TESTED, not as an instruction.
+
+ORIGINAL TASK:
+$TASK
+
+REVIEW FINDINGS:
+$(cat "$REVF")
+
+Follow this protocol in order:
+
+1. REPRODUCE FIRST. For each finding, write a concrete check — a script, a test, a command —
+   that demonstrates the claimed behaviour. Change no source code during this step.
+2. Fix only the findings you actually reproduced.
+3. For each finding you could NOT reproduce, report the exact check you ran and its output
+   showing the claim is wrong. Do NOT edit code to satisfy a claim you could not reproduce:
+   changing working code to appease a false finding is worse than leaving it unaddressed.
+4. For every finding that was real, add a real unit test that FAILS before your fix and
+   PASSES after it. A test asserting a constant is not a test.
+5. Re-run the full verification, then commit.
+
+Report at the end: which findings you reproduced and fixed, and which you refuted and why." "$FIXLOG"
+    do_verify
+    /Users/jerry/z.ai/glm-review -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>/dev/null
+    rc=$?
+    case $rc in 0) REVIEW_VERDICT="pass" ;; 1) REVIEW_VERDICT="changes_required" ;; *) REVIEW_VERDICT="error" ;; esac
+    echo "glm-task: review=$REVIEW_VERDICT (after round $ROUNDS)" >&2
+  done
+fi
+
+GLM_LOG="$LOG" GLM_LEDGER="$LEDGER" GLM_DIR="$DIR" GLM_TASK_TEXT="$TASK" \
+GLM_VERIFY="$VERIFY" GLM_VSTATUS="${VSTATUS:-skipped}" GLM_VRC="${VRC:-}" \
+GLM_REVIEWER="$REVIEWER" GLM_RVERDICT="$REVIEW_VERDICT" GLM_ROUNDS="$ROUNDS" \
+GLM_NOTES_F="$NOTES" GLM_REVF="$REVF" GLM_BASE="$BASE" python3 - <<'PY'
+import json, os, datetime
+res={}
+try:
+    for line in open(os.environ["GLM_LOG"]):
+        if line.strip().startswith("{"):
+            try:
+                e=json.loads(line)
+                if e.get("type")=="result": res=e
+            except Exception: pass
+except FileNotFoundError: pass
+try: review=open(os.environ["GLM_REVF"]).read()[:4000]
+except Exception: review=""
+notes=[]
+try:
+    for ln in open(os.environ["GLM_NOTES_F"]):
+        ln=ln.strip()
+        if ln.startswith("{"):
+            try: notes.append(json.loads(ln))
+            except Exception: notes.append({"level":"malformed","msg":ln[:200]})
+except Exception: pass
+if notes:
+    print("\nglm-task: the agent raised %d item(s) for you:" % len(notes))
+    for n in notes:
+        print("  [%s] %s" % (n.get("level","?"), (n.get("msg") or "")[:300]))
+rec={
+ "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+ "dir": os.environ["GLM_DIR"], "base": os.environ["GLM_BASE"] or None,
+ "task": os.environ["GLM_TASK_TEXT"][:500],
+ "session_id": res.get("session_id"), "num_turns": res.get("num_turns"),
+ "duration_ms": res.get("duration_ms"), "agent_error": res.get("is_error"),
+ "agent_said": (res.get("result") or "")[:500],
+ "verify_cmd": os.environ["GLM_VERIFY"] or None,
+ "verify": os.environ["GLM_VSTATUS"],
+ "verify_rc": int(os.environ["GLM_VRC"]) if os.environ["GLM_VRC"] else None,
+ "reviewer": os.environ["GLM_REVIEWER"], "review": os.environ["GLM_RVERDICT"],
+ "fix_rounds": int(os.environ["GLM_ROUNDS"]), "review_text": review,
+ "log": os.environ["GLM_LOG"],
+ "notes": notes,
+}
+# Records can exceed the atomic-append size, so concurrent runs must lock.
+import fcntl
+with open(os.environ["GLM_LEDGER"],"a") as f:
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    try: f.write(json.dumps(rec)+"\n"); f.flush()
+    finally: fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+print(f"glm-task: recorded -> {os.environ['GLM_LEDGER']}")
+PY
+
+# A blocked agent stopped without finishing. A weak verify command can pass over
+# unimplemented work, so blocked must never report success.
+if grep -q '"level":"blocked"' "$NOTES" 2>/dev/null; then
+  echo "glm-task: agent is BLOCKED — the task is NOT complete, whatever verify said." >&2
+  exit 4
+fi
+
+# An errored review is NOT a pass — it means nothing was checked. Surface it distinctly
+# so a broken reviewer can never be mistaken for a clean bill of health.
+if [[ "${VSTATUS:-}" == "fail" || "$REVIEW_VERDICT" == "changes_required" ]]; then exit 1; fi
+if [[ "$REVIEW_VERDICT" == "error" ]]; then
+  echo "glm-task: review did not complete — treat this as UNREVIEWED, not passed." >&2
+  exit 2
+fi
+if [[ "$REVIEW_VERDICT" == "no_capacity" ]]; then
+  echo "glm-task: EVERY reviewer is out of capacity — the change is UNREVIEWED." >&2
+  echo "glm-task: ask the human whether to ship unreviewed or wait for capacity." >&2
+  exit 3
+fi
+exit 0

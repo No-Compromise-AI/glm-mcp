@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Summarise delegated GLM outcomes: first-try hit rate, turns, duration.
+#   glm-stats            # summary
+#   glm-stats -l         # list recent runs
+exec python3 - "$@" <<'PY'
+import json, os, sys, statistics
+ledger = os.environ.get("GLM_TASK_LEDGER", os.path.expanduser("~/.claude-glm/outcomes.jsonl"))
+if not os.path.exists(ledger):
+    print(f"No outcomes yet at {ledger}"); sys.exit(0)
+rows=[]
+for line in open(ledger):
+    try: rows.append(json.loads(line))
+    except Exception: pass
+if not rows:
+    print("No outcomes recorded yet."); sys.exit(0)
+
+if "-l" in sys.argv:
+    print(f"{'when':<17} {'verify':<8} {'turns':>5} {'secs':>6}  task")
+    for r in rows[-25:]:
+        print(f"{(r.get('ts') or '')[:16]:<17} {r.get('verify','?'):<8} "
+              f"{str(r.get('num_turns') or '-'):>5} {str((r.get('duration_ms') or 0)//1000):>6}  "
+              f"{(r.get('task') or '')[:60]}")
+    sys.exit(0)
+
+checked=[r for r in rows if r.get("verify") in ("pass","fail")]
+passed=[r for r in checked if r["verify"]=="pass"]
+turns=[r["num_turns"] for r in rows if r.get("num_turns")]
+secs=[(r["duration_ms"] or 0)/1000 for r in rows if r.get("duration_ms")]
+errored=[r for r in rows if r.get("agent_error")]
+
+print(f"Delegated GLM runs: {len(rows)}   ({ledger})")
+print()
+if checked:
+    pct = 100*len(passed)/len(checked)
+    print(f"  Independently verified : {len(checked)}")
+    print(f"  Passed first try       : {len(passed)}  ({pct:.0f}%)")
+    print(f"  Failed verification    : {len(checked)-len(passed)}")
+else:
+    print("  No runs used -v, so nothing was independently verified.")
+    print("  Pass -v '<command>' to record a real hit rate.")
+print(f"  Agent-reported errors  : {len(errored)}")
+
+reviewed=[r for r in rows if r.get("review") in ("pass","changes_required")]
+if reviewed:
+    rpass=[r for r in reviewed if r["review"]=="pass"]
+    fixed=[r for r in reviewed if (r.get("fix_rounds") or 0) > 0 and r["review"]=="pass"]
+    print()
+    print(f"  Reviewed               : {len(reviewed)}  (by {', '.join(sorted({r.get('reviewer') or '?' for r in reviewed}))})")
+    print(f"  Clean first review     : {len(rpass)-len(fixed)}")
+    print(f"  Passed after fix round : {len(fixed)}")
+    print(f"  Still failing review   : {len(reviewed)-len(rpass)}")
+    vp=[r for r in reviewed if r.get("verify")=="pass" and r["review"]=="changes_required"]
+    if vp:
+        print(f"  >> {len(vp)} passed verification but FAILED review — what the reviewer is for.")
+if turns: print(f"  Turns   median {statistics.median(turns):.0f}   max {max(turns)}")
+if secs:  print(f"  Runtime median {statistics.median(secs):.0f}s   max {max(secs):.0f}s")
+unverified = len(rows)-len(checked)
+if unverified: print(f"\n  {unverified} run(s) unverified — treat the hit rate as covering only the {len(checked)} checked.")
+PY

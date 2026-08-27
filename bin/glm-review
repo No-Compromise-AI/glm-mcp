@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# Review a change against the spec it was meant to implement.
+#
+#   glm-review -b <base-sha> -s <spec-file> [-C dir] [-r codex|claude|glm|agy]
+#   glm-review -b <sha> -s spec.txt -r codex,agy      # several reviewers, findings merged
+#
+# Exits 0 if every reviewer passes, 1 if any asks for changes, 2 if none could review.
+# Use a DIFFERENT model than the one that wrote the code — a model re-reading its own work
+# reliably under-reports. Different families overlap surprisingly little, so two cheap
+# reviewers from different vendors beat one expensive one.
+set -uo pipefail
+
+DIR="$PWD"; BASE=""; SPEC=""; HEADREF="HEAD"; REVIEWERS="${GLM_REVIEWER:-codex}"
+while getopts "C:b:s:r:H:h" opt; do
+  case "$opt" in
+    C) DIR="$OPTARG" ;; b) BASE="$OPTARG" ;; s) SPEC="$OPTARG" ;; r) REVIEWERS="$OPTARG" ;;
+    H) HEADREF="$OPTARG" ;;
+    h) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -10; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+cd "$DIR" || exit 2
+[[ -n "$BASE" ]] || BASE="$(git rev-parse HEAD~1 2>/dev/null)" || { echo "no base" >&2; exit 2; }
+
+SPEC_TEXT="(no written spec supplied; infer intent from the commit messages)"
+[[ -n "$SPEC" && -f "$SPEC" ]] && SPEC_TEXT="$(cat "$SPEC")"
+
+MAXDIFF="${GLM_REVIEW_MAX_DIFF:-400000}"
+DIFF="$(git diff "${BASE}..${HEADREF}" 2>/dev/null | head -c "$MAXDIFF")"
+MSGS="$(git log --format='%h %s%n%b' "${BASE}..${HEADREF}" 2>/dev/null | head -c 20000)"
+[[ -n "$DIFF" ]] || { echo "glm-review: empty diff ${BASE}..${HEADREF}" >&2; exit 2; }
+
+read -r -d '' PROMPT <<PROMPT_EOF
+Review the following change. The full diff is included below, so you do not need git
+access; if you do have file tools, use them to read surrounding code for context.
+
+--- COMMIT MESSAGES ---
+${MSGS}
+--- DIFF (${BASE}..${HEADREF}) ---
+${DIFF}
+--- END DIFF ---
+
+It was written by an AI agent implementing this specification:
+
+--- SPEC ---
+${SPEC_TEXT}
+--- END SPEC ---
+
+Prioritise, in this order:
+1. Requirements the spec states or implies that were NOT addressed, or were silently
+   narrowed. Agents pass their own tests while quietly dropping scope — that is the
+   failure mode most worth catching.
+2. Fabricated or hollow implementation. Call out anything stubbed, mocked, hardcoded to
+   return a fixed value, wrapped in a permanent TODO, or a test asserting a constant
+   instead of behaviour. An agent that mocks the work and reports success is the most
+   expensive failure there is — say so loudly if you see it.
+3. Test quality. Tests must assert real behaviour against real inputs. A test that restates
+   the implementation, asserts a constant, or exists only to make a suite go green is not a
+   test — flag it as such. Logic that deterministic unit tests would trivially cover, left
+   untested, is itself a finding. Any UI change must be verified end to end with Playwright,
+   not asserted by inspection or screenshot-free claim.
+4. Correctness bugs. Verify claims by reading the code; do not assume the tests cover it.
+5. Practical problems a user would hit in a real repository.
+
+Report only defects you can point at in the diff. Do not speculate, and do not pad the
+list — a fabricated finding costs more to disprove than a missed one costs to catch later.
+
+Be concrete: name the file, the symbol, and what breaks. Prefer a reproducible case over
+a description. Do not restate what the change does. Do not praise it.
+
+End your response with a final line that is exactly one of:
+VERDICT: PASS
+VERDICT: CHANGES_REQUIRED
+PROMPT_EOF
+
+run_one() { # $1 = reviewer name -> stdout is its raw output
+  case "$1" in
+    codex)  codex exec --sandbox read-only "$PROMPT" 2>&1 < /dev/null ;;
+    claude) claude -p "$PROMPT" --allowedTools Read Grep Glob "Bash(git:*)" "Bash(node:*)" 2>&1 < /dev/null ;;
+    glm)    /Users/jerry/z.ai/claude-glm -p "$PROMPT" --allowedTools Read Grep Glob "Bash(git:*)" "Bash(node:*)" 2>&1 < /dev/null ;;
+    agy)    agy -p "$PROMPT" --add-dir "$DIR" --model "${GLM_AGY_MODEL:-claude-opus-4-6-thinking}" 2>&1 < /dev/null ;;
+    *) echo "unknown reviewer: $1" >&2; return 2 ;;
+  esac
+}
+
+ANY_CHANGES=0; ANY_OK=0
+declare -a EXHAUSTED=() TRIED=() USED=()
+
+# Capacity exhaustion has to be distinguished from a normal failure: an unavailable
+# reviewer must never be reported as a clean review.
+is_exhausted() {
+  printf '%s' "$1" | grep -qiE \
+    'rate.?limit|quota (exceeded|reached)|usage limit|out of (credits|capacity|tokens)|too many requests|http 429|status 429|insufficient (balance|credits|quota)|plan limit|limit reached|try again (later|in [0-9])'
+}
+
+REVIEW_TIMEOUT="${GLM_REVIEW_TIMEOUT:-900}"
+HEARTBEAT="${GLM_REVIEW_HEARTBEAT:-60}"
+
+# Run a reviewer with output streamed to a file, a liveness heartbeat, and a hard
+# deadline. A reviewer that hangs or dies must never be mistaken for one that passed.
+# Returns 0 = finished, 124 = timed out, other = its exit code.
+run_capture() { # $1 = reviewer, $2 = output file
+  local R="$1" OF="$2" pid waited=0 tick=5 last=0 now
+  : > "$OF"
+  ( run_one "$R" ) > "$OF" 2>&1 < /dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    [[ $waited -ge $REVIEW_TIMEOUT ]] && break
+    sleep "$tick"; waited=$((waited+tick))
+    if (( waited % HEARTBEAT == 0 )); then
+      now=$(wc -c < "$OF" 2>/dev/null || echo 0)
+      if [[ "$now" == "$last" ]]; then
+        echo "glm-review: $R alive ${waited}s, ${now}B (no new output since last check)" >&2
+      else
+        echo "glm-review: $R alive ${waited}s, ${now}B" >&2
+      fi
+      last="$now"
+    fi
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "glm-review: $R exceeded ${REVIEW_TIMEOUT}s — killing it." >&2
+    pkill -P "$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null
+    sleep 2
+    pkill -9 -P "$pid" 2>/dev/null; kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    return 124
+  fi
+  wait "$pid"; return $?
+}
+
+already_tried() { local x; for x in ${TRIED[@]+"${TRIED[@]}"}; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
+
+attempt() { # $1 = reviewer. echoes findings; sets LAST_STATUS to ok|exhausted|error
+  local R="$1"
+  already_tried "$R" && { LAST_STATUS="skip"; return; }
+  TRIED+=("$R")
+  echo "glm-review: reviewer=$R base=${BASE:0:8}" >&2
+  local OUT V BODY TF rc
+  TF="$(mktemp "${TMPDIR:-/tmp}/glm-rev-$R-XXXXXX")"
+  run_capture "$R" "$TF"; rc=$?
+  OUT="$(cat "$TF" 2>/dev/null)"
+  LASTLOG="$TF"
+  if [[ $rc -eq 124 ]]; then
+    echo "glm-review: $R TIMED OUT — partial output kept at $TF" >&2
+    LAST_STATUS="timeout"; return
+  fi
+  if [[ $rc -ne 0 && -z "$OUT" ]]; then
+    echo "glm-review: $R died with exit $rc and produced nothing — see $TF" >&2
+    LAST_STATUS="error"; return
+  fi
+  V="$(printf '%s\n' "$OUT" | grep -oE '^VERDICT: (PASS|CHANGES_REQUIRED)$' | tail -1)"
+  if [[ -z "$V" ]] && is_exhausted "$OUT"; then
+    EXHAUSTED+=("$R")
+    echo "glm-review: $R is OUT OF CAPACITY — not reviewed by it." >&2
+    LAST_STATUS="exhausted"; return
+  fi
+  if [[ -z "$V" ]]; then
+    echo "glm-review: $R returned no verdict (error, not capacity)." >&2
+    LAST_STATUS="error"; return
+  fi
+  # A verdict with no analysis behind it is a rubber stamp, not a review. Reject it
+  # rather than let an empty PASS read as approval.
+  local SUBSTANCE
+  SUBSTANCE=$(printf '%s' "$OUT" | grep -vE '^VERDICT: (PASS|CHANGES_REQUIRED)$' | tr -d '[:space:]' | wc -c | tr -d ' ')
+  if [[ "$SUBSTANCE" -lt "${GLM_REVIEW_MIN_SUBSTANCE:-200}" ]]; then
+    echo "glm-review: $R returned a bare verdict (${SUBSTANCE} chars of analysis) — not a real review." >&2
+    LAST_STATUS="error"; return
+  fi
+  BODY="$(printf '%s\n' "$OUT" | awk '
+    /^VERDICT: (PASS|CHANGES_REQUIRED)$/ { last=NR } { l[NR]=$0 } END {
+      if (last==0) { for(i=1;i<=NR;i++) print l[i]; exit }
+      start=1; for(i=last-1;i>=1;i--) if (l[i] ~ /^(Findings|codex|# |\*\*)/) { start=i; break }
+      for(i=start;i<=last;i++) print l[i]
+    }')"
+  echo "===== reviewer: $R — $V ====="
+  printf '%s\n' "${BODY:-$OUT}"
+  echo
+  USED+=("$R")
+  ANY_OK=1
+  [[ "$V" == "VERDICT: CHANGES_REQUIRED" ]] && ANY_CHANGES=1
+  LAST_STATUS="ok"
+}
+
+peer_of() { case "$1" in codex) echo agy ;; agy) echo codex ;; *) echo "" ;; esac; }
+
+IFS=',' read -r -a LIST <<< "$REVIEWERS"
+for R in ${LIST[@]+"${LIST[@]}"}; do
+  R="$(echo "$R" | tr -d '[:space:]')"; [[ -n "$R" ]] || continue
+  attempt "$R"
+  # Any reviewer that failed to deliver a verdict — no capacity, hung, or crashed —
+  # hands off to its peer, so a failure never silently leaves the change unreviewed.
+  if [[ "$LAST_STATUS" == "exhausted" || "$LAST_STATUS" == "timeout" || "$LAST_STATUS" == "error" ]]; then
+    P="$(peer_of "$R")"
+    if [[ -n "$P" ]] && ! already_tried "$P"; then
+      echo "glm-review: $R did not deliver a verdict ($LAST_STATUS) — falling back to $P" >&2
+      attempt "$P"
+    fi
+  fi
+done
+
+# Last resort: Claude, so the change is at least reviewed by something.
+if [[ $ANY_OK -eq 0 ]] && ! already_tried claude; then
+  echo "glm-review: no reviewer delivered a verdict — falling back to claude" >&2
+  attempt claude
+fi
+
+if [[ ${#EXHAUSTED[@]} -gt 0 ]]; then
+  echo "glm-review: OUT OF CAPACITY: ${EXHAUSTED[*]-}" >&2
+fi
+if [[ $ANY_OK -eq 1 ]]; then
+  echo "glm-review: reviewed by: ${USED[*]-}" >&2
+  [[ $ANY_CHANGES -eq 1 ]] && exit 1
+  exit 0
+fi
+if [[ ${#EXHAUSTED[@]} -gt 0 ]]; then
+  echo "glm-review: EVERY reviewer is out of capacity. Nothing was reviewed." >&2
+  exit 3   # caller must ask the human: proceed unreviewed, or wait for capacity?
+fi
+echo "glm-review: no reviewer returned a verdict" >&2
+exit 2

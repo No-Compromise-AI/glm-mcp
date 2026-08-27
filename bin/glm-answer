@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Answer a delegated GLM run that stopped and asked for a decision, resuming the
+# same session so it keeps everything it already worked out.
+#
+#   glm-answer <session-id> "use approach B, and leave the legacy path alone"
+#   glm-answer -C ~/proj <session-id> "..."
+#
+# Find the session id in the run's ledger entry or from `glm-notes`.
+set -uo pipefail
+DIR="$PWD"
+while getopts "C:h" opt; do
+  case "$opt" in
+    C) DIR="$OPTARG" ;;
+    h) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -8; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -ge 2 ]] || { echo 'usage: glm-answer [-C dir] <session-id> "<answer>"' >&2; exit 2; }
+SID="$1"; shift; ANSWER="$*"
+
+STAMP="$(date +%Y%m%d-%H%M%S)"
+LOG="${TMPDIR:-/tmp}/glm-answer-$STAMP.jsonl"
+NOTES="${GLM_NOTES:-${TMPDIR:-/tmp}/glm-notes-$STAMP.jsonl}"
+: > "$NOTES"
+
+cd "$DIR" || exit 1
+echo "glm-answer: resuming $SID in $DIR" >&2
+echo "glm-answer: log=$LOG" >&2
+
+/Users/jerry/z.ai/claude-glm --resume "$SID" -p "The human answered your question:
+
+$ANSWER
+
+Continue from where you stopped. If this answer resolves the block, carry on and finish the
+task. If it does not, say precisely what is still unresolved rather than guessing.
+
+You can still reach them the same way: append one JSON line to $NOTES with a level of
+blocked, scope, discovery or decision. Default to silence." \
+  --permission-mode acceptEdits \
+  --add-dir "$(dirname "$NOTES")" \
+  --allowedTools "Bash(node:*)" "Bash(npm:*)" "Bash(pnpm:*)" "Bash(python3:*)" "Bash(pytest:*)" \
+                 "Bash(make:*)" "Bash(dotnet:*)" "Bash(cargo:*)" "Bash(go:*)" "Bash(git:*)" \
+                 "Bash(gh:*)" "Bash(az:*)" "Bash(printf:*)" Read Edit Write Glob Grep \
+  --output-format stream-json --verbose < /dev/null 2>&1 | tee "$LOG" \
+| python3 -u -c "
+import json,sys
+for line in sys.stdin:
+    try:
+        e=json.loads(line); t=e.get('type')
+        if t=='assistant':
+            for c in e.get('message',{}).get('content',[]):
+                if c.get('type')=='text' and c.get('text','').strip():
+                    sys.stderr.write('  '+c['text'].strip()[:200]+chr(10))
+                elif c.get('type')=='tool_use':
+                    sys.stderr.write('  . '+str(c.get('name'))+chr(10))
+        elif t=='result':
+            sys.stderr.write('  -- '+str(e.get('num_turns'))+' turns'+chr(10))
+        sys.stderr.flush()
+    except Exception: continue
+"
+if [[ -s "$NOTES" ]]; then
+  echo "glm-answer: the agent raised more items:" >&2
+  sed 's/^/  /' "$NOTES" >&2
+fi

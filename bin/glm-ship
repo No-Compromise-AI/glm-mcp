@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Take a finished branch all the way to "verified working", not just "PR opened".
+#
+#   glm-ship -C ~/proj -b feat/x -t "Title" [-m] [-D deploy.yml] [-V "curl -fsS https://app/health"]
+#
+#   -b <branch>   branch to ship (default: current)
+#   -t <title>    PR title (default: the branch's last commit subject)
+#   -B <body>     PR body (default: generated from the commits)
+#   -m            enable auto-merge (squash)
+#   -D <workflow> deploy workflow filename to watch after merge
+#   -V <cmd>      post-deploy check. THIS is what "done" means; without it the
+#                 run reports merged-but-unverified, never done.
+#   -R            require at least one check; fail rather than merge unchecked
+#   -T <secs>     overall watch deadline (default 3600)
+#
+# Escalates through the same notes channel as glm-task: anything that stops the
+# change reaching production is written as a `blocked` note and notified.
+set -uo pipefail
+
+DIR="$PWD"; BRANCH=""; TITLE=""; BODY=""; AUTOMERGE=0; DEPLOY_WF=""; VERIFY_CMD=""; DEADLINE=5400
+REQUIRE_CHECKS=0
+# Measured on this account: GitHub can take 2.5-20 MINUTES to create a run after the
+# event. Anything shorter than that concludes "no CI" while the run is still pending.
+CHECK_GRACE="${GLM_SHIP_CHECK_GRACE:-1500}"
+while getopts "C:b:t:B:mD:V:T:Rh" opt; do
+  case "$opt" in
+    C) DIR="$OPTARG" ;; b) BRANCH="$OPTARG" ;; t) TITLE="$OPTARG" ;; B) BODY="$OPTARG" ;;
+    m) AUTOMERGE=1 ;; R) REQUIRE_CHECKS=1 ;; D) DEPLOY_WF="$OPTARG" ;; V) VERIFY_CMD="$OPTARG" ;; T) DEADLINE="$OPTARG" ;;
+    h) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -16; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+cd "$DIR" || exit 2
+BRANCH="${BRANCH:-$(git branch --show-current)}"
+STAMP="$(date +%Y%m%d-%H%M%S)-$$"
+NOTES="${GLM_NOTES:-${TMPDIR:-/tmp}/glm-ship-notes-$STAMP.jsonl}"
+: > "$NOTES"
+
+note() { # $1 level  $2 message — reaches the human the same way glm-task's do
+  printf '{"level":"%s","msg":"%s"}\n' "$1" "$(printf '%s' "$2" | sed 's/"/\\"/g' | tr '\n' ' ')" >> "$NOTES"
+  echo "  >>> ship [$1]: $2" >&2
+  if [[ "$1" == "blocked" ]]; then
+    osascript -e "display notification \"$(printf '%s' "$2" | cut -c1-170 | sed 's/"/\\"/g')\" with title \"Ship blocked\" subtitle \"$BRANCH\" sound name \"Ping\"" >/dev/null 2>&1 || true
+  fi
+}
+
+say() { echo "glm-ship: $*" >&2; }
+START=$SECONDS
+past_deadline() { (( SECONDS - START > DEADLINE )); }
+
+WARNED_NOCHECKS=0
+say "branch=$BRANCH dir=$DIR"
+git push -u origin "$BRANCH" 2>&1 | tail -2 >&2 || { note blocked "push of $BRANCH failed"; exit 4; }
+
+PR=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number' 2>/dev/null)
+if [[ -z "$PR" || "$PR" == "null" ]]; then
+  TITLE="${TITLE:-$(git log -1 --format=%s "$BRANCH")}"
+  BODY="${BODY:-$(git log --format='- %s' origin/main.."$BRANCH" 2>/dev/null)}"
+  PR=$(gh pr create --head "$BRANCH" --title "$TITLE" --body "$BODY" --json number --jq .number 2>/dev/null) \
+    || PR=$(gh pr create --head "$BRANCH" --title "$TITLE" --body "$BODY" 2>&1 | grep -oE '[0-9]+$' | tail -1)
+fi
+[[ -n "$PR" ]] || { note blocked "could not create or find a PR for $BRANCH"; exit 4; }
+say "PR #$PR"
+# If auto-merge cannot be armed we must merge ourselves, or the watch loop waits
+# forever for something that will never happen.
+ARMED=0
+if [[ $AUTOMERGE -eq 1 ]]; then
+  if gh pr merge "$PR" --squash --auto >/dev/null 2>&1; then
+    ARMED=1; say "auto-merge armed"
+  else
+    note scope "auto-merge could not be armed on #$PR (repo setting or branch rules); this run will merge it directly once checks are green"
+  fi
+fi
+
+# ---- watch checks -------------------------------------------------------
+say "watching checks…"
+while :; do
+  past_deadline && { note blocked "PR #$PR: checks still running after ${DEADLINE}s"; exit 4; }
+  STATE=$(gh pr view "$PR" --json mergeable,mergeStateStatus,state --jq '[.state,.mergeable,.mergeStateStatus]|@tsv' 2>/dev/null)
+  PRSTATE=$(printf '%s' "$STATE" | cut -f1); MERGEABLE=$(printf '%s' "$STATE" | cut -f2)
+  [[ "$PRSTATE" == "MERGED" ]] && break
+  [[ "$PRSTATE" == "CLOSED" ]] && { note blocked "PR #$PR was closed without merging"; exit 4; }
+  if [[ "$MERGEABLE" == "CONFLICTING" ]]; then
+    note blocked "PR #$PR has merge conflicts and cannot merge. Resolve them, then re-run glm-ship."
+    exit 4
+  fi
+  FAILED=$(gh pr checks "$PR" --json name,state --jq '[.[]|select(.state=="FAILURE" or .state=="TIMED_OUT" or .state=="CANCELLED")|.name]|join(", ")' 2>/dev/null)
+  if [[ -n "$FAILED" && "$FAILED" != "null" ]]; then
+    note blocked "PR #$PR checks failed: $FAILED — not merged. See: gh pr checks $PR"
+    exit 4
+  fi
+  TOTAL=$(gh pr checks "$PR" --json state --jq 'length' 2>/dev/null)
+  if [[ "${TOTAL:-0}" == "0" ]]; then
+    # Checks are created asynchronously. Merging the instant none exist races the CI
+    # that is about to report, so wait out the grace period before concluding there
+    # genuinely are none.
+    if (( SECONDS - START < CHECK_GRACE )); then
+      sleep 10; continue
+    fi
+    if [[ $WARNED_NOCHECKS -eq 0 ]]; then
+      WARNED_NOCHECKS=1
+      if [[ $REQUIRE_CHECKS -eq 1 ]]; then
+        note blocked "PR #$PR still has no checks after ${CHECK_GRACE}s and -R was given. Not merging something nothing verified."
+        exit 4
+      fi
+      note scope "PR #$PR has no checks after ${CHECK_GRACE}s — nothing is verifying this change before merge."
+    fi
+  fi
+  PENDING=$(gh pr checks "$PR" --json state --jq '[.[]|select(.state=="PENDING" or .state=="QUEUED" or .state=="IN_PROGRESS")]|length' 2>/dev/null)
+  if [[ "${PENDING:-0}" == "0" ]]; then
+    if [[ $ARMED -eq 0 ]]; then
+      say "checks green; merging"
+      gh pr merge "$PR" --squash >/dev/null 2>&1 || { note blocked "PR #$PR is green but the merge was rejected (branch rules or review required)"; exit 4; }
+    fi
+  fi
+  sleep 15
+done
+say "PR #$PR merged"
+
+# ---- watch the deploy ---------------------------------------------------
+if [[ -n "$DEPLOY_WF" ]]; then
+  say "watching deploy workflow $DEPLOY_WF…"
+  sleep 10
+  RUN=$(gh run list --workflow "$DEPLOY_WF" --limit 1 --json databaseId,status --jq '.[0].databaseId' 2>/dev/null)
+  if [[ -z "$RUN" || "$RUN" == "null" ]]; then
+    note blocked "merged, but no run of $DEPLOY_WF appeared — the deploy may not have triggered."
+    exit 4
+  fi
+  while :; do
+    past_deadline && { note blocked "deploy run $RUN still going after ${DEADLINE}s"; exit 4; }
+    read -r ST CC < <(gh run view "$RUN" --json status,conclusion --jq '[.status,.conclusion]|@tsv' 2>/dev/null)
+    [[ "$ST" == "completed" ]] && break
+    sleep 15
+  done
+  if [[ "$CC" != "success" ]]; then
+    note blocked "deploy $DEPLOY_WF finished '$CC' — the change is merged but NOT deployed. gh run view $RUN --log-failed"
+    exit 4
+  fi
+  say "deploy succeeded"
+fi
+
+# ---- verify it actually works ------------------------------------------
+if [[ -z "$VERIFY_CMD" ]]; then
+  note scope "PR #$PR merged${DEPLOY_WF:+ and deployed}, but no post-deploy check was given, so nothing was verified. This is NOT done."
+  say "merged, UNVERIFIED (no -V given)"
+  exit 5
+fi
+say "verifying in the deployed environment: $VERIFY_CMD"
+for attempt in 1 2 3; do
+  if eval "$VERIFY_CMD" >/dev/null 2>&1; then
+    say "VERIFIED — merged, deployed, and working."
+    exit 0
+  fi
+  say "  post-deploy check failed (attempt $attempt/3), retrying in 20s…"
+  sleep 20
+done
+note blocked "PR #$PR merged${DEPLOY_WF:+ and deployed}, but the post-deploy check FAILED three times: $VERIFY_CMD — the change is live and not working."
+exit 4

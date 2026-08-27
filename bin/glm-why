@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Show a delegated GLM run's visible reasoning and tool trace.
+#   glm-why                  most recent run
+#   glm-why <log.jsonl>      a specific run
+#   glm-why -f               full thinking text (default: first 600 chars per block)
+set -uo pipefail
+FULL=0; LOG=""
+for a in "$@"; do case "$a" in -f) FULL=1 ;; *) LOG="$a" ;; esac; done
+[[ -n "$LOG" ]] || LOG=$(ls -t ${TMPDIR:-/tmp}/glm-task-*.jsonl 2>/dev/null | head -1)
+[[ -n "$LOG" && -f "$LOG" ]] || { echo "No run log found." >&2; exit 1; }
+echo "run: $LOG" >&2
+GLM_FULL=$FULL python3 - "$LOG" <<'PY'
+import json,os,sys
+full=os.environ.get("GLM_FULL")=="1"
+rows=[]
+for l in open(sys.argv[1]):
+    l=l.strip()
+    if l.startswith("{"):
+        try: rows.append(json.loads(l))
+        except Exception: pass
+n=0
+for e in rows:
+    if e.get("type")!="assistant": continue
+    for c in e.get("message",{}).get("content",[]):
+        t=c.get("type")
+        if t=="thinking":
+            n+=1; txt=c.get("thinking","")
+            print(f"\n─── reasoning {n} ({len(txt):,} chars) " + "─"*30)
+            print(txt if full else txt[:600] + ("…" if len(txt)>600 else ""))
+        elif t=="tool_use":
+            print(f"    · {c.get('name')}")
+        elif t=="text" and c.get("text","").strip():
+            print(f"  > {c['text'].strip()[:300]}")
+    if e.get("type")=="result": pass
+for e in rows:
+    if e.get("type")=="result":
+        print(f"\n{'─'*50}\nturns={e.get('num_turns')}  secs={(e.get('duration_ms') or 0)//1000}  error={e.get('is_error')}")
+PY

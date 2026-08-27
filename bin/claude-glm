@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Launch Claude Code CLI against z.ai's Anthropic-compatible endpoint (GLM-5.3).
+# Uses an isolated CLAUDE_CONFIG_DIR so your normal Anthropic login/history stay untouched.
+set -euo pipefail
+
+# --- resolve the z.ai API key (never hardcode it in this file) ---
+if [[ -z "${ZAI_API_KEY:-}" && -f "$HOME/.config/zai/api-key" ]]; then
+  ZAI_API_KEY="$(tr -d '[:space:]' < "$HOME/.config/zai/api-key")"
+fi
+# fall back to the key zcode already stores
+if [[ -z "${ZAI_API_KEY:-}" && -f "$HOME/.zcode/v2/config.json" ]]; then
+  ZAI_API_KEY="$(python3 -c "import json,sys;d=json.load(open('$HOME/.zcode/v2/config.json'));print(d['provider']['builtin:zai-coding-plan']['options'].get('apiKey',''))" 2>/dev/null || true)"
+fi
+if [[ -z "${ZAI_API_KEY:-}" ]]; then
+  echo "No z.ai API key. Put one in ~/.config/zai/api-key or export ZAI_API_KEY." >&2
+  exit 1
+fi
+
+export CLAUDE_CONFIG_DIR="$HOME/.claude-glm"
+mkdir -p "$CLAUDE_CONFIG_DIR"
+
+export ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic"
+export ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY"
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+
+# GLM-5.3 = the reasoning model; glm-4.7 for the cheap/fast slot (5.3 forces thinking on).
+# Every value below can be overridden by exporting it before calling this script.
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.3}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-glm-5.3}"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-glm-4.7}"
+export CLAUDE_CODE_SUBAGENT_MODEL="${CLAUDE_CODE_SUBAGENT_MODEL:-glm-5.3}"
+
+# GLM-5.3 has a 1M context. Without this, auto-compact fires at the default
+# threshold and discards context the model could still hold — costly on long runs.
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-1000000}"
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-32000}"
+
+export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+exec claude "$@"
