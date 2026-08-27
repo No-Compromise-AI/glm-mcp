@@ -6,6 +6,7 @@ import { expandGlob, isGlobPattern, patternAnchors } from "./glob.js";
 import { confineRoots, deniedCredentials, insideRoots, realpathish } from "./confine.js";
 import {
   envLimit,
+  envOverride,
   walkBudget,
   DEFAULT_MAX_FILE_BYTES,
   DEFAULT_TIMEOUT_MS,
@@ -19,6 +20,22 @@ export const DEFAULT_MODEL = "glm-5.3";
  * number for every model was the original mistake — the vision models stop at
  * 32,768 and the 4.5 family at 98,304, so a global default either starved the
  * text models or broke the rest.
+ *
+ * Each row also carries the model's context window in tokens, where z.ai's
+ * own documentation states one (#59) — the same table, because output and
+ * input are two limits of one request and split tables are two things to keep
+ * in step. The window is what the input budget is derived from, per call, for
+ * the model the request will actually use; before #59 it was one global
+ * assumption handed to every model alike, which the routing guidance of #54
+ * turned from a harmlessness into a defect: a caller sent to glm-4.5 was sized
+ * against glm-5.3's million tokens and learned the difference from z.ai. A
+ * row without `context` is an unrecorded window, not a small one — the budget
+ * falls back to the documented assumption ({@link CONTEXT_WINDOW_TOKENS}),
+ * exactly as #36 leaves an unknown model's output ceiling to z.ai rather than
+ * guessing. The windows here are z.ai's own figures and move when theirs do;
+ * GLM_MCP_CONTEXT_TOKENS is the operator's correction, and it outranks the
+ * table for every model at once, because a published number that is wrong
+ * cannot be waited out.
  *
  * Each row also carries the model's role — the one line glm_models prints
  * beside the id (#54). The role lives inside this table rather than in a
@@ -39,14 +56,14 @@ export const DEFAULT_MODEL = "glm-5.3";
  */
 const OUTPUT_LIMITS = new Map<
   string,
-  { def: number; max: number; role: string; vision?: boolean }
+  { def: number; max: number; context?: number; role: string; vision?: boolean }
 >([
   // The 5.x generation and the 4.6/4.7 text models: 65,536 of a 131,072 ceiling.
-  ["glm-5.3", { def: 65_536, max: 131_072, role: "the frontier flagship; it always reasons, so it cannot run with reasoning off" }],
+  ["glm-5.3", { def: 65_536, max: 131_072, context: 1_048_576, role: "the frontier flagship; it always reasons, so it cannot run with reasoning off" }],
   // Natively multimodal with no `v` in its name — the row glm-5.3-flash is why
   // modality is declared rather than inferred from the id (#45). It also cannot
   // run with reasoning off, silently — see THINKING_REQUIRED below.
-  ["glm-5.3-flash", { def: 65_536, max: 131_072, role: "the flagship generation's fast tier, for bulk mechanical work; natively multimodal, but this server sends text only, so its image modality goes unused; it always reasons, so reasoning 'none' is raised to 'low'", vision: true }],
+  ["glm-5.3-flash", { def: 65_536, max: 131_072, context: 1_048_576, role: "the flagship generation's fast tier, for bulk mechanical work; natively multimodal, but this server sends text only, so its image modality goes unused; it always reasons, so reasoning 'none' is raised to 'low'", vision: true }],
   ["glm-5.2", { def: 65_536, max: 131_072, role: "the previous generation of the frontier line" }],
   ["glm-5.1", { def: 65_536, max: 131_072, role: "an earlier generation of the frontier line" }],
   ["glm-5", { def: 65_536, max: 131_072, role: "the first of the 5 generation" }],
@@ -57,16 +74,20 @@ const OUTPUT_LIMITS = new Map<
   // "low", so they reason with 2,048 thinking tokens until the caller selects
   // "none". "Runs with reasoning off" sold the option as the default and cost
   // the latency-sensitive caller exactly the thinking they came to avoid.
-  ["glm-4.7", { def: 65_536, max: 131_072, role: "the newer of the 4.6/4.7 text pair; it can run with reasoning off when you select reasoning 'none'" }],
-  ["glm-4.6", { def: 65_536, max: 131_072, role: "can run with reasoning off when you select reasoning 'none'; the cheap route for bulk mechanical work" }],
-  // The 4.5 text family: the same default against a lower ceiling.
-  ["glm-4.5", { def: 65_536, max: 98_304, role: "the 4.5 text family, a generation older with a lower output ceiling" }],
+  ["glm-4.7", { def: 65_536, max: 131_072, context: 200_000, role: "the newer of the 4.6/4.7 text pair; it can run with reasoning off when you select reasoning 'none'" }],
+  ["glm-4.6", { def: 65_536, max: 131_072, context: 200_000, role: "can run with reasoning off when you select reasoning 'none'; the cheap route for bulk mechanical work" }],
+  // The 4.5 text family: the same default against a lower ceiling. Its window
+  // matches glm-4.6v's (#59) while its default output is four times larger, so
+  // its input budget is the smaller of the two — the reserve is the model's own.
+  ["glm-4.5", { def: 65_536, max: 98_304, context: 128_000, role: "the 4.5 text family, a generation older with a lower output ceiling" }],
   ["glm-4.5-air", { def: 65_536, max: 98_304, role: "the 4.5 family's light build" }],
   ["glm-4.5-x", { def: 65_536, max: 98_304, role: "the 4.5 family's speed-tuned build" }],
   ["glm-4.5-airx", { def: 65_536, max: 98_304, role: "the 4.5 family's light, speed-tuned build" }],
   ["glm-4.5-flash", { def: 65_536, max: 98_304, role: "the 4.5 family's fast tier" }],
-  // The 4.6 vision family: a quarter of the ceiling above.
-  ["glm-4.6v", { def: 16_384, max: 32_768, role: "vision model; this server sends text only, so its image modality goes unused", vision: true }],
+  // The 4.6 vision family: a quarter of the ceiling above. Same 128K window as
+  // glm-4.5 (#59) with a quarter of the default output, so more of that window
+  // is left for input.
+  ["glm-4.6v", { def: 16_384, max: 32_768, context: 128_000, role: "vision model; this server sends text only, so its image modality goes unused", vision: true }],
   ["glm-4.6v-flash", { def: 16_384, max: 32_768, role: "fast-tier vision model; this server sends text only, so its image modality goes unused", vision: true }],
   ["glm-4.6v-flashx", { def: 16_384, max: 32_768, role: "fast-tier vision model; this server sends text only, so its image modality goes unused", vision: true }],
   // The 4.5 vision model and the 128k 4-32b, where the default IS the ceiling.
@@ -100,9 +121,10 @@ export interface OutputLimits {
  */
 export function outputLimits(model: string): OutputLimits {
   const row = OUTPUT_LIMITS.get(model);
-  // The role and the vision flag ride in the same row but are not sizing, so
-  // they stay out of the returned shape: #36's contract is exactly {def, max}
-  // — and the role has its own reader below.
+  // The role, the vision flag and the context window ride in the same row but
+  // are not output sizing, so they stay out of the returned shape: #36's
+  // contract is exactly {def, max} — and the role and the window each have
+  // their own reader below.
   return row ? { def: row.def, max: row.max } : { def: DEFAULT_MAX_TOKENS };
 }
 
@@ -515,20 +537,71 @@ export function getClient(): Anthropic {
 // that window after the reply and the prompt are provided for.
 
 /**
- * The context window the input budget is sized against, in tokens. z.ai does
- * NOT publish a context length; this figure is from model listings, so it is
- * an assumption and must read as one — overridable with GLM_MCP_CONTEXT_TOKENS
- * when it proves wrong, which is also how a caller on a model with a smaller
- * window sizes the budget down.
+ * The context window the input budget is sized against for a model the table
+ * declares no window for, in tokens (#59). z.ai's documentation states windows
+ * for the models it publishes, and those live in the table beside their output
+ * limits; a model it has said nothing about is z.ai's to size, exactly as #36
+ * has it for output ceilings, so the budget falls back to this documented
+ * assumption rather than to a guess of our own.
  */
 export const CONTEXT_WINDOW_TOKENS = 1_048_576;
 
 /**
- * Tokens of the window held back for the reply: the default model's own
- * default max_tokens (see {@link outputLimits}) — the answer shares the window
- * with the input, so the input budget is what remains after it.
+ * The context window of a model, in tokens (#59), with the operator's word
+ * outranking the table's: GLM_MCP_CONTEXT_TOKENS when it is set — a published
+ * figure can be wrong, and an operator who has measured a different window
+ * must not have to wait for a table update to size requests honestly, so the
+ * override applies to EVERY model — then the row's declared `context`, then
+ * CONTEXT_WINDOW_TOKENS as the documented assumption. An unparsable value
+ * falls back the way every env limit does (#24).
  */
-const OUTPUT_RESERVE_TOKENS = outputLimits(DEFAULT_MODEL).def;
+export function contextWindowTokens(model: string): number {
+  return resolveWindow(model).tokens;
+}
+
+/**
+ * The window the budget derives from, together with which of its three
+ * sources supplied it (#59) — the operator's GLM_MCP_CONTEXT_TOKENS, the row's
+ * declared window, or the documented assumption, in the order
+ * {@link contextWindowTokens} resolves them. The source is decided by the same
+ * expressions that resolve the number, so the two cannot disagree; it is
+ * returned separately because it is not recoverable from the number (an
+ * override set to exactly the table's figure is the same number from a
+ * different place), and the truncation note has to name it (#26): of the
+ * three, only the row's declared window is a fact about the model, so it is
+ * the only one the note may call the model's.
+ */
+function resolveWindow(model: string): {
+  tokens: number;
+  source: "operator" | "model" | "assumption";
+} {
+  const forced = envOverride("GLM_MCP_CONTEXT_TOKENS");
+  if (forced !== undefined) return { tokens: forced, source: "operator" };
+  const declared = OUTPUT_LIMITS.get(model)?.context;
+  if (declared !== undefined) return { tokens: declared, source: "model" };
+  return { tokens: CONTEXT_WINDOW_TOKENS, source: "assumption" };
+}
+
+/**
+ * The window in words, for the truncation note — naming which of its three
+ * sources produced the figure, because only one of them is the model's own
+ * (#26, #59). Calling either of the others "<model>'s context window" states
+ * as fact something the code does not know: the operator's
+ * GLM_MCP_CONTEXT_TOKENS applies to every model alike and is a fact about the
+ * deployment, not about any model, and the assumption is this package's own
+ * documented figure for a model whose window nobody recorded. A caller reading
+ * the note acts on the difference — a small window of the model's own says
+ * another model has room; a figure that is not the model's says no such thing.
+ */
+function windowInWords(model: string, w: ReturnType<typeof resolveWindow>): string {
+  if (w.source === "operator") {
+    return `the operator-set GLM_MCP_CONTEXT_TOKENS window of ${w.tokens} tokens`;
+  }
+  if (w.source === "model") {
+    return `${model}'s ${w.tokens}-token context window`;
+  }
+  return `the documented assumption of ${w.tokens} tokens — no window recorded for ${model}`;
+}
 
 /**
  * Tokens held back for everything the caller sends that is not file context —
@@ -553,20 +626,50 @@ export const CHARS_PER_TOKEN = 3.0;
  * output and prompt reserves, converted at {@link CHARS_PER_TOKEN}. A function
  * of the window rather than a constant so the derivation is the contract —
  * moving the window moves the budget with it.
+ *
+ * The output reserve is the model's OWN default max_tokens (see
+ * {@link outputLimits}), not the default model's (#59) — the same defect twice
+ * over: the answer shares the window with the input, so the input budget is
+ * what remains after the reply, and a model that holds back less for output
+ * has more of its window left for input. glm-4.5 and glm-4.6v share a 128K
+ * window while holding back 65,536 and 16,384 respectively, so their budgets
+ * differ; a model the table does not know reserves {@link DEFAULT_MAX_TOKENS}.
  */
-export function deriveMaxFileChars(contextTokens: number): number {
-  const inputBudget = Math.max(0, contextTokens - OUTPUT_RESERVE_TOKENS - PROMPT_RESERVE_TOKENS);
+export function deriveMaxFileChars(
+  contextTokens: number,
+  model: string = DEFAULT_MODEL,
+): number {
+  const inputBudget = Math.max(
+    0,
+    contextTokens - outputLimits(model).def - PROMPT_RESERVE_TOKENS,
+  );
   return Math.floor(inputBudget * CHARS_PER_TOKEN);
 }
 
-// Resolved once per process, so the cap is pinned by the environment the server
-// started with — like the client's, this is a knob of the process, not of a call.
-// GLM_MCP_MAX_FILE_CHARS still overrides the derived value outright (#35), and
-// an unparsable value still falls back to it (#24).
-const DEFAULT_MAX_FILE_CHARS = deriveMaxFileChars(
-  envLimit("GLM_MCP_CONTEXT_TOKENS", CONTEXT_WINDOW_TOKENS),
-);
-export const MAX_FILE_CHARS = envLimit("GLM_MCP_MAX_FILE_CHARS", DEFAULT_MAX_FILE_CHARS);
+/**
+ * The character budget the file context of a call to this model assembles
+ * under (#59): GLM_MCP_MAX_FILE_CHARS when it is set — the operator's explicit
+ * cap overrides the derivation outright, for every model (#35), and an
+ * unparsable value falls back to it (#24) — else the window of the model the
+ * request will actually use, derived above. Resolved per call, like
+ * GLM_MCP_MAX_FILE_BYTES beside it in buildFileContext, so the cap follows the
+ * model being asked and the environment as it stands, not as they stood at
+ * import.
+ */
+export function maxFileChars(model: string): number {
+  return envLimit(
+    "GLM_MCP_MAX_FILE_CHARS",
+    deriveMaxFileChars(contextWindowTokens(model), model),
+  );
+}
+
+/**
+ * The DEFAULT MODEL's budget — what a caller that names no model is sized
+ * against, and the value verify:capacity reads. A startup snapshot of
+ * {@link maxFileChars}; the per-model sizing happens per call inside
+ * buildFileContext.
+ */
+export const MAX_FILE_CHARS = maxFileChars(DEFAULT_MODEL);
 
 /**
  * The first `maxUnits` UTF-16 units of `s`, cut where it cannot split a
@@ -651,16 +754,24 @@ export interface FileContext {
 
 /**
  * Read files into a single prompt block, guarding against blowing the context
- * window. Paths are confined to the operator's roots (see confine.ts): every
- * file's realpath must land inside one, which is what closes the ../ and
- * symlink escapes, and the server's own credentials are refused regardless of
- * roots. A refused path is a note like any other — one bad entry must not
- * fail a request that also names ten good files — so this never throws for a
- * refusal. `cwd` outside every root is the one refusal that cannot proceed:
- * narrowing it to a root would return an empty-but-successful read, the exact
- * silent-failure shape this project has spent the most effort removing.
+ * window — the window of the `model` the request will actually use (#59),
+ * which defaults to DEFAULT_MODEL when the caller names none; the argument is
+ * optional because two-argument callers exist (verify:capacity) and
+ * MAX_FILE_CHARS keeps its meaning as the default model's budget. Paths are
+ * confined to the operator's roots (see confine.ts): every file's realpath
+ * must land inside one, which is what closes the ../ and symlink escapes, and
+ * the server's own credentials are refused regardless of roots. A refused
+ * path is a note like any other — one bad entry must not fail a request that
+ * also names ten good files — so this never throws for a refusal. `cwd`
+ * outside every root is the one refusal that cannot proceed: narrowing it to
+ * a root would return an empty-but-successful read, the exact silent-failure
+ * shape this project has spent the most effort removing.
  */
-export function buildFileContext(paths: string[], cwd: string): FileContext {
+export function buildFileContext(
+  paths: string[],
+  cwd: string,
+  model: string = DEFAULT_MODEL,
+): FileContext {
   // Every note is filed under the argument that produced it, and the notes
   // leave in the order the arguments arrived (#26). Which branch handles an
   // entry — literal or pattern — is decided by whether the file exists, so
@@ -724,6 +835,30 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     notes.push({ arg: argAt, msg });
   });
   const maxFileBytes = envLimit("GLM_MCP_MAX_FILE_BYTES", DEFAULT_MAX_FILE_BYTES);
+  // #59: the char budget is the REQUESTED model's — its window and its output
+  // reserve both — so a caller routed to a smaller model by the guidance is
+  // sized against that model's window rather than the default's million
+  // tokens. maxFileChars applies GLM_MCP_MAX_FILE_CHARS over the derivation
+  // for every model alike (#35), and an unparsable value falls back (#24).
+  const cap = maxFileChars(model);
+  // Which bound the cap enforced, for the truncation note at the cut: the
+  // window the budget derived from, or the operator's explicit override. A
+  // caller routed to a smaller model has to be able to tell "this model's
+  // window is smaller" — the fix is another model — from "this file is too
+  // big" — the fix is fewer files, or a higher cap. The answer is read from
+  // whether the override is in force, never inferred from the cap's number: a
+  // pin set to exactly a model's derived budget is indistinguishable from the
+  // derivation by value yet follows the caller to every wider-window model,
+  // and naming the window there would send them model-shopping for relief the
+  // cap still denies. An unparsable pin supplies no cap (#24), so the window
+  // names the cut. The window is named with its SOURCE (see windowInWords):
+  // only the table's declared window is the model's own figure, and crediting
+  // the operator's override or the documented assumption to the model would
+  // state as fact something the code does not know (#26) — the one thing a
+  // caller might act on, and the one thing that is not true.
+  const capWhy = envOverride("GLM_MCP_MAX_FILE_CHARS") === undefined
+    ? windowInWords(model, resolveWindow(model))
+    : "the GLM_MCP_MAX_FILE_CHARS cap";
 
   // Glob entries expand to the files they match, sorted and de-duplicated against
   // everything already listed; literal paths go through exactly as given. Every
@@ -978,12 +1113,12 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     const header = `--- ${p} ---\n`;
     const sep = chunks.length > 0 ? "\n\n" : "";
     const overhead = (sep ? 2 : 0) + header.length;
-    if (total + overhead + body.length > MAX_FILE_CHARS) {
+    if (total + overhead + body.length > cap) {
       // The marker makes the truncated header longer than the plain one, so the
       // room left is measured against the header that will actually be pushed —
       // a budget that quietly grows to fit its own bookkeeping is not a budget.
       const theader = `--- ${p} (truncated) ---\n`;
-      const room = MAX_FILE_CHARS - total - (sep ? 2 : 0) - theader.length;
+      const room = cap - total - (sep ? 2 : 0) - theader.length;
       if (room > 0) {
         const taken = takeUnits(body, room);
         chunks.push(`${sep}${theader}${taken}`);
@@ -1004,10 +1139,11 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       // the note keeps to the caller's side of the boundary. This one note is
       // also that argument's whole answer: the entry was read on its behalf,
       // so the pendings loop below stays silent about it and the argument is
-      // said exactly once.
+      // said exactly once. The note also names the window that bound it
+      // (#59) — see capWhy above.
       notes.push({
         arg,
-        msg: `truncated at ${MAX_FILE_CHARS} total chars starting with: ${via}`,
+        msg: `truncated at ${cap} total chars (${capWhy}), starting with: ${via}`,
       });
       // The cap cut the loop here, so the entries after this one were never
       // attempted. `capCutAt` records whose read was underway (#40): every

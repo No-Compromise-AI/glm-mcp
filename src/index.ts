@@ -31,7 +31,7 @@ server.registerTool(
     title: "Ask GLM",
     description:
       "Send a prompt to a Z.ai GLM model (default GLM-5.3) and return its answer. " +
-      "GLM-5.3 is an independent frontier model with a 1,000,000-token context window, " +
+      "GLM-5.3 is an independent frontier model with a million-token context window, " +
       "so this is useful for a genuine second opinion from a different model, for " +
       "cross-checking reasoning, and for analysing far more source material at once than " +
       "fits in a normal context. Optionally pass file paths to include as context. " +
@@ -122,9 +122,15 @@ server.registerTool(
     try {
       let finalPrompt = prompt;
       const notes: string[] = [];
+      // Resolved once, used twice: the file context and the request itself are
+      // sized for the SAME model (#59) — the budget follows the model the
+      // caller chose (or the default when it chose none), never a private
+      // default of this file's own, which is how index.ts has been wrong
+      // before while every check beneath it stayed green.
+      const chosenModel = model ?? DEFAULT_MODEL;
 
       if (files?.length) {
-        const ctx = buildFileContext(files, cwd ?? process.cwd());
+        const ctx = buildFileContext(files, cwd ?? process.cwd(), chosenModel);
         notes.push(...ctx.notes);
         // A refused call read nothing. Sending the prompt anyway would answer
         // the question with none of the material it asked about — a silent
@@ -146,7 +152,7 @@ server.registerTool(
 
       const result = await ask({
         prompt: finalPrompt,
-        model: model ?? DEFAULT_MODEL,
+        model: chosenModel,
         reasoning: (reasoning ?? "low") as Reasoning,
         system,
         // #36: omitted, ask() applies the model's own published default — not a

@@ -196,10 +196,13 @@ const c = glm.buildFileContext(['big.txt'], ${JSON.stringify(FIXTURE)});
 out.len = c.text.length; out.notes = c.notes; out.cap = glm.MAX_FILE_CHARS;`, env);
 
 // The derivation restated from the module's own constants, so the test fails
-// on the derivation changing, not on a mystery number.
-const derived = (windowTokens) => Math.floor(
-  (windowTokens - glm.outputLimits(glm.DEFAULT_MODEL).def - glm.PROMPT_RESERVE_TOKENS)
+// on the derivation changing, not on a mystery number. The default model's
+// window is the #35 case; #59 made it per model, and the reserve it subtracts
+// is the REQUESTED model's own default.
+const derivedFor = (model, windowTokens) => Math.floor(
+  (windowTokens - glm.outputLimits(model).def - glm.PROMPT_RESERVE_TOKENS)
     * glm.CHARS_PER_TOKEN);
+const derived = (windowTokens) => derivedFor(glm.DEFAULT_MODEL, windowTokens);
 
 test('#35 the input budget is derived from the window, not guessed', () => {
   const r = ctx({});
@@ -256,4 +259,120 @@ test('#35 a bigger budget is not permission to go quiet: the derived cap still t
   assert.ok(r.len <= r.cap, `${r.len} chars assembled against a ${r.cap}-char budget`);
   assert.ok((r.notes ?? []).some((n) => /truncated at \d+ total chars/i.test(n)),
     `a 3.2M-char file over the derived budget must be truncated AND noted — ${JSON.stringify(r.notes)}`);
+});
+
+// ------------------------------------------------ #59: which bound the note names
+// A truncation note names the bound that cut it — the model's window, or the
+// operator's cap — because the reader's next move depends on which it was
+// (#59, rule 7). The attribution has to be read from whether an override is in
+// force, never inferred from the cap's NUMBER: a pin set to exactly a model's
+// derived budget is indistinguishable from the derivation by value yet follows
+// the caller to every wider-window model, and a note that names the window
+// there sends the caller model-shopping for relief the cap still denies.
+
+test("#59 a cap pinned to exactly the model's derived budget is still named as the cap", () => {
+  // glm-4.5: a 128,000-token window (z.ai's published figure, stated here
+  // independently per this file's convention) against its own 65,536 default.
+  const glm45 = derivedFor('glm-4.5', 128_000);
+  const cut = (env) => child(`
+process.env.GLM_MCP_ROOTS = ${JSON.stringify(FIXTURE)};
+const c = glm.buildFileContext(['big.txt'], ${JSON.stringify(FIXTURE)}, 'glm-4.5');
+out.len = c.text.length; out.notes = c.notes;`, env)
+    .notes.find((n) => /truncat/i.test(n)) ?? '';
+
+  const pinned = cut({ GLM_MCP_MAX_FILE_CHARS: glm45 });
+  assert.ok(pinned.includes('GLM_MCP_MAX_FILE_CHARS'),
+    `GLM_MCP_MAX_FILE_CHARS=${glm45} is in force — it is exactly glm-4.5's derived budget, and under the same pin glm-4.6's 200K window is cut at it too — so the bound is the cap and the note must say so: ${JSON.stringify(pinned)}`);
+  assert.ok(!pinned.includes('context window'),
+    `the window did not bind this cut; naming it tells the caller to change models, which the cap survives: ${JSON.stringify(pinned)}`);
+
+  // The other branch must survive the fix, not be flattened into always saying
+  // "cap": with no override — and with an unparsable one, which supplies no
+  // cap at all (#24) — it is glm-4.5's own window that binds.
+  for (const env of [{}, { GLM_MCP_MAX_FILE_CHARS: 'abc' }]) {
+    const free = cut(env);
+    assert.ok(/glm-4\.5's 128000-token context window/.test(free),
+      `with ${JSON.stringify(env)} the derivation binds, and the note must name glm-4.5's window: ${JSON.stringify(free)}`);
+  }
+});
+
+// --------------------------------- #59: the published windows, stated exactly
+// A resolver checked only against itself passes with a mistyped window — the
+// same reasoning as PUBLISHED above — and the whole input budget derives from
+// this number, so z.ai's figures are written down here independently. The gate
+// pins them too (verify:window rule 9); a unit test is where a contributor
+// looks first. Run in a scrubbed child: contextWindowTokens reads
+// GLM_MCP_CONTEXT_TOKENS per call, so a value pinned in the ambient
+// environment would mask the table's own figures.
+
+const PUBLISHED_WINDOWS = [
+  ['glm-5.3', 1_048_576],
+  ['glm-5.3-flash', 1_048_576],
+  ['glm-4.7', 200_000],
+  ['glm-4.6', 200_000],
+  ['glm-4.5', 128_000],
+  ['glm-4.6v', 128_000],
+];
+
+test("#59 the declared context windows are z.ai's published figures, exactly", () => {
+  const ids = PUBLISHED_WINDOWS.map(([id]) => id);
+  const r = child(`out.windows = {};
+for (const m of ${JSON.stringify(ids)}) out.windows[m] = glm.contextWindowTokens(m);`);
+  assert.equal(r.threw, undefined, `contextWindowTokens must resolve, not throw — ${r.threw}`);
+  for (const [model, tokens] of PUBLISHED_WINDOWS) {
+    assert.equal(r.windows[model], tokens,
+      `${model}'s window must resolve to ${tokens} per z.ai's published figure — got ${r.windows[model]}`);
+  }
+});
+
+test('#59 a model with no recorded window keeps the documented assumption', () => {
+  // glm-5.2 is in the table with no window recorded; glm-99-unreleased is not
+  // in the table at all. Neither is ours to size, so both fall back to the
+  // documented assumption — stated here independently, not read back from the
+  // constant the resolver uses.
+  const r = child(`out.windows = {
+  'glm-5.2': glm.contextWindowTokens('glm-5.2'),
+  'glm-99-unreleased': glm.contextWindowTokens('glm-99-unreleased'),
+};`);
+  assert.equal(r.windows['glm-5.2'], 1_048_576,
+    `a model the table records no window for must keep the documented assumption — got ${r.windows['glm-5.2']}`);
+  assert.equal(r.windows['glm-99-unreleased'], 1_048_576,
+    `a model the table has never heard of must keep the documented assumption — got ${r.windows['glm-99-unreleased']}`);
+});
+
+// -------------------- #26: the note does not invent a model's window (#59)
+// The window figure has three sources and only the table's is the model's
+// own. A note that says "<model>'s N-token context window" where N came from
+// GLM_MCP_CONTEXT_TOKENS or from the undocumented-window assumption states as
+// fact something the code does not know, so the note names the source instead.
+
+test("#59 a truncation note never calls a figure the model's window unless it is", () => {
+  const cut = (model, env) => child(`
+process.env.GLM_MCP_ROOTS = ${JSON.stringify(FIXTURE)};
+const c = glm.buildFileContext(['big.txt'], ${JSON.stringify(FIXTURE)}, ${JSON.stringify(model)});
+out.notes = c.notes;`, env)
+    .notes.find((n) => /truncat/i.test(n)) ?? '';
+
+  // The assumption, for a model the table records no window for and for one it
+  // has never heard of: the figure is this package's, and the note must read
+  // as an assumption — a published window for either model would be invented.
+  for (const model of ['glm-5.2', 'glm-99-unreleased']) {
+    const note = cut(model, {});
+    assert.ok(note, `${model} must truncate a 3.2M-char file under the assumed window`);
+    assert.ok(!/'s\s[\d,_]+-token context window/.test(note),
+      `no window is published for ${model}; presenting the assumption as the model's own invents a fact — ${JSON.stringify(note)}`);
+    assert.ok(/assumption/i.test(note),
+      `the note must say the figure is an assumption, not pass it off as the model's — ${JSON.stringify(note)}`);
+  }
+
+  // The operator's override, on a model that DOES publish a window: 90,000 is
+  // the operator's figure for every model alike, and glm-4.6's own window is
+  // 200,000 — reporting 90,000 as glm-4.6's is the one thing a caller might
+  // act on and the one thing that is not true.
+  const overridden = cut('glm-4.6', { GLM_MCP_CONTEXT_TOKENS: 90_000 });
+  assert.ok(overridden, 'glm-4.6 must truncate under GLM_MCP_CONTEXT_TOKENS=90000');
+  assert.ok(overridden.includes('GLM_MCP_CONTEXT_TOKENS'),
+    `the figure came from the operator's variable, and the note must name it — ${JSON.stringify(overridden)}`);
+  assert.ok(!/'s\s[\d,_]+-token context window/.test(overridden),
+    `90000 is the operator's override, not glm-4.6's published 200,000 — ${JSON.stringify(overridden)}`);
 });
