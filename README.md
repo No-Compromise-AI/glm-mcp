@@ -96,7 +96,7 @@ Two things it is genuinely good at:
 | `model` | string | `glm-5.3` | any id from `glm_models` |
 | `reasoning` | `none`\|`low`\|`high`\|`max` | `low` | higher is slower |
 | `system` | string | — | optional system prompt |
-| `max_tokens` | number | 8192 | output cap |
+| `max_tokens` | number | 8192 | hard ceiling on output; see Reasoning |
 
 ### `glm_models`
 
@@ -114,7 +114,13 @@ Lists the model ids available on the configured account.
 | `high` | 8,192 tokens |
 | `max` | 24,576 tokens |
 
-`max_tokens` is raised automatically to leave room for the answer on top of the budget.
+`max_tokens` is a **ceiling, not a target**: the request never asks for more than you set.
+Where the budget above would not fit beneath it, the thinking budget is reduced to leave room
+for the answer — so a small `max_tokens` buys less reasoning rather than a bigger bill.
+
+Set it below what any reasoning needs at all — the API's minimum thinking budget plus room for
+an answer — and the call is refused rather than quietly enlarged. The refusal names the smallest
+cap that would work. Raise `max_tokens`, or lower `reasoning` on a model that permits it.
 
 ## Path confinement
 
@@ -214,10 +220,19 @@ variable that set it — nothing is ever silently truncated or silently dropped.
 ## Errors and endpoints
 
 z.ai's coded errors are translated into something actionable: `1113` (no balance), `1210`
-(reasoning required), `3007` (wrong credential type — see Credentials above).
+(reasoning required), `3007` (wrong credential type — see Credentials above). The code has to
+be the error's own code: a request id or token count that happens to contain those digits is
+passed through untranslated rather than explained as something it is not.
 
 Requests go to `https://api.z.ai/api/anthropic` unless `ZAI_BASE_URL` says otherwise. Your key
 is sent to whatever host it names, so only point it at endpoints you trust.
+
+`glm_models` reads a different endpoint on a different path prefix, so it does not follow
+`ZAI_BASE_URL` — pointing the two at one host would only be a guess about your gateway's
+layout. It defaults to `https://api.z.ai/api/paas/v4/models` and is set explicitly with
+`ZAI_MODELS_URL`. **If you set `ZAI_BASE_URL` to scope where your key is sent, set
+`ZAI_MODELS_URL` too**, or `glm_models` will keep sending the key to z.ai. Both requests
+observe `GLM_MCP_TIMEOUT_MS`.
 
 ## Testing
 

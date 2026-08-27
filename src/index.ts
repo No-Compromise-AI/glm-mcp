@@ -8,6 +8,8 @@ import {
   DEFAULT_MODEL,
   explainError,
   listModels,
+  ANSWER_ROOM,
+  MIN_BUDGET_TOKENS,
   type Reasoning,
 } from "./glm.js";
 
@@ -53,7 +55,20 @@ server.registerTool(
           "Reasoning depth. Higher is slower. GLM-5.3 always reasons, so 'none' is raised to 'low' for it.",
         ),
       system: z.string().optional().describe("Optional system prompt."),
-      max_tokens: z.number().int().positive().optional().describe("Max output tokens. Default 8192."),
+      max_tokens: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Max output tokens — a hard cap. The request never exceeds it; the thinking " +
+            "budget scales down to fit beneath it, always leaving room for the answer, " +
+            `but never below the API minimum of ${MIN_BUDGET_TOKENS}. A cap below ` +
+            `${MIN_BUDGET_TOKENS + ANSWER_ROOM} — the API's budget minimum plus the room ` +
+            "the answer needs — cannot hold both and is refused rather than silently " +
+            "raised; on GLM-5.3, which always reasons, the only fix is a higher cap. " +
+            "Default 8192.",
+        ),
     },
   },
   async ({ prompt, files, cwd, model, reasoning, system, max_tokens }) => {
