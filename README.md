@@ -151,11 +151,13 @@ re-open those three files.
 
 ### Upgrading to 0.2.0
 
-**If you read files across more than one project, set `GLM_MCP_ROOTS` in your MCP
-registration before upgrading.** Each server is rooted at the project it was
-started in, so asking from one project about a file in another worked silently
-before 0.2.0 and is refused after it. The registration ships `env: {}`, so this
-has to be added deliberately:
+**Using it in each of your projects needs no configuration.** Your client starts
+one server per project, rooted at that project, so `env: {}` already gives you
+what you want: in `~/work/app` it reads `app`, in `~/work/api` it reads `api`.
+
+**If you read files across more than one project in a single call, set
+`GLM_MCP_ROOTS` before upgrading.** That worked silently before 0.2.0 and is
+refused after it:
 
 ```json
 "env": { "GLM_MCP_ROOTS": "/Users/you/project-a:/Users/you/project-b" }
@@ -163,6 +165,23 @@ has to be added deliberately:
 
 Absolute paths are confined too, but that breaks far less than it sounds: a
 survey of this author's own tooling found no caller that passes them.
+
+Two other behaviours change in 0.2.0, both in your favour and neither needing
+configuration:
+
+- **`max_tokens` is now a ceiling rather than a floor.** It used to be raised to
+  make room for reasoning, so a small cap silently became a large one. It is now
+  honoured exactly, with the thinking budget scaled to fit beneath it. A cap too
+  small to hold any reasoning *and* an answer is refused with a message naming
+  the smallest that works, instead of quietly becoming an expensive request.
+- **The defaults are much larger.** Output goes from 8,192 to the model's own
+  default — 65,536 for GLM-5.3 — and the file-context budget from 800,000
+  characters to roughly 2.9 million, derived from the context window rather than
+  guessed. If you had raised `GLM_MCP_MAX_FILE_CHARS` to work around the old
+  ceiling, you can drop the override.
+
+`glm_models` gains `ZAI_MODELS_URL`. It matters only if you set `ZAI_BASE_URL`
+to control where your key is sent — see [Errors and endpoints](#errors-and-endpoints).
 
 ## File context
 
