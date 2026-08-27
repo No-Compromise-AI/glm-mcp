@@ -194,6 +194,41 @@ test('#40 a file that reached the model before the cut is not among the drops, e
   }
 });
 
+test('#40 a pattern\'s later matches past the cap are named, not vanished', () => {
+  // The tests above cover the literal route: four named files, each past the
+  // cap, each named by its own argument's note. But a glob is how most
+  // callers name many files at once, and it takes a different path through
+  // the same code — a pattern that had ANY match spoken for is answered with
+  // silence, so once the cap took one of its matches, the rest fell past the
+  // cut without a word. One pattern, three matches, a cap that delivers the
+  // first and truncates the second: the third must be recoverable from the
+  // notes, and the one argument must still cost one note (#26) — which is
+  // why the names ride inside the truncation's own note rather than adding a
+  // note per dropped match.
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-cap-glob-')));
+  try {
+    const MD = ['a-one.md', 'b-two.md', 'c-three.md'];
+    for (const n of MD) writeFileSync(join(dir, n), 'm'.repeat(600));
+    const r = ctx(['*.md'], dir, { GLM_MCP_MAX_FILE_CHARS: '1000' });
+    assert.ok(r.text.includes('--- a-one.md ---'), 'the fixture must deliver a-one.md whole');
+    assert.ok(r.notes.some((n) => /truncat/i.test(n) && n.includes('b-two.md')),
+      `b-two.md must be where the cut is reported — ${JSON.stringify(r.notes)}`);
+    // As with the literal route: naming alone is not enough, and `no matches`
+    // would claim a file the pattern matched never existed.
+    const dropNote = r.notes.find((x) => x.includes('c-three.md'));
+    assert.ok(dropNote && /not read|cap|truncat/i.test(dropNote) && !/no matches/i.test(dropNote),
+      `c-three.md matched the caller's pattern, never reached the model, and no note honestly names it — ${JSON.stringify(r.notes)}`);
+    assert.equal(r.notes.length, 1,
+      `one argument must cost one note — a note per dropped match would reopen #26: ${JSON.stringify(r.notes)}`);
+    // The mirror-image lie: a-one arrived whole, and reporting it as dropped
+    // would be the same falsehood in the other direction.
+    assert.ok(!r.notes.some((n) => n.includes('a-one.md')),
+      `a match that reached the model must not be reported as dropped — ${JSON.stringify(r.notes)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('#40 naming the drops does not tell absent from unreadable after the cut', (t) => {
   // The constraint #26 fixed, re-asserted for the new wording: the cap-drop
   // note is chosen by the argument's POSITION relative to the cut, never by

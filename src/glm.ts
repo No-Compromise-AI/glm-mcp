@@ -626,7 +626,8 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // was read and yielded nothing.
   let capCutAt = -1;
 
-  for (const { p, via, resolved, arg } of files) {
+  for (let fi = 0; fi < files.length; fi++) {
+    const { p, via, resolved, arg } = files[fi];
     // Re-checked at read time because a glob match may be a symlink whose
     // target leaves the roots only once resolved; the anchor could not see it.
     if (denied.has(resolved)) {
@@ -717,9 +718,35 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         chunks.push(`${sep}${theader}${taken}`);
         total += (sep ? 2 : 0) + theader.length + taken.length;
       }
+      // #40: the cut also owns the entries after it — they were never
+      // attempted, and the pendings loop below answers ARGUMENTS, not the
+      // matches inside them. A literal past the cut is named by its own
+      // argument's note, and a pattern that contributed nothing is named by
+      // its own too; but a pattern that DID contribute something is answered
+      // with silence — any match spoken for suppresses its note — so its
+      // later matches would vanish without a word, and a glob is how most
+      // callers name many files at once. Those matches are named here, inside
+      // the one note the cap event already produced: this note describes the
+      // cut, not an argument, so the list adds no note to any argument
+      // (#26's one-per-argument line) and carries exactly the files no other
+      // note will name.
+      const notRead: string[] = [];
+      for (const later of files.slice(fi + 1)) {
+        // A literal entry is its argument's own spelling, and the note that
+        // argument receives below names it already.
+        if (later.via === later.p) continue;
+        // The same test the pendings loop will apply: a pattern some match of
+        // which was spoken for gets no note there, which is what makes its
+        // remaining matches this note's to carry. `spokenFor` has settled for
+        // the loop by now — everything after the cut is unprocessed — so the
+        // answer here is the one the pendings loop would give.
+        const found = patternMatches.get(later.via)?.found;
+        if (found && [...found].some((key) => spokenFor.has(key))) notRead.push(later.p);
+      }
       notes.push({
         arg,
-        msg: `truncated at ${MAX_FILE_CHARS} total chars starting with: ${p}`,
+        msg: `truncated at ${MAX_FILE_CHARS} total chars starting with: ${p}` +
+          (notRead.length > 0 ? `; not read: ${notRead.join(", ")}` : ""),
       });
       // The cap cut the loop here, so the entries after this one were never
       // attempted. `capCutAt` records whose read was underway (#40): every
