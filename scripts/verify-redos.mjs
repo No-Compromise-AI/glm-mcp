@@ -16,7 +16,7 @@
 // against and hand-checked, so a rewrite that is fast but subtly wrong fails
 // here rather than in someone's repository.
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -105,7 +105,12 @@ try {
   // Generated from the implementation this gate was written against, then read
   // through by hand. A matcher that is fast but disagrees with any line of this
   // has changed glob semantics, which #3 settled and this issue does not reopen.
-  const NAMES = ['a.ts', 'b.ts', 'ab.ts', 'abc.ts', 'axb', 'a*b', 'a?b', 'a[b', 'ABC.ts',
+  // No two names may differ only by case: this fixture has to materialise the
+  // same way on a case-insensitive filesystem as on a case-sensitive one, or
+  // the expectations below describe whichever machine generated them. An
+  // earlier revision carried both 'abc.ts' and 'ABC.ts', which collapsed into
+  // one file on macOS and stayed two on the Linux CI runners.
+  const NAMES = ['a.ts', 'b.ts', 'ab.ts', 'abc.ts', 'axb', 'a*b', 'a?b', 'a[b',
     '1.ts', '-.ts', '.hidden', '.h.ts', 'xaybz', 'aaa', 'a', 'ab', 'abcd', 'z.ts', 'a.b.ts'];
   const CORPUS = {
     '*': ['-.ts', '1.ts', 'a', 'a*b', 'a.b.ts', 'a.ts', 'a?b', 'a[b', 'aaa', 'ab', 'ab.ts', 'abc.ts', 'abcd', 'axb', 'b.ts', 'xaybz', 'z.ts'],
@@ -142,6 +147,13 @@ try {
   const corpusRoot = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-redos-corpus-')));
   try {
     for (const n of NAMES) writeFileSync(join(corpusRoot, n), 'x');
+    // Fail on the fixture rather than on the corpus. A name that did not
+    // survive creation would otherwise surface as a baffling mismatch in
+    // whichever pattern happened to match it.
+    const onDisk = readdirSync(corpusRoot).sort();
+    if (onDisk.length !== NAMES.length) {
+      fail(`the corpus fixture did not materialise: asked for ${NAMES.length} names, got ${onDisk.length} — ${JSON.stringify(onDisk)}`);
+    }
     for (const [pattern, expected] of Object.entries(CORPUS)) {
       const got = expand(pattern, corpusRoot).matches;
       if (JSON.stringify(got) !== JSON.stringify(expected)) {
