@@ -11,8 +11,8 @@ import {
   listModels,
   modelRole,
   outputLimits,
-  ANSWER_ROOM,
   MIN_BUDGET_TOKENS,
+  MIN_ANSWER_TOKENS,
   type Reasoning,
 } from "./glm.js";
 
@@ -100,10 +100,16 @@ server.registerTool(
           "Max output tokens — a hard cap. The request never exceeds it; the thinking " +
             "budget scales down to fit beneath it, always leaving room for the answer, " +
             `but never below the API minimum of ${MIN_BUDGET_TOKENS}. A cap below ` +
-            `${MIN_BUDGET_TOKENS + ANSWER_ROOM} — the API's budget minimum plus the room ` +
-            "the answer needs — cannot hold both and is refused rather than silently " +
-            "raised; on GLM-5.3 and glm-5.3-flash, which always reason, the only " +
-            "fix is a higher cap. " +
+            // The threshold ask() enforces is the budget minimum plus
+            // MIN_ANSWER_TOKENS — the least room that still constitutes an
+            // answer — not plus ANSWER_ROOM, which is only what a generous cap
+            // PREFERS to leave. Quoting the preference here refused, on paper,
+            // caps the request path deliberately sends: #20 settled that a cap
+            // of 5,000 with 3,976 for the reply is an answer by any reading.
+            `${MIN_BUDGET_TOKENS + MIN_ANSWER_TOKENS} — the API's budget minimum plus ` +
+            "the least room that still constitutes an answer — cannot hold both and " +
+            "is refused rather than silently raised; on GLM-5.3 and glm-5.3-flash, " +
+            "which always reason, the only fix is a higher cap. " +
             "A cap over the model's published ceiling is likewise refused before " +
             // DEFAULT_MODEL is an OUTPUT_LIMITS key, so its ceiling is defined.
             `anything is sent (${outputLimits(DEFAULT_MODEL).max!.toLocaleString("en-US")} for GLM-5.3). ` +
