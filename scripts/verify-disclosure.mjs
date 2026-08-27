@@ -179,11 +179,62 @@ out.notes = c.notes; out.text = c.text;`);
     ['probe[.]txt', 'probe[.]txt'],
     ['probe.txt', 'probe.txt'],
   ]) {
+    // NOTE the one shape deliberately absent from this sweep, recorded below
+    // rather than left to be rediscovered: a string that is BOTH a valid
+    // filename and an uncompilable glob.
     const yes = oracleProbe(true, paths);
     const no = oracleProbe(false, paths);
     if (yes.text.includes('S')) fail(`the fixture leaked an unreadable body for ${JSON.stringify(paths)}`);
     if (JSON.stringify(yes.notes) !== JSON.stringify(no.notes)) {
       fail(`#26: ${JSON.stringify(paths)} tells a caller whether the file exists:\n  present, unreadable: ${JSON.stringify(yes.notes)}\n  absent:              ${JSON.stringify(no.notes)}`);
+    }
+  }
+
+  // ---- a documented limit, pinned so it cannot drift unnoticed ----
+  // `[z-a].txt` is a legal filename AND a glob whose character class cannot
+  // compile. The two gates this project already ships disagree about it:
+  //
+  //   verify-redos (#28): an uncompilable pattern must be reported as
+  //     MALFORMED, never as merely matching nothing — silently reporting
+  //     "no matches" for a pattern that can never match is the failure mode
+  //     that issue existed to fix.
+  //   this gate (#26): absent and present-but-unreadable must be
+  //     INDISTINGUISHABLE.
+  //
+  // For that one string both cannot hold, because the branch is selected by
+  // whether the file exists. Satisfying #26 here means dropping the malformed
+  // diagnostic for any name that happens to exist — and whether it exists is
+  // precisely what we are trying not to reveal, so the rule would be circular.
+  //
+  // The residual leak is narrow: an attacker must guess an exact filename that
+  // is simultaneously a malformed glob and present-but-unreadable inside a
+  // root. The cost of closing it is that every genuinely malformed pattern
+  // goes back to reporting "no matches". #28 is the better trade.
+  //
+  // Pinned, so the day someone changes it, they change it on purpose:
+  {
+    const shape = (present) => {
+      const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-known-')));
+      try {
+        if (present) {
+          writeFileSync(join(dir, '[z-a].txt'), 'S');
+          chmodSync(join(dir, '[z-a].txt'), 0o000);
+        }
+        return child(`
+process.env.GLM_MCP_ROOTS = ${JSON.stringify(dir)};
+out.notes = glm.buildFileContext(['[z-a].txt'], ${JSON.stringify(dir)}).notes;`);
+      } finally {
+        try { chmodSync(join(dir, '[z-a].txt'), 0o600); } catch { /* absent */ }
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+    const present = shape(true);
+    const absent = shape(false);
+    if (!absent.notes.some((n) => /malformed|expansion failed/i.test(n))) {
+      fail(`the malformed-pattern diagnostic #28 asked for is gone: ${JSON.stringify(absent.notes)}`);
+    }
+    if (present.notes.some((n) => /malformed|expansion failed/i.test(n))) {
+      fail(`an existing file named like a bad pattern must not be diagnosed as one: ${JSON.stringify(present.notes)}`);
     }
   }
 

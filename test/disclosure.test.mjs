@@ -500,6 +500,36 @@ test('the same argument list answers the same whether the named file exists', (t
     `the note must still name the spelling the caller sent — ${JSON.stringify(named.notes)}`);
 });
 
+test('#26 one note per argument, in the caller\'s own order', () => {
+  // deepEqual(present, absent) alone is satisfied by an implementation that
+  // de-duplicates BOTH sides down to one note, or sorts both the same wrong
+  // way. The counts and the order are the claim, so they are asserted against
+  // exact arrays rather than against each other.
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-order-')));
+  try {
+    writeFileSync(join(dir, 'decoy.txt'), 'DECOY');
+    const notesFor = (paths) => {
+      let r;
+      isolated({ GLM_MCP_ROOTS: dir }, () => {
+        r = buildFileContext(paths, dir);
+      });
+      return r.notes;
+    };
+    const miss = (p) => `skipped (no matches): ${p}`;
+
+    assert.deepEqual(notesFor(['a.txt', 'a.txt']), [miss('a.txt'), miss('a.txt')],
+      'the same argument twice is two arguments, so two notes');
+    assert.deepEqual(notesFor(['b.txt', 'a.txt']), [miss('b.txt'), miss('a.txt')],
+      'notes follow the order the caller gave, not a sort');
+    assert.deepEqual(notesFor(['a.txt', 'b.txt']), [miss('a.txt'), miss('b.txt')],
+      'and the reverse order likewise');
+    assert.deepEqual(notesFor(['a.txt', 'decoy.txt', 'b.txt']), [miss('a.txt'), miss('b.txt')],
+      'a readable file contributes content, not a note, without disturbing the order of the rest');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a cap that cuts the reads short still answers every argument alike', (t) => {
   // The same property with the char cap in play. A cap that fills mid-list
   // stops the reads outright, and the round before this one let the literals
