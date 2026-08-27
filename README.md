@@ -241,8 +241,8 @@ variable that set it — nothing is ever silently truncated or silently dropped.
 
 | Limit | Variable | Default |
 | --- | --- | --- |
-| Total context characters, headers and separators included | `GLM_MCP_MAX_FILE_CHARS` | derived, ~2.9M |
-| Assumed context window the budget is derived from | `GLM_MCP_CONTEXT_TOKENS` | 1,048,576 |
+| Total context characters, headers and separators included | `GLM_MCP_MAX_FILE_CHARS` | derived per model — ~2.9M for GLM-5.3 |
+| Context window the budget is derived from | `GLM_MCP_CONTEXT_TOKENS` | the model's declared window; 1,048,576 when undeclared |
 | Per-file size, checked before the file is read | `GLM_MCP_MAX_FILE_BYTES` | 5 MB |
 | Glob walk depth | `GLM_MCP_MAX_DEPTH` | 24 |
 | Directory entries examined per call | `GLM_MCP_MAX_ENTRIES` | 200,000 |
@@ -250,14 +250,29 @@ variable that set it — nothing is ever silently truncated or silently dropped.
 | Total `{a,b}` brace expansions | `GLM_MCP_MAX_BRACE_EXPANSIONS` | 1,024 |
 | Request timeout, the whole call — all retries included | `GLM_MCP_TIMEOUT_MS` | 600,000 |
 
-The character budget is **derived**, not chosen: the assumed context window,
-less the model's default output and a prompt reserve, at 3 characters per token.
+The character budget is **derived, per model**, not chosen: the context window
+of the model the request will use, less that model's default output and a
+prompt reserve, at 3 characters per token. The windows come from the same
+z.ai-published table that sizes output — 1,048,576 for GLM-5.3 and
+glm-5.3-flash, 200,000 for glm-4.7 and glm-4.6, 128,000 for glm-4.5 and
+glm-4.6v — so a caller routed to a cheaper model by the routing guidance is
+sized against that model's window, not the flagship's million tokens. Two
+models sharing a window still get different budgets when their output defaults
+differ: glm-4.5 and glm-4.6v both have 128K, but glm-4.6v holds back a quarter
+as much for the reply, so more of the window is left for your files. A model
+the table does not know keeps the documented assumption of 1,048,576 — z.ai is
+the authority on its own models, exactly as with output ceilings. A truncation
+note names which bound cut it: the model's window, or your explicit
+`GLM_MCP_MAX_FILE_CHARS` cap.
+
 That ratio targets **English and code deliberately** — this is what the project
 is built for. Denser scripts pack more tokens per character (Chinese runs nearer
 one token per character), so a CJK-heavy caller should lower
 `GLM_MCP_MAX_FILE_CHARS`; overshooting surfaces as a context-length error from
-z.ai rather than a silent truncation. z.ai publishes output limits but not
-context length, so `GLM_MCP_CONTEXT_TOKENS` is an assumption you can correct.
+z.ai rather than a silent truncation. `GLM_MCP_CONTEXT_TOKENS` overrides the
+window for **every model at once** — a published figure that proves wrong is
+corrected with one variable, not a code change — and `GLM_MCP_MAX_FILE_CHARS`
+overrides the character budget outright, also for every model.
 
 Output ceilings come from z.ai's published table and are **per model** — 131,072
 for the GLM-5 and 4.6/4.7 families, 98,304 for GLM-4.5, 32,768 for the vision
