@@ -340,8 +340,9 @@ function takeUnits(s: string, maxUnits: number): string {
  * caller itself sent. The refusal notes in buildFileContext are the
  * deliberate opposite — they name the expanded match, pinned by the
  * confinement gate, because a boundary the caller cannot see is what those
- * notes have to explain. Glob entries get their own wording there, borrowed
- * from the note a matchless pattern already gets.
+ * notes have to explain. Glob matches are not noted here at all: their
+ * pattern is answered once, after the reads, in the wording a matchless
+ * pattern already gets.
  */
 const skipNote = (p: string): string => `skipped (could not be read): ${p}`;
 
@@ -449,6 +450,19 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // would widen what notes already disclose.
   const files: Array<{ p: string; via: string; resolved: string }> = [];
   const included = new Set<string>();
+  // Every pattern of this call and the resolved matches it found — the
+  // de-duplicated ones too, because the note these sets exist to write asks
+  // the pattern a question (did it contribute anything?) that a match
+  // claimed by an earlier entry still answers. A Map, so a pattern repeated
+  // in the argument list is one entry and says its one note once; insertion
+  // order is first appearance, so the notes read in the order the caller
+  // named the patterns.
+  const patternMatches = new Map<string, Set<string>>();
+  // The files this result already speaks for, by resolved identity: one
+  // delivered its content, or was refused in a note naming it. A file that
+  // yielded nothing is deliberately not here — that absence is what tells
+  // the note at the end which patterns contributed nothing at all.
+  const spokenFor = new Set<string>();
   for (const p of paths) {
     // The credential rule runs before any existence check (decision 3), so
     // /proc/self/environ is reported as refused, not missing, where it does
@@ -491,27 +505,21 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       // other: expandGlob reports each reported path once, with the spelling a
       // match would carry, so the note names both it and the pattern that
       // reached it.
-      let refusedMatch = false;
       const matches = expandGlob(p, cwd, roots ?? undefined, (refused) => {
-        refusedMatch = true;
         refusedPatterns.add(p);
         notes.push(
           `refused: ${refused} (matched by ${p}) resolves outside the allowed roots`,
         );
       }, budget);
-      if (matches.length === 0) {
-        // Refused is not the same as absent: a pattern whose matches were all
-        // stopped at the boundary — or cut short by a limit — must not also be
-        // filed under "no matches", which reads as a pattern that was simply
-        // wrong and contradicts the note beside it. Only a pattern that matched
-        // nothing, refused nothing and was limited by nothing says "no matches"
-        // — and it is THIS pattern's refusal that is asked about, never
-        // whether the call has seen one at all.
-        if (!refusedMatch && !limitedPatterns.has(p)) notes.push(`skipped (no matches): ${p}`);
-        continue;
-      }
+      // Every match is recorded against the pattern, de-duplicated or not;
+      // a pattern that matched nothing is recorded the same way, with no
+      // matches. The note this feeds is written after the reads, because
+      // whether a pattern contributed anything is known only then.
+      let found = patternMatches.get(p);
+      if (!found) patternMatches.set(p, (found = new Set<string>()));
       for (const m of matches) {
         const key = keyOf(m);
+        found.add(key);
         if (included.has(key)) continue;
         included.add(key);
         files.push({ p: m, via: p, resolved: key });
@@ -529,31 +537,14 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     }
   }
 
-  // Nothing was read from this entry (#26). The literal route says so in one
-  // wording that already covers both reasons a file yields nothing; the
-  // pattern route borrows the wording a matchless pattern gets, because a
-  // pattern spelled to match exactly one name — `secret[.]txt` — is the
-  // literal probe one indirection away, and a match that cannot be read
-  // answering differently from a pattern that matched nothing would keep the
-  // oracle open through the wildcard. The two routes may read differently
-  // from each other — a caller knows which one it addressed — but within
-  // either, absent and unreadable are the same answer. So the wording is
-  // "no matches" rather than a new one: it is what a genuinely empty pattern
-  // already says, asserted as such wherever an empty pattern is. The note
-  // names the PATTERN (`via`), never the match the machine found, and says it
-  // once per pattern however many of its matches yielded nothing — except
-  // beside a note saying this pattern's walk was stopped, where "no matches"
-  // would claim it was simply wrong, the same contradiction the
-  // expansion-time note is guarded against.
-  const saidNoMatches = new Set<string>();
+  // Nothing was read from this entry (#26). The literal route says so at
+  // once, in the one wording that already covers both reasons a file yields
+  // nothing; the pattern route says nothing here — its pattern is answered
+  // after the reads, in the wording a matchless pattern gets, because that
+  // answer can only be written once the whole pattern's contribution is
+  // known.
   const readNothing = (p: string, via: string): void => {
-    if (via === p) {
-      notes.push(skipNote(via));
-      return;
-    }
-    if (saidNoMatches.has(via) || limitedPatterns.has(via) || refusedPatterns.has(via)) return;
-    saidNoMatches.add(via);
-    notes.push(`skipped (no matches): ${via}`);
+    if (via === p) notes.push(skipNote(via));
   };
 
   for (const { p, via, resolved } of files) {
@@ -561,10 +552,12 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     // target leaves the roots only once resolved; the anchor could not see it.
     if (denied.has(resolved)) {
       notes.push(`refused (credential path): ${p}${via === p ? "" : ` (matched by ${via})`}`);
+      spokenFor.add(resolved);
       continue;
     }
     if (roots && !insideRoots(resolved, roots)) {
       notes.push(`refused: ${p}${via === p ? "" : ` (matched by ${via})`} resolves outside the allowed roots`);
+      spokenFor.add(resolved);
       continue;
     }
     const abs = resolve(cwd, p);
@@ -586,6 +579,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     const matchedBy = via === p ? "" : ` (matched by ${via})`;
     if (!st.isFile()) {
       notes.push(`refused (not a regular file): ${p}${matchedBy}`);
+      spokenFor.add(resolved);
       continue;
     }
     if (st.size > maxFileBytes) {
@@ -593,6 +587,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         `refused (too large): ${p}${matchedBy} is ${st.size} bytes, over the ` +
           `GLM_MCP_MAX_FILE_BYTES limit of ${maxFileBytes}`,
       );
+      spokenFor.add(resolved);
       continue;
     }
     let body: string;
@@ -602,6 +597,9 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       readNothing(p, via);
       continue;
     }
+    // Content will be delivered — in full or truncated — so the result
+    // speaks for this file either way.
+    spokenFor.add(resolved);
     // #19: the header and the separator count toward the cap with the body, so
     // 300 empty files cannot produce a five-figure prompt under a
     // multimillion-char "cap" with no note. `total` is the assembled length so
@@ -625,6 +623,37 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     }
     chunks.push(`${sep}${header}${body}`);
     total += overhead + body.length;
+  }
+
+  // A pattern that contributed nothing to the result is told so now, when
+  // the reads have settled which patterns did (#26). One wording covers both
+  // ways to contribute nothing — matched nothing at all, or matched files
+  // not one of which could be read — because they are the same fact to the
+  // caller: a pattern spelled to match exactly one name (`secret[.]txt`) is
+  // the literal existence probe one indirection away, and were a matched but
+  // unreadable file to answer differently from a pattern that matched
+  // nothing, the oracle the literal fix closed would survive through the
+  // wildcard. The wording is "no matches" rather than a new one: it is what
+  // a genuinely empty pattern has always said, asserted as such wherever an
+  // empty pattern is. Symmetrically, a pattern some of whose matches WERE
+  // read says nothing — `no matches` beside content that came from this very
+  // pattern would not be the truth, and the note would still disclose that
+  // another of its matches existed and could not be read. And a pattern
+  // whose walk was stopped — by a limit, or by a boundary refusal — is
+  // excused entirely: refused is not the same as absent, that note already
+  // speaks for it, and "no matches" beside it would claim it was simply
+  // wrong. It is always THIS pattern's own stopping that is asked about,
+  // never whether the call has seen one at all.
+  for (const [via, found] of patternMatches) {
+    if (limitedPatterns.has(via) || refusedPatterns.has(via)) continue;
+    let contributed = false;
+    for (const key of found) {
+      if (spokenFor.has(key)) {
+        contributed = true;
+        break;
+      }
+    }
+    if (!contributed) notes.push(`skipped (no matches): ${via}`);
   }
 
   // The separators were budgeted per chunk above, so joining is the identity:

@@ -326,8 +326,109 @@ test('a glob spelled to match one name tells a missing file from an unreadable o
   }
 });
 
-test('an uncompilable pattern is refused in this project\'s words, not V8\'s', () => {
-  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-pattern-')));
+test('a pattern with one unreadable match answers as one that matched only the readable', (t) => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-partial-')));
+  writeFileSync(join(dir, 'public.txt'), 'PUBLIC-BODY');
+  const locked = join(dir, 'locked.txt');
+  writeFileSync(locked, 'LOCKED-BODY');
+  const cleanup = () => {
+    try { chmodSync(locked, 0o600); } catch { /* best effort */ }
+    rmSync(dir, { recursive: true, force: true });
+  };
+  if (!deniesRead(locked)) {
+    cleanup();
+    t.skip('chmod 000 did not deny the read (running as root?) — the partial-match case cannot be exercised here');
+    return;
+  }
+  try {
+    isolated({ GLM_MCP_ROOTS: dir }, () => {
+      // Two spellings a caller can write without knowing anything about the
+      // directory: one names a second member that does not exist, the other
+      // one that exists and cannot be read. Both match the same readable
+      // file, so both deliver the same text — and the notes must not be where
+      // they differ, or the difference IS the oracle: "no matches" beside
+      // content this very pattern produced says both that the walk found
+      // something more and that the read of it was refused.
+      const twin = buildFileContext(['{public,absent}[.]txt'], dir);
+      const probed = buildFileContext(['{public,locked}[.]txt'], dir);
+      assert.ok(twin.text.includes('PUBLIC-BODY') && probed.text.includes('PUBLIC-BODY'),
+        `both spellings match the readable member — ${JSON.stringify({ twin, probed })}`);
+      assert.ok(!probed.text.includes('LOCKED-BODY'), 'the unreadable member must not be read');
+      assert.deepEqual(probed.notes, twin.notes,
+        `a pattern that contributed content is told apart from its all-readable twin — ${JSON.stringify({
+          twin: twin.notes, probed: probed.notes })}`);
+      assert.ok(!twin.notes.some((n) => /no matches/i.test(n)),
+        `a pattern whose match was read must not also be filed as matching nothing — ${JSON.stringify(twin.notes)}`);
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test('a deduplicated or repeated pattern still gets its own note, once', (t) => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-dedup-')));
+  const locked = join(dir, 'locked.txt');
+  writeFileSync(locked, 'LOCKED-BODY');
+  const cleanup = () => {
+    try { chmodSync(locked, 0o600); } catch { /* best effort */ }
+    rmSync(dir, { recursive: true, force: true });
+  };
+  if (!deniesRead(locked)) {
+    cleanup();
+    t.skip('chmod 000 did not deny the read (running as root?) — the dedup case cannot be exercised here');
+    return;
+  }
+  try {
+    isolated({ GLM_MCP_ROOTS: dir }, () => {
+      // Each probe is compared against its absent twin: same argument list
+      // shape, second member missing instead of unreadable. Abstracting the
+      // spellings away — each argument to a shared placeholder, by position,
+      // so both sides land on the same names — the two must be
+      // indistinguishable: the count and position of the notes is as much an
+      // answer as their wording.
+      const shape = (notes, ...names) => {
+        let out = notes;
+        names.forEach((n, i) => {
+          out = out.map((x) => x.split(n).join(`<${i + 1}>`));
+        });
+        return out;
+      };
+      // A later pattern whose only match an earlier entry already claimed:
+      // dropping its note at de-duplication leaves the unreadable case one
+      // note short of the absent one.
+      const dedupUnreadable = buildFileContext(['locked[.]txt', 'locke?.txt'], dir);
+      const dedupAbsent = buildFileContext(['absent[.]txt', 'absen?.txt'], dir);
+      assert.deepEqual(
+        shape(dedupUnreadable.notes, 'locked[.]txt', 'locke?.txt'),
+        shape(dedupAbsent.notes, 'absent[.]txt', 'absen?.txt'),
+        `a pattern whose match was de-duplicated away is silent, and its absent twin is not — ${JSON.stringify({
+          unreadable: dedupUnreadable.notes, absent: dedupAbsent.notes })}`);
+      // The same through a literal: the pattern's note must survive the read
+      // note of the file that claimed the match, in the same position either
+      // way.
+      const litUnreadable = buildFileContext(['locked.txt', 'locked[.]txt'], dir);
+      const litAbsent = buildFileContext(['absent.txt', 'absent[.]txt'], dir);
+      assert.deepEqual(
+        shape(litUnreadable.notes, 'locked.txt', 'locked[.]txt'),
+        shape(litAbsent.notes, 'absent.txt', 'absent[.]txt'),
+        `a pattern after a literal that claimed its match answers differently from its absent twin — ${JSON.stringify({
+          unreadable: litUnreadable.notes, absent: litAbsent.notes })}`);
+      // And a pattern repeated in the argument list: it says its note exactly
+      // once whether the match was unreadable or nothing matched at all.
+      const repeatUnreadable = buildFileContext(['locked[.]txt', 'locked[.]txt'], dir);
+      const repeatAbsent = buildFileContext(['absent[.]txt', 'absent[.]txt'], dir);
+      assert.deepEqual(
+        shape(repeatUnreadable.notes, 'locked[.]txt'),
+        shape(repeatAbsent.notes, 'absent[.]txt'),
+        `a repeated pattern's note count tells unreadable from absent — ${JSON.stringify({
+          unreadable: repeatUnreadable.notes, absent: repeatAbsent.notes })}`);
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test('an uncompilable pattern is refused in this project\'s words, not V8\'s', () => {  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-pattern-')));
   writeFileSync(join(dir, 'ok.txt'), 'OK-BODY');
   try {
     isolated({ GLM_MCP_ROOTS: dir }, () => {
