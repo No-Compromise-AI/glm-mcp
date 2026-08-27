@@ -556,10 +556,51 @@ export const CONTEXT_WINDOW_TOKENS = 1_048_576;
  * falls back the way every env limit does (#24).
  */
 export function contextWindowTokens(model: string): number {
-  return envLimit(
-    "GLM_MCP_CONTEXT_TOKENS",
-    OUTPUT_LIMITS.get(model)?.context ?? CONTEXT_WINDOW_TOKENS,
-  );
+  return resolveWindow(model).tokens;
+}
+
+/**
+ * The window the budget derives from, together with which of its three
+ * sources supplied it (#59) — the operator's GLM_MCP_CONTEXT_TOKENS, the row's
+ * declared window, or the documented assumption, in the order
+ * {@link contextWindowTokens} resolves them. The source is decided by the same
+ * expressions that resolve the number, so the two cannot disagree; it is
+ * returned separately because it is not recoverable from the number (an
+ * override set to exactly the table's figure is the same number from a
+ * different place), and the truncation note has to name it (#26): of the
+ * three, only the row's declared window is a fact about the model, so it is
+ * the only one the note may call the model's.
+ */
+function resolveWindow(model: string): {
+  tokens: number;
+  source: "operator" | "model" | "assumption";
+} {
+  const forced = envOverride("GLM_MCP_CONTEXT_TOKENS");
+  if (forced !== undefined) return { tokens: forced, source: "operator" };
+  const declared = OUTPUT_LIMITS.get(model)?.context;
+  if (declared !== undefined) return { tokens: declared, source: "model" };
+  return { tokens: CONTEXT_WINDOW_TOKENS, source: "assumption" };
+}
+
+/**
+ * The window in words, for the truncation note — naming which of its three
+ * sources produced the figure, because only one of them is the model's own
+ * (#26, #59). Calling either of the others "<model>'s context window" states
+ * as fact something the code does not know: the operator's
+ * GLM_MCP_CONTEXT_TOKENS applies to every model alike and is a fact about the
+ * deployment, not about any model, and the assumption is this package's own
+ * documented figure for a model whose window nobody recorded. A caller reading
+ * the note acts on the difference — a small window of the model's own says
+ * another model has room; a figure that is not the model's says no such thing.
+ */
+function windowInWords(model: string, w: ReturnType<typeof resolveWindow>): string {
+  if (w.source === "operator") {
+    return `the operator-set GLM_MCP_CONTEXT_TOKENS window of ${w.tokens} tokens`;
+  }
+  if (w.source === "model") {
+    return `${model}'s ${w.tokens}-token context window`;
+  }
+  return `the documented assumption of ${w.tokens} tokens — no window recorded for ${model}`;
 }
 
 /**
@@ -800,19 +841,23 @@ export function buildFileContext(
   // tokens. maxFileChars applies GLM_MCP_MAX_FILE_CHARS over the derivation
   // for every model alike (#35), and an unparsable value falls back (#24).
   const cap = maxFileChars(model);
-  const windowTokens = contextWindowTokens(model);
   // Which bound the cap enforced, for the truncation note at the cut: the
-  // model's own window, or the operator's explicit override. A caller routed
-  // to a smaller model has to be able to tell "this model's window is smaller"
-  // — the fix is another model — from "this file is too big" — the fix is
-  // fewer files, or a higher cap. The answer is read from whether the override
-  // is in force, never inferred from the cap's number: a pin set to exactly a
-  // model's derived budget is indistinguishable from the derivation by value
-  // yet follows the caller to every wider-window model, and naming the window
-  // there would send them model-shopping for relief the cap still denies. An
-  // unparsable pin supplies no cap (#24), so the window names the cut.
+  // window the budget derived from, or the operator's explicit override. A
+  // caller routed to a smaller model has to be able to tell "this model's
+  // window is smaller" — the fix is another model — from "this file is too
+  // big" — the fix is fewer files, or a higher cap. The answer is read from
+  // whether the override is in force, never inferred from the cap's number: a
+  // pin set to exactly a model's derived budget is indistinguishable from the
+  // derivation by value yet follows the caller to every wider-window model,
+  // and naming the window there would send them model-shopping for relief the
+  // cap still denies. An unparsable pin supplies no cap (#24), so the window
+  // names the cut. The window is named with its SOURCE (see windowInWords):
+  // only the table's declared window is the model's own figure, and crediting
+  // the operator's override or the documented assumption to the model would
+  // state as fact something the code does not know (#26) — the one thing a
+  // caller might act on, and the one thing that is not true.
   const capWhy = envOverride("GLM_MCP_MAX_FILE_CHARS") === undefined
-    ? `${model}'s ${windowTokens}-token context window`
+    ? windowInWords(model, resolveWindow(model))
     : "the GLM_MCP_MAX_FILE_CHARS cap";
 
   // Glob entries expand to the files they match, sorted and de-duplicated against

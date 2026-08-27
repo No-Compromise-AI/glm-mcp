@@ -15,7 +15,7 @@ This server takes the other route — GLM becomes a tool Claude can call mid-con
 Useful for:
 
 - **A real second opinion.** An independent frontier model, not the same model asked twice.
-- **Very large context.** GLM-5.3 has a 1,000,000-token window, so you can hand it far more
+- **Very large context.** GLM-5.3 has a million-token window, so you can hand it far more
   source material than fits in a normal session.
 - **Cheap bulk work.** Route grunt work to `glm-4.7` and keep the expensive model for reasoning.
 
@@ -262,8 +262,11 @@ differ: glm-4.5 and glm-4.6v both have 128K, but glm-4.6v holds back a quarter
 as much for the reply, so more of the window is left for your files. A model
 the table does not know keeps the documented assumption of 1,048,576 — z.ai is
 the authority on its own models, exactly as with output ceilings. A truncation
-note names which bound cut it: the model's window, or your explicit
-`GLM_MCP_MAX_FILE_CHARS` cap.
+note names which bound cut it, and names the window by its source — the model's
+own published window, the window you set with `GLM_MCP_CONTEXT_TOKENS`, or the
+documented assumption for a model whose window nobody has recorded — because
+only the first of those is a fact about the model. Your explicit
+`GLM_MCP_MAX_FILE_CHARS` cap is named as itself.
 
 That ratio targets **English and code deliberately** — this is what the project
 is built for. Denser scripts pack more tokens per character (Chinese runs nearer
