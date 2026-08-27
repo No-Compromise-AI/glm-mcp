@@ -99,6 +99,20 @@ try {
     }
   }
 
+  // The same cut, reached through ONE argument instead of four. A pattern's
+  // later matches were dropped without a word once any earlier match had been
+  // spoken for — the literal case fixed while the glob case stayed open, which
+  // is precisely the shape #26 took four rounds to stop repeating.
+  const MD = ['a-one.md', 'b-two.md', 'c-three.md'];
+  for (const n of MD) writeFileSync(join(ROOT, n), 'm'.repeat(600));
+  r = ctx(['*.md'], ROOT, { GLM_MCP_MAX_FILE_CHARS: 1000 });
+  for (const n of MD) {
+    const reached = r.text.includes(`--- ${n} ---`);
+    if (!reached && !r.notes.join(' ').includes(n)) {
+      fail(`#40: ${n} matched the caller's pattern, never reached the model, and no note names it. Coming in through a glob is not a reason to vanish.\n  notes=${JSON.stringify(r.notes)}`);
+    }
+  }
+
   // ------------------------------- #41 an answer that was cut off says so
   // The body text differs per case on purpose. Reusing "cut off mid-sent" for
   // the end_turn probe made the check match the MODEL'S OWN WORDS rather than
