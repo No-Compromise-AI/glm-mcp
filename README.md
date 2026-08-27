@@ -25,8 +25,12 @@ Register it once, user-scoped, and it is available in **every** project on the m
 per-project setup:
 
 ```bash
-claude mcp add --scope user glm -- npx -y @nocompromiseai/glm-mcp
+claude mcp add --scope user glm -- npx -y @nocompromiseai/glm-mcp@0.2.0
 ```
+
+The version is pinned on purpose: a bare `npx` resolves `latest` at run time, while the package
+itself ships the exact dependency graph it was tested with — pinning is what makes the two the
+same graph. Bump the pin when you upgrade.
 
 Or from a local checkout:
 
