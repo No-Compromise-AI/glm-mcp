@@ -27,8 +27,9 @@ while [[ -L "$__self" ]]; do
   [[ "$__self" != /* ]] && __self="$__dir/$__self"
 done
 HERE="$(cd -P "$(dirname -- "$__self")" && pwd)"
+. "$HERE/_glm-hosts.sh"
 
-DIR="$PWD"; VERIFY=""; TOOLS_OVERRIDE=""; REVIEWER="${GLM_REVIEWER:-codex}"; FIXES=1
+DIR="$PWD"; VERIFY=""; TOOLS_OVERRIDE=""; REVIEWER="${GLM_REVIEWER:-auto}"; FIXES=1
 ISOLATE=0; BRANCH=""
 while getopts "C:v:t:r:x:Wb:h" opt; do
   case "$opt" in
@@ -42,7 +43,19 @@ done
 shift $((OPTIND - 1))
 [[ $# -ge 1 ]] || { echo 'usage: glm-task [-C dir] [-v cmd] [-r reviewer] "<task>"' >&2; exit 2; }
 TASK="$*"
-command -v codex >/dev/null || [[ "$REVIEWER" != "codex" ]] || REVIEWER="none"
+# Resolve auto/all against the host, then drop any reviewer whose CLI is not
+# installed. The old line knew only how to disable codex.
+REVIEWER="$(glm_resolve_reviewers "$REVIEWER")"
+AVAIL=""
+for _r in $REVIEWER; do
+  _cmd="$_r"; [[ "$_r" == "glm" ]] && _cmd="$HERE/claude-glm"
+  if command -v "$_cmd" >/dev/null 2>&1 || [[ -x "$_cmd" ]]; then
+    AVAIL="${AVAIL:+$AVAIL,}$_r"
+  else
+    echo "glm-task: reviewer '$_r' is not installed — skipping it" >&2
+  fi
+done
+REVIEWER="${AVAIL:-none}"
 
 DEFAULT_TOOLS=(
   "Bash(node:*)" "Bash(npm:*)" "Bash(pnpm:*)" "Bash(yarn:*)"

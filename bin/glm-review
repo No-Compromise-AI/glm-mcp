@@ -20,8 +20,9 @@ while [[ -L "$__self" ]]; do
   [[ "$__self" != /* ]] && __self="$__dir/$__self"
 done
 HERE="$(cd -P "$(dirname -- "$__self")" && pwd)"
+. "$HERE/_glm-hosts.sh"
 
-DIR="$PWD"; BASE=""; SPEC=""; HEADREF="HEAD"; REVIEWERS="${GLM_REVIEWER:-codex}"
+DIR="$PWD"; BASE=""; SPEC=""; HEADREF="HEAD"; REVIEWERS="${GLM_REVIEWER:-auto}"
 while getopts "C:b:s:r:H:h" opt; do
   case "$opt" in
     C) DIR="$OPTARG" ;; b) BASE="$OPTARG" ;; s) SPEC="$OPTARG" ;; r) REVIEWERS="$OPTARG" ;;
@@ -192,9 +193,24 @@ attempt() { # $1 = reviewer. echoes findings; sets LAST_STATUS to ok|exhausted|e
   LAST_STATUS="ok"
 }
 
-peer_of() { case "$1" in codex) echo agy ;; agy) echo codex ;; *) echo "" ;; esac; }
+# The stand-in when a reviewer cannot deliver: any pooled reviewer that is
+# neither the one that just failed nor the host itself. The old map hardcoded
+# codex <-> agy, which had no answer from inside either of them.
+peer_of() {
+  local h p; h="$(glm_host)"
+  for p in $GLM_REVIEWER_POOL; do
+    [[ "$p" == "$1" || "$p" == "$h" ]] && continue
+    already_tried "$p" && continue
+    echo "$p"; return 0
+  done
+  echo ""
+}
 
-IFS=',' read -r -a LIST <<< "$REVIEWERS"
+# auto/all/none expand against the agent driving this run; an explicit list is
+# passed through untouched. See _glm-hosts.sh.
+RESOLVED="$(glm_resolve_reviewers "$REVIEWERS")"
+[[ "$REVIEWERS" != "$RESOLVED" ]] && echo "glm-review: reviewers '$REVIEWERS' -> ${RESOLVED:-none} (host: $(glm_host))" >&2
+read -r -a LIST <<< "$RESOLVED"
 for R in ${LIST[@]+"${LIST[@]}"}; do
   R="$(echo "$R" | tr -d '[:space:]')"; [[ -n "$R" ]] || continue
   attempt "$R"
@@ -210,9 +226,17 @@ for R in ${LIST[@]+"${LIST[@]}"}; do
 done
 
 # Last resort: Claude, so the change is at least reviewed by something.
-if [[ $ANY_OK -eq 0 ]] && ! already_tried claude; then
-  echo "glm-review: no reviewer delivered a verdict — falling back to claude" >&2
-  attempt claude
+# Last resort, so the change is at least reviewed by something — but never by
+# the host: from inside Claude, "fall back to claude" reviews the session's own
+# work and spends the budget this loop exists to conserve.
+# "none" is a request for no review, not a failure to find one — the last
+# resort must not turn it back into a review.
+if [[ $ANY_OK -eq 0 && "$REVIEWERS" != "none" ]]; then
+  LAST="$(peer_of "")"
+  if [[ -n "$LAST" ]]; then
+    echo "glm-review: no reviewer delivered a verdict — falling back to $LAST" >&2
+    attempt "$LAST"
+  fi
 fi
 
 if [[ ${#EXHAUSTED[@]} -gt 0 ]]; then

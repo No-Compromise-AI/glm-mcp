@@ -47,3 +47,4 @@ jobs:
       - run: npm run verify:disclosure
       - run: npm run verify:supplychain
       - run: npm run verify:completeness
+      - run: npm run verify:host-routing
