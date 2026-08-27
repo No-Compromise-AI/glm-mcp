@@ -411,6 +411,79 @@ test('#40 a pattern after the cut does not tell absent from unreadable', (t) => 
   }
 });
 
+test('#40 a pattern whose every match an earlier argument already read is named, not credited with them', () => {
+  // The cap is not the only way a later overlapping pattern delivers
+  // nothing: an earlier argument can simply have READ the file, and the
+  // contribution scan counted that match as the pattern's own. The caller
+  // was told the cut began at a literal and never learned that its pattern
+  // delivered nothing at all — the same silence, with no cap to explain it.
+  // What arrived on the pattern's behalf is nothing, so it is named as its
+  // own argument, in the merged #26 wording: why an overlap yields nothing
+  // (already read, absent, unreadable) is not the caller's to learn.
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-overlap-')));
+  try {
+    writeFileSync(join(dir, 'readable.txt'), 'READABLE-BODY');
+    const r = ctx(['readable.txt', 'readabl?.txt'], dir);
+    assert.ok(r.text.includes('READABLE-BODY'),
+      `the overlap must still be delivered once — ${JSON.stringify(r.text)}`);
+    assert.ok(r.notes.some((n) => n.includes('readabl?.txt')),
+      `'readabl?.txt' delivered nothing of its own and no note names it — ${JSON.stringify(r.notes)}`);
+    // The note names the pattern, never the match it did not read: that
+    // filename exists only because the file does (#26) — and the literal's
+    // file arrived, so it is not the pattern's note to carry.
+    assert.ok(!r.notes.some((n) => n.includes('readable.txt')),
+      `a file the literal already delivered is named as the pattern's — ${JSON.stringify(r.notes)}`);
+    assert.equal(r.notes.length, 1,
+      `one argument, one note — ${JSON.stringify(r.notes)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#40 a pattern before the cut does not tell absent from unreadable', (t) => {
+  // The other half of the overlap: BEFORE the cut, the branch twin 'a[.]md'
+  // is a literal when a file by that name exists and a pattern matching a.md
+  // when it does not, and its overlap with the already-read a.md was
+  // credited as the pattern's own. The unreadable twin said `no matches`
+  // and the absent one said nothing — the note count was the oracle.
+  // Crediting only what was read on the pattern's own behalf makes both
+  // worlds answer the same.
+  const check = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-precut-0-')));
+  writeFileSync(join(check, 'canary'), 'X');
+  const denied = deniesRead(join(check, 'canary'));
+  rmSync(check, { recursive: true, force: true });
+  if (!denied) {
+    t.skip('chmod 000 did not deny the read (running as root?) — the pre-cut twin oracle cannot be exercised here');
+    return;
+  }
+  const probe = (present) => {
+    const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-precut-')));
+    try {
+      writeFileSync(join(dir, 'a.md'), 'A'.repeat(10));
+      writeFileSync(join(dir, 'big.txt'), 'B'.repeat(200));
+      if (present) {
+        const f = join(dir, 'a[.]md');
+        writeFileSync(f, 'S'.repeat(10));
+        chmodSync(f, 0o000);
+      }
+      return ctx(['a.md', 'a[.]md', 'big.txt'], dir, { GLM_MCP_MAX_FILE_CHARS: '100' });
+    } finally {
+      try { chmodSync(join(dir, 'a[.]md'), 0o600); } catch { /* absent */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const present = probe(true);
+  const absent = probe(false);
+  assert.ok(present.notes.some((n) => /truncat/i.test(n)),
+    `the fixture must actually cut the reads — ${JSON.stringify(present.notes)}`);
+  assert.ok(!present.text.includes('S'), 'the unreadable body leaked');
+  assert.ok(absent.notes.some((n) => n.includes('a[.]md')),
+    `the overlapping argument is named when its file exists and silent when it does not — ${JSON.stringify(absent.notes)}`);
+  assert.deepEqual(present.notes, absent.notes,
+    `a pattern before the cut tells a caller whether an unreadable file exists — ${JSON.stringify({
+      present: present.notes, absent: absent.notes })}`);
+});
+
 // --------------------------------- #41: a severed answer says so
 
 // The stand-in for z.ai, answering with a chosen stop_reason: the shape ask()
