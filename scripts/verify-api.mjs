@@ -146,6 +146,10 @@ out.results = ${JSON.stringify(jobs)}.map((j) => {
     { message: '400 {"error":{"code":"1113_retry"}}' },
     { message: '400 {"error":{"code":"1210x"}}' },
     { message: 'rate limited at 1113.0 requests per second' },
+    // Inside quotes the value ends at the closing quote, so a period there is
+    // part of the code, not the end of a sentence.
+    { message: '400 {"error":{"code":"1113.retry"}}' },
+    { message: '400 {"error":{"code":"1113."}}' },
   ]).results;
   for (const [i, text] of suffixed.entries()) {
     if (BALANCE.test(text) || REASONING.test(text) || CREDENTIAL.test(text)) {

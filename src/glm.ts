@@ -507,8 +507,24 @@ function zaiCode(e: unknown): string | undefined {
   // (`1113.0`). Followed by anything else, or by nothing, it is punctuation
   // ending a sentence, and the digits before it are still the whole code; on
   // the leading side a `.` before the digits always continues a number.
+  // Where the code is a quoted value, the quotes are the boundary: everything
+  // between them is the code, so "1113." and "1113.retry" are their own codes
+  // and not 1113. Read that form first, because the prose rule below cannot
+  // see the closing quote and would stop at the period.
+  const quoted = /\bcode\b["']?\s*[:=]\s*(["'])(.*?)\1/iu.exec(msg);
+  if (quoted) return /^\d+$/.test(quoted[2]) ? quoted[2] : undefined;
+
+  // Unquoted, a code is still a whole token: the digits may not touch a
+  // character a code value can carry — a letter in any script, a digit, `_`,
+  // `-` or `.`. `1113abc`, `1113-retry`, `1113.0` and `1113é` are all
+  // different codes from `1113`, exactly as `11130` is. The one value
+  // character that also closes a sentence is `.`, so unquoted it counts as
+  // part of the code only where it continues the number — a digit follows it.
+  // Followed by anything else, or by nothing, it is punctuation ending a
+  // sentence and the digits before it are the whole code; on the leading side
+  // a `.` before the digits always continues a number.
   const labelled =
-    /\bcode\b["']?\s*[:=]?\s*["']?(?<![\p{L}\p{N}_.-])(\d+)(?![\p{L}\p{N}_-]|\.\p{N})/iu.exec(msg);
+    /\bcode\b["']?\s*[:=]?\s*(?<![\p{L}\p{N}_.-])(\d+)(?![\p{L}\p{N}_-]|\.\p{N})/iu.exec(msg);
   return labelled?.[1];
 }
 

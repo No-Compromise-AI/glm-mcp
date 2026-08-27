@@ -241,6 +241,10 @@ test('#25 a code is a whole token, not the prefix of one', () => {
     '400 {"error":{"code":"1113-retry"}}',
     '400 {"error":{"code":"1113.0"}}',
     '400 {"error":{"code":"1113é"}}',
+    // Inside quotes the value ends at the closing quote, so a period there
+    // belongs to the code rather than ending a sentence.
+    '400 {"error":{"code":"1113.retry"}}',
+    '400 {"error":{"code":"1113."}}',
     '400 {"error":{"code":"1210x"}}',
     '400 {"error":{"code":"1210.1"}}',
   ];
