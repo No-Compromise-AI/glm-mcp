@@ -19,31 +19,59 @@ export const DEFAULT_MODEL = "glm-5.3";
  * number for every model was the original mistake — the vision models stop at
  * 32,768 and the 4.5 family at 98,304, so a global default either starved the
  * text models or broke the rest.
+ *
+ * Each row also carries the model's role — the one line glm_models prints
+ * beside the id (#54). The role lives inside this table rather than in a
+ * second table beside it because two tables are two things to keep in step,
+ * and a hint table that silently falls behind the model table is the failure
+ * to design against: here a model added without its role does not compile,
+ * and a role glm_models fails to print fails verify:routing. An id the
+ * account returns that has no row here is listed bare — z.ai's to describe,
+ * exactly as it is z.ai's to size (#36).
+ *
+ * A row that accepts image input declares `vision: true` (#45). That is a
+ * fact about the model, carried per row because an id cannot be evidence:
+ * the `v` names the 4.5/4.6 vision family, but glm-5.3-flash is natively
+ * multimodal and its name says nothing of it, while glm-4.6's own docs say
+ * text only, so it is not marked. ask() sends text only, so every declared
+ * row's role says the image half goes unused where the choice is made; a
+ * model whose modality nobody recorded is not claimed either way.
  */
-const OUTPUT_LIMITS = new Map<string, { def: number; max: number }>([
+const OUTPUT_LIMITS = new Map<
+  string,
+  { def: number; max: number; role: string; vision?: boolean }
+>([
   // The 5.x generation and the 4.6/4.7 text models: 65,536 of a 131,072 ceiling.
-  ["glm-5.3", { def: 65_536, max: 131_072 }],
-  ["glm-5.3-flash", { def: 65_536, max: 131_072 }],
-  ["glm-5.2", { def: 65_536, max: 131_072 }],
-  ["glm-5.1", { def: 65_536, max: 131_072 }],
-  ["glm-5", { def: 65_536, max: 131_072 }],
-  ["glm-5-turbo", { def: 65_536, max: 131_072 }],
-  ["glm-5v-turbo", { def: 65_536, max: 131_072 }],
-  ["glm-4.7", { def: 65_536, max: 131_072 }],
-  ["glm-4.6", { def: 65_536, max: 131_072 }],
+  ["glm-5.3", { def: 65_536, max: 131_072, role: "the frontier flagship; it always reasons, so it cannot run with reasoning off" }],
+  // Natively multimodal with no `v` in its name — the row glm-5.3-flash is why
+  // modality is declared rather than inferred from the id (#45). It also cannot
+  // run with reasoning off, silently — see THINKING_REQUIRED below.
+  ["glm-5.3-flash", { def: 65_536, max: 131_072, role: "the flagship generation's fast tier, for bulk mechanical work; natively multimodal, but this server sends text only, so its image modality goes unused; it always reasons, so reasoning 'none' is raised to 'low'", vision: true }],
+  ["glm-5.2", { def: 65_536, max: 131_072, role: "the previous generation of the frontier line" }],
+  ["glm-5.1", { def: 65_536, max: 131_072, role: "an earlier generation of the frontier line" }],
+  ["glm-5", { def: 65_536, max: 131_072, role: "the first of the 5 generation" }],
+  ["glm-5-turbo", { def: 65_536, max: 131_072, role: "a lower-latency tier of the 5 family" }],
+  ["glm-5v-turbo", { def: 65_536, max: 131_072, role: "vision model; this server sends text only, so its image modality goes unused", vision: true }],
+  // These two CAN run with reasoning off — and the role must keep saying it as
+  // a choice, never as behaviour: glm_ask defaults an omitted reasoning to
+  // "low", so they reason with 2,048 thinking tokens until the caller selects
+  // "none". "Runs with reasoning off" sold the option as the default and cost
+  // the latency-sensitive caller exactly the thinking they came to avoid.
+  ["glm-4.7", { def: 65_536, max: 131_072, role: "the newer of the 4.6/4.7 text pair; it can run with reasoning off when you select reasoning 'none'" }],
+  ["glm-4.6", { def: 65_536, max: 131_072, role: "can run with reasoning off when you select reasoning 'none'; the cheap route for bulk mechanical work" }],
   // The 4.5 text family: the same default against a lower ceiling.
-  ["glm-4.5", { def: 65_536, max: 98_304 }],
-  ["glm-4.5-air", { def: 65_536, max: 98_304 }],
-  ["glm-4.5-x", { def: 65_536, max: 98_304 }],
-  ["glm-4.5-airx", { def: 65_536, max: 98_304 }],
-  ["glm-4.5-flash", { def: 65_536, max: 98_304 }],
+  ["glm-4.5", { def: 65_536, max: 98_304, role: "the 4.5 text family, a generation older with a lower output ceiling" }],
+  ["glm-4.5-air", { def: 65_536, max: 98_304, role: "the 4.5 family's light build" }],
+  ["glm-4.5-x", { def: 65_536, max: 98_304, role: "the 4.5 family's speed-tuned build" }],
+  ["glm-4.5-airx", { def: 65_536, max: 98_304, role: "the 4.5 family's light, speed-tuned build" }],
+  ["glm-4.5-flash", { def: 65_536, max: 98_304, role: "the 4.5 family's fast tier" }],
   // The 4.6 vision family: a quarter of the ceiling above.
-  ["glm-4.6v", { def: 16_384, max: 32_768 }],
-  ["glm-4.6v-flash", { def: 16_384, max: 32_768 }],
-  ["glm-4.6v-flashx", { def: 16_384, max: 32_768 }],
+  ["glm-4.6v", { def: 16_384, max: 32_768, role: "vision model; this server sends text only, so its image modality goes unused", vision: true }],
+  ["glm-4.6v-flash", { def: 16_384, max: 32_768, role: "fast-tier vision model; this server sends text only, so its image modality goes unused", vision: true }],
+  ["glm-4.6v-flashx", { def: 16_384, max: 32_768, role: "fast-tier vision model; this server sends text only, so its image modality goes unused", vision: true }],
   // The 4.5 vision model and the 128k 4-32b, where the default IS the ceiling.
-  ["glm-4.5v", { def: 16_384, max: 16_384 }],
-  ["glm-4-32b-0414-128k", { def: 16_384, max: 16_384 }],
+  ["glm-4.5v", { def: 16_384, max: 16_384, role: "vision model; this server sends text only, so its image modality goes unused", vision: true }],
+  ["glm-4-32b-0414-128k", { def: 16_384, max: 16_384, role: "an older 32B build; its default output cap is also its ceiling" }],
 ]);
 
 /**
@@ -71,7 +99,21 @@ export interface OutputLimits {
  * default with no ceiling, and the request is sent for z.ai to judge.
  */
 export function outputLimits(model: string): OutputLimits {
-  return OUTPUT_LIMITS.get(model) ?? { def: DEFAULT_MAX_TOKENS };
+  const row = OUTPUT_LIMITS.get(model);
+  // The role and the vision flag ride in the same row but are not sizing, so
+  // they stay out of the returned shape: #36's contract is exactly {def, max}
+  // — and the role has its own reader below.
+  return row ? { def: row.def, max: row.max } : { def: DEFAULT_MAX_TOKENS };
+}
+
+/**
+ * The one-line role glm_models prints beside a model id (#54), or undefined
+ * for a model the table does not know — such a model is z.ai's to describe,
+ * exactly as it is z.ai's to size (#36), so it is listed bare rather than
+ * guessed at.
+ */
+export function modelRole(model: string): string | undefined {
+  return OUTPUT_LIMITS.get(model)?.role;
 }
 
 const DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic";
@@ -98,8 +140,16 @@ export function modelsUrl(): string {
 export const BASE_URL = baseUrl();
 export const MODELS_URL = modelsUrl();
 
-/** Models that reject any request lacking a thinking block (z.ai error 1210). */
-const THINKING_REQUIRED = new Set(["glm-5.3"]);
+/**
+ * Models that cannot run with reasoning off (#54). The refusal arrives two
+ * ways, and the quiet one is the dangerous one: glm-5.3 rejects a request
+ * without a thinking block outright (z.ai error 1210), while glm-5.3-flash —
+ * whose docs allow `thinking.type` no value but `enabled` — accepts a disabled
+ * setting and silently reasons anyway, with nothing to tell the caller the
+ * knob it turned was ignored. ask() raises "none" to "low" for both rather
+ * than send a promise the request cannot keep.
+ */
+const THINKING_REQUIRED = new Set(["glm-5.3", "glm-5.3-flash"]);
 
 export type Reasoning = "none" | "low" | "high" | "max";
 
@@ -866,7 +916,11 @@ export interface AskResult {
 export async function ask(args: AskArgs): Promise<AskResult> {
   const { prompt, model, system } = args;
 
-  // glm-5.3 always reasons; a request without a thinking block is rejected outright.
+  // THINKING_REQUIRED models cannot run with reasoning off: glm-5.3 rejects
+  // the request outright (z.ai 1210), glm-5.3-flash accepts it and silently
+  // reasons anyway. "none" is raised to "low" here rather than sent — the
+  // silent variant is the worse failure, because nothing tells the caller
+  // the setting it chose was dropped.
   let reasoning = args.reasoning;
   if (reasoning === "none" && THINKING_REQUIRED.has(model)) reasoning = "low";
 

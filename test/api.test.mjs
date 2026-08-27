@@ -394,6 +394,22 @@ test('#20 reasoning "none" is raised on glm-5.3, and a cap too small for even th
     `glm-5.3 cannot run with reasoning off; a cap of 100 cannot hold it — got ${JSON.stringify(r.threw)}`);
 });
 
+test('#54 reasoning "none" on glm-5.3-flash is raised to "low" before anything is sent', async () => {
+  // glm-5.3-flash cannot disable thinking, and unlike glm-5.3 it says nothing
+  // about it: z.ai's docs allow `thinking.type` no value but `enabled`, and a
+  // disabled setting is accepted and silently ignored — the answer comes back
+  // reasoned with no error to notice. The raise happens here, before the
+  // request, so the caller pays the 2,048 it was always going to pay instead
+  // of a knob it believes it turned.
+  const r = await ask({ prompt: 'hi', model: 'glm-5.3-flash', reasoning: 'none' });
+  const sent = upstreamSeen[0]?.body;
+  assert.ok(sent, `a request must have been captured — ${JSON.stringify(r.threw ?? upstreamSeen)}`);
+  assert.equal(sent.thinking?.type, 'enabled',
+    `thinking must arrive enabled, not disabled — got ${JSON.stringify(sent.thinking)}`);
+  assert.equal(sent.thinking?.budget_tokens, 2_048,
+    `"none" raised to "low" means low's own budget of 2048 — got ${JSON.stringify(sent.thinking)}`);
+});
+
 test('#20 with reasoning off on a model that permits it, max_tokens goes through exactly', async () => {
   const r = await ask({ prompt: 'hi', model: 'glm-4.6', reasoning: 'none', maxTokens: 100 });
   const sent = upstreamSeen[0]?.body;

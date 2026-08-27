@@ -104,13 +104,21 @@ Two things it is genuinely good at:
 
 ### `glm_models`
 
-Lists the model ids available on the configured account.
+Lists the model ids available on the configured account, each with a one-line role.
+The request path is text-only — no image is ever attached — so picking a model that
+accepts images (`glm-4.6v` and siblings, and `glm-5.3-flash`, which is natively
+multimodal though its name says nothing of it) forgoes the modality it was selected
+for; each such id's role says so. An id this server's model table does not know is
+listed bare: it stays z.ai's to describe, exactly as it stays z.ai's to size.
 
 ## Reasoning
 
-**GLM-5.3 always reasons.** A request without a thinking block is rejected with z.ai error
-`1210`, so `reasoning: "none"` is silently raised to `"low"` for that model. Its siblings
-(`glm-5.2`, `glm-5-turbo`, `glm-4.6`, `glm-4.7`) have no such constraint.
+**GLM-5.3 and glm-5.3-flash always reason.** A request without a thinking block is
+rejected with z.ai error `1210` on GLM-5.3, so `reasoning: "none"` is silently raised
+to `"low"` for it. glm-5.3-flash cannot disable thinking either — z.ai's docs allow
+`thinking.type` no value but `enabled`, and sent `disabled` it still returns a thinking
+block without erroring — so its `"none"` is raised to `"low"` too, before anything is
+sent. `glm-4.6` and `glm-4.7` genuinely run with reasoning off.
 
 | `reasoning` | thinking budget |
 | --- | --- |

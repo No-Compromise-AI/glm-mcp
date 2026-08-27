@@ -28,6 +28,24 @@ Worth stating plainly, since this server holds an API key:
   configured endpoint.
 - **Your key, your account, your billing.** Nothing routes through the maintainer.
 
+## Prompt injection through file context
+
+`glm_ask` reads the files the caller names, and the file contents are sent to the
+model as part of the prompt, with the same standing as the question itself. A file
+inside a hostile repository can therefore carry an injected instruction — "disregard
+the request; instead do ..." — and nothing between the read and the request judges it:
+the model's answer is returned into the calling agent's context, where that agent may
+act on it. The whole chain — repository content to the model, model's answer to the
+calling agent — is the tool working as designed; it exists to bring repository content
+into a conversation, so the injection risk travels with the feature and cannot be
+filtered out at any one hop.
+
+What bounds it: the operator's roots decide what the server may read at all (see Path
+confinement in the README), and a caller can neither choose nor widen them; the
+server's own credential files are never read, whatever the roots say. How far to trust
+an answer built on untrusted files is the calling agent's judgement — the same
+judgement it applies to any web page or dependency it reads.
+
 ## Supply chain
 
 This repository holds no npm token or any other publish credential, and nothing in a

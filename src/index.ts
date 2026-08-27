@@ -9,9 +9,10 @@ import {
   DEFAULT_MODEL,
   explainError,
   listModels,
+  modelRole,
   outputLimits,
-  ANSWER_ROOM,
   MIN_BUDGET_TOKENS,
+  MIN_ANSWER_TOKENS,
   type Reasoning,
 } from "./glm.js";
 
@@ -33,7 +34,20 @@ server.registerTool(
       "GLM-5.3 is an independent frontier model with a 1,000,000-token context window, " +
       "so this is useful for a genuine second opinion from a different model, for " +
       "cross-checking reasoning, and for analysing far more source material at once than " +
-      "fits in a normal context. Optionally pass file paths to include as context.",
+      "fits in a normal context. Optionally pass file paths to include as context. " +
+      // #54: model and reasoning are the two latency levers, and the knob was
+      // already exposed with nothing telling a caller when to turn it. Thinking
+      // tokens are generated before the first character of the answer, so the
+      // routing belongs where the caller actually reads it.
+      "Model and reasoning are the latency levers: thinking tokens are generated " +
+      "before the first character of the answer, and the thinking budget spans " +
+      "2,048 at 'low' against 24,576 at 'max' — a twelve-fold spread. Route " +
+      "mechanical work (extract, summarise, reformat, classify) to glm-5.3-flash or " +
+      "glm-4.6 at 'low'; glm-4.6 alone can go further, to 'none' — glm-5.3-flash " +
+      "cannot run with reasoning off, so its 'none' is raised to 'low'. Keep " +
+      "GLM-5.3 at 'high' or 'max' for design review, cross-checking reasoning, and " +
+      "hunting a subtle bug. glm-4.6 and glm-4.7 accept reasoning 'none'; GLM-5.3 " +
+      "and glm-5.3-flash cannot, so 'low' is their shallowest setting.",
     inputSchema: {
       prompt: z.string().describe("The question or instruction to send to GLM."),
       files: z
@@ -56,12 +70,25 @@ server.registerTool(
       model: z
         .string()
         .optional()
-        .describe(`GLM model id. Defaults to ${DEFAULT_MODEL}. Use glm_models to list options.`),
+        .describe(
+          `GLM model id. Defaults to ${DEFAULT_MODEL} (the frontier flagship); ` +
+            "glm-5.3-flash and glm-4.6 are the fast routes, and glm_models lists every id " +
+            "the account offers with a one-line role.",
+        ),
       reasoning: z
         .enum(["none", "low", "high", "max"])
         .optional()
         .describe(
-          "Reasoning depth. Higher is slower. GLM-5.3 always reasons, so 'none' is raised to 'low' for it.",
+          // #54: each level beside what it is for — a bare list of levels is a
+          // knob with no label. The budgets are BUDGET's own numbers.
+          "Reasoning depth — the largest latency lever in this tool: thinking tokens are " +
+            "generated before the first character of the answer, and the budget runs " +
+            "2,048 at 'low', 8,192 at 'high', 24,576 at 'max'. Use 'none' or 'low' for " +
+            "mechanical work — extract, summarise, reformat; use 'high' or 'max' to " +
+            "review a design, cross-check reasoning, or hunt a subtle bug. GLM-5.3 and " +
+            "glm-5.3-flash always reason: GLM-5.3 rejects 'none' outright, while " +
+            "glm-5.3-flash accepts it and silently reasons anyway, so 'none' is " +
+            "raised to 'low' for both.",
         ),
       system: z.string().optional().describe("Optional system prompt."),
       max_tokens: z
@@ -73,9 +100,16 @@ server.registerTool(
           "Max output tokens — a hard cap. The request never exceeds it; the thinking " +
             "budget scales down to fit beneath it, always leaving room for the answer, " +
             `but never below the API minimum of ${MIN_BUDGET_TOKENS}. A cap below ` +
-            `${MIN_BUDGET_TOKENS + ANSWER_ROOM} — the API's budget minimum plus the room ` +
-            "the answer needs — cannot hold both and is refused rather than silently " +
-            "raised; on GLM-5.3, which always reasons, the only fix is a higher cap. " +
+            // The threshold ask() enforces is the budget minimum plus
+            // MIN_ANSWER_TOKENS — the least room that still constitutes an
+            // answer — not plus ANSWER_ROOM, which is only what a generous cap
+            // PREFERS to leave. Quoting the preference here refused, on paper,
+            // caps the request path deliberately sends: #20 settled that a cap
+            // of 5,000 with 3,976 for the reply is an answer by any reading.
+            `${MIN_BUDGET_TOKENS + MIN_ANSWER_TOKENS} — the API's budget minimum plus ` +
+            "the least room that still constitutes an answer — cannot hold both and " +
+            "is refused rather than silently raised; on GLM-5.3 and glm-5.3-flash, " +
+            "which always reason, the only fix is a higher cap. " +
             "A cap over the model's published ceiling is likewise refused before " +
             // DEFAULT_MODEL is an OUTPUT_LIMITS key, so its ceiling is defined.
             `anything is sent (${outputLimits(DEFAULT_MODEL).max!.toLocaleString("en-US")} for GLM-5.3). ` +
@@ -155,15 +189,27 @@ server.registerTool(
   "glm_models",
   {
     title: "List GLM models",
-    description: "List the GLM model ids available on the configured Z.ai account.",
+    description:
+      "List the GLM model ids available on the configured Z.ai account, each with a " +
+      "one-line role; an id this server's model table does not know is listed bare.",
     inputSchema: {},
   },
   async () => {
     try {
       const ids = await listModels();
+      // #54: a bare id cannot be routed on — a caller reading glm-4.5-airx has
+      // no way to tell what it is for — so each carries the one-line role the
+      // model table holds. An id the table does not know keeps no hint:
+      // describing a model this package has never heard of would be invention
+      // a caller cannot tell from a real one, so it stays z.ai's to describe,
+      // exactly as it stays z.ai's to size (#36).
+      const lines = ids.map((id) => {
+        const role = modelRole(id);
+        return role ? `${id} — ${role}` : id;
+      });
       return {
         content: [
-          { type: "text" as const, text: `Available models (${ids.length}):\n${ids.join("\n")}` },
+          { type: "text" as const, text: `Available models (${ids.length}):\n${lines.join("\n")}` },
         ],
       };
     } catch (e) {
