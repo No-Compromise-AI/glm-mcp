@@ -295,7 +295,13 @@ function takeUnits(s: string, maxUnits: number): string {
  * way, and telling the two apart — as `not found` and `unreadable` once did —
  * is an existence-and-permission oracle for anything inside the roots: probe a
  * spelling, learn whether it names something and whether the server's account
- * can read it. One wording, spelling out only what the caller itself sent.
+ * can read it. One wording, spelling out only what the caller itself sent —
+ * which for a glob entry is the PATTERN it sent, never the match the machine
+ * found by expanding it (`via`, not `p`): with literals already uniform, the
+ * expanded name was the one remaining way to confirm both that a hidden file
+ * exists and that it cannot be read. The refusal notes below are the deliberate
+ * opposite — they name the expanded match, pinned by the confinement gate,
+ * because a boundary the caller cannot see is what those notes have to explain.
  */
 const skipNote = (p: string): string => `skipped (could not be read): ${p}`;
 
@@ -498,7 +504,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     try {
       st = statSync(abs);
     } catch {
-      notes.push(skipNote(p));
+      notes.push(skipNote(via));
       continue;
     }
     // Regular files only (#15): a FIFO blocks the read forever, a device like
@@ -521,7 +527,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     try {
       body = readFileSync(abs, "utf8");
     } catch {
-      notes.push(skipNote(p));
+      notes.push(skipNote(via));
       continue;
     }
     // #19: the header and the separator count toward the cap with the body, so

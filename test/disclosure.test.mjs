@@ -183,6 +183,54 @@ test('a missing file and an unreadable one are the same fact to the caller', (t)
   }
 });
 
+test('a skip note for a glob match names the pattern, not the match the machine found', (t) => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-glob-')));
+  // The exact name is knowable only by expanding the pattern: the caller sent
+  // "sudoer?" and never "sudoers".
+  const secret = join(dir, 'sudoers');
+  writeFileSync(join(dir, 'readable.txt'), 'READABLE-BODY');
+  writeFileSync(secret, 'ROOT-ONLY-BODY');
+  const cleanup = () => {
+    try { chmodSync(secret, 0o600); } catch { /* best effort */ }
+    rmSync(dir, { recursive: true, force: true });
+  };
+  if (!deniesRead(secret)) {
+    cleanup();
+    t.skip('chmod 000 did not deny the read (running as root?) — the glob-match case cannot be exercised here');
+    return;
+  }
+  try {
+    isolated({ GLM_MCP_ROOTS: dir }, () => {
+      const viaPattern = buildFileContext(['sudoer?', 'readable.txt'], dir);
+      assert.ok(!viaPattern.text.includes('ROOT-ONLY-BODY'),
+        'the unreadable match must not be read');
+      assert.ok(viaPattern.text.includes('READABLE-BODY'),
+        `a good file beside a skipped match must still be read — ${JSON.stringify(viaPattern)}`);
+      // The note names the spelling the caller sent, so a caller with ten
+      // patterns still learns which of them got nothing.
+      assert.ok(viaPattern.notes.some((n) => n.includes('sudoer?')),
+        `the note must name the spelling the caller sent — ${JSON.stringify(viaPattern.notes)}`);
+      // And it does not name the filename the machine discovered by expanding
+      // that spelling. With missing and unreadable already indistinguishable
+      // for literals, the expanded name was the one remaining way to confirm
+      // both that this file exists and that the server's account cannot read
+      // it — the oracle #26 closes, routed through a wildcard.
+      assert.ok(!JSON.stringify(viaPattern.notes).includes('sudoers'),
+        `the note names the machine-expanded filename — ${JSON.stringify(viaPattern.notes)}`);
+      // The same-note contract, now on the pattern route: probing the file by
+      // pattern and by literal spelling must agree once each note is cut down
+      // to the spelling its own caller sent.
+      const viaLiteral = buildFileContext(['sudoers'], dir);
+      const shape = (notes, name) => notes.map((n) => n.split(name).join('<CALLER-PATH>'));
+      assert.deepEqual(shape(viaPattern.notes, 'sudoer?'), shape(viaLiteral.notes, 'sudoers'),
+        `the pattern route and the literal route told the same probe apart — ${JSON.stringify({
+          viaPattern: viaPattern.notes, viaLiteral: viaLiteral.notes })}`);
+    });
+  } finally {
+    cleanup();
+  }
+});
+
 test('an uncompilable pattern is refused in this project\'s words, not V8\'s', () => {
   const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-pattern-')));
   writeFileSync(join(dir, 'ok.txt'), 'OK-BODY');
