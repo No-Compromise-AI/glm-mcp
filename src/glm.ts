@@ -165,17 +165,25 @@ function comparableEndpoint(url: string): string {
  * they did not. #22 made ZAI_BASE_URL the egress-scoping knob, so the two
  * states are not interchangeable: an operator who scoped where the key goes
  * did not scope it so that a mistyped value would fall back to the vendor's
- * own host. A value that is SET but names no endpoint — empty after trimming,
- * only slashes, only whitespace, which is exactly what
- * `ZAI_BASE_URL="${HOST}/"` with HOST unset leaves — is refused here, naming
- * the variable, rather than replaced.
+ * own host. And whether a SET value names an endpoint at all is answered the
+ * one way it can be — by trying to make a URL of it, the same test the SDK
+ * applies when it joins the request path — never by deleting characters and
+ * judging what is left: two rounds went to that, each fix closing the
+ * spellings it knew ("/", "//", whitespace) and the next arrangement
+ * ("/ /", "//\t//") walking through, because a rule written against a
+ * character class always has one more spelling outside it. A value no URL can
+ * be made of — which is exactly what `ZAI_BASE_URL="${HOST}/"` with HOST
+ * unset leaves — is refused here, naming the variable, rather than replaced.
  *
  * Refusing rather than sending the value as written for the SDK to reject (the
- * behaviour before #42) is a deliberate choice with one ground: the SDK does
+ * behaviour before #42) is a deliberate choice with two grounds. The SDK does
  * not reject an empty baseURL, it substitutes api.anthropic.com — a third host
- * the operator named even less than z.ai's. Only the empty spelling reaches
- * that, and it is the ordinary one (`"${HOST}"` with HOST unset, no slash), so
- * the class is refused as a whole rather than half-sent, half-rejected.
+ * the operator named even less than z.ai's — and the ordinary way into this
+ * class (`"${HOST}"` with HOST unset, no slash) is exactly that spelling. And
+ * for the rest of the class the SDK's rejection arrives as a bare "Invalid
+ * URL" that names no variable, long after the configuration left the
+ * operator's hands; refusing at resolution names ZAI_BASE_URL while the value
+ * is still in front of whoever set it.
  *
  * The refusal therefore fires at module scope too, through BASE_URL below: a
  * server whose egress scope does not resolve does not start. That is the
@@ -187,16 +195,21 @@ function comparableEndpoint(url: string): string {
 export function baseUrl(): string {
   const raw = process.env.ZAI_BASE_URL;
   if (raw === undefined) return DEFAULT_BASE_URL;
-  // This question — does the value name anything at all — is the resolver's
-  // own, asked literally rather than borrowed from comparableEndpoint, whose
-  // job is whether two spellings SEND the same place. A set value that is
-  // empty after trimming, only slashes, only whitespace is this class.
-  if (raw.trim().replace(/\/+$/, "") === "") {
+  // The parse is a TEST, not a normalisation. A value that passes is returned
+  // exactly as written — the operator's spelling is what gets sent, spaces,
+  // extra slashes and all, and the href of the parse is not consulted, because
+  // what is SENT is not the parse's business (comparableEndpoint owns the one
+  // job a normalised form has: comparing). A value that fails is refused.
+  // Nothing here trims or strips, because every such rule has a spelling
+  // outside it — the parse is the SDK's own question asked early.
+  try {
+    new URL(raw);
+  } catch {
     throw new Error(
-      `ZAI_BASE_URL is set to ${JSON.stringify(raw)}, which names no endpoint. It is ` +
-        `not replaced with the default (${DEFAULT_BASE_URL}): the variable is how egress ` +
-        `is scoped, so a value that is set is sent as written or refused, never quietly ` +
-        `swapped for a host the operator did not name. Unset it to use ` +
+      `ZAI_BASE_URL is set to ${JSON.stringify(raw)}, which no URL can be made of. It ` +
+        `is not replaced with the default (${DEFAULT_BASE_URL}): the variable is how ` +
+        `egress is scoped, so a value that is set is sent as written or refused, never ` +
+        `quietly swapped for a host the operator did not name. Unset it to use ` +
         `${DEFAULT_BASE_URL}, or set it to the endpoint requests should go to.`,
     );
   }

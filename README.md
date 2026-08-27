@@ -284,11 +284,10 @@ passed through untranslated rather than explained as something it is not.
 
 Requests go to `https://api.z.ai/api/anthropic` unless `ZAI_BASE_URL` says otherwise. Your key
 is sent to whatever host it names, so only point it at endpoints you trust. A `ZAI_BASE_URL`
-that is set but names no endpoint — empty, only slashes, only whitespace, which is what
-`ZAI_BASE_URL="${HOST}/"` with `HOST` unset leaves — makes the server refuse to start with an
-error naming the variable, rather than quietly falling back to the default: the variable is how
-egress is scoped, so a value you set is sent as written or refused, never swapped for a host you
-did not name.
+that is set but that no URL can be made of — which is what `ZAI_BASE_URL="${HOST}/"` with
+`HOST` unset leaves — makes the server refuse to start with an error naming the variable,
+rather than quietly falling back to the default: the variable is how egress is scoped, so a
+value you set is sent as written or refused, never swapped for a host you did not name.
 
 `glm_models` reads a different endpoint on a different path prefix, so it does not follow
 `ZAI_BASE_URL` — pointing the two at one host would only be a guess about your gateway's

@@ -139,9 +139,14 @@ ${body}
   out.threw = String(e && e.message ? e.message : e);
 }
 out.seen = seen;
-process.stdout.write(JSON.stringify(out));
 server.close();
-process.exit(0);
+// process.exit() does NOT wait for a pipe to drain, so exiting straight after
+// the write truncates any result too big for the pipe buffer — which arrives
+// as a JSON parse error and reads like a malformed result rather than a lost
+// one. It only appeared once a case returned 121 rows (the endpoint-class case
+// below); verify-budget.mjs's child learned this the same way. Exit from the
+// write's own callback.
+process.stdout.write(JSON.stringify(out), () => process.exit(0));
 `;
   const childEnv = { ...process.env };
   for (const k of Object.keys(childEnv)) if (/^(GLM_MCP_|ZAI_)/.test(k)) delete childEnv[k];
@@ -434,22 +439,63 @@ test('#42 with ZAI_BASE_URL unset the chat endpoint is exactly what it has alway
 });
 
 test('#42 a base URL the operator SET but that names no endpoint is refused, never replaced', async () => {
-  // The class, not the spellings: '/' through '\t' and ''. That last one is
-  // `ZAI_BASE_URL="${HOST}"` with HOST unset — the ordinary way an operator
-  // reaches this class, and the reason the refusal covers it whole: the SDK
+  // The CLASS, not a list of spellings — a list is what cost two rounds,
+  // each closing the arrangement it knew ("/", "//", whitespace) and
+  // reopening for the next ("/ /", "//\t//"). The class is every string of
+  // length 1..4 over '/', ' ' and '\t', 120 of them, generated the way the
+  // acceptance gate generates it, plus the empty string — which is
+  // `ZAI_BASE_URL="${HOST}"` with HOST unset, the ordinary way an operator
+  // reaches this class and the reason the refusal covers it whole: the SDK
   // does not reject an empty baseURL, it substitutes api.anthropic.com, so
-  // "send what they wrote" has no honest spelling for ''. The refusal must
-  // name the variable and say the default is not substituted, because the
-  // operator's next move depends on knowing no fallback is going to catch
-  // them.
-  for (const value of ['/', '//', '///', ' ', '  /  ', '\t', '']) {
-    const r = await child('out.url = glm.baseUrl();', { ZAI_BASE_URL: value }, 20_000, { lazy: true });
-    assert.ok(r.threw,
-      `ZAI_BASE_URL=${JSON.stringify(value)} must be refused, not resolved — got ${JSON.stringify(r.url ?? r)}`);
-    assert.match(r.threw, /ZAI_BASE_URL/,
-      `ZAI_BASE_URL=${JSON.stringify(value)}: the refusal must name the variable — got ${JSON.stringify(r.threw)}`);
-    assert.match(r.threw, /not replaced with the default/,
-      `ZAI_BASE_URL=${JSON.stringify(value)}: the refusal must say the default is not substituted — got ${JSON.stringify(r.threw)}`);
+  // "send what they wrote" has no honest spelling for ''. The resolver's
+  // question is "can a URL be made of this?", so the test asks the same
+  // question of the class first — if URL ever parses one of these, the
+  // generator is wrong and must say so rather than check the wrong thing.
+  // The refusal must name the variable and say the default is not
+  // substituted, because the operator's next move depends on knowing no
+  // fallback is going to catch them.
+  const alphabet = ['/', ' ', '\t'];
+  const values = [''];
+  let round = [''];
+  for (let n = 0; n < 4; n++) {
+    round = round.flatMap((p) => alphabet.map((c) => p + c));
+    values.push(...round);
+  }
+  for (const v of values) {
+    let parsed = true;
+    try { new URL(v); } catch { parsed = false; }
+    assert.ok(!parsed,
+      `the class generator produced ${JSON.stringify(v)}, which URL parses — the class is wrong, not the resolver`);
+  }
+  // One child for all 121: a spawn each would make this the slowest test in
+  // the file for no extra evidence, and the assertion is per-value either way.
+  // The last line pins the other half of the property: a value a URL CAN be
+  // made of is returned exactly as written — the parse is the test, never a
+  // normalisation of what gets sent.
+  const r = await child(`
+const values = ${JSON.stringify(values)};
+out.rows = [];
+for (const v of values) {
+  process.env.ZAI_BASE_URL = v;
+  const row = { v };
+  try { row.url = glm.baseUrl(); } catch (e) { row.refused = String(e && e.message ? e.message : e); }
+  out.rows.push(row);
+}
+process.env.ZAI_BASE_URL = ' http://127.0.0.1:1/x ';
+out.asWritten = glm.baseUrl();`);
+  assert.equal(r.threw, undefined,
+    `the class case must run at all — ${JSON.stringify(r.threw)}`);
+  assert.equal(r.asWritten, ' http://127.0.0.1:1/x ',
+    `a set value a URL can be made of is returned as written, not normalised — got ${JSON.stringify(r.asWritten)}`);
+  assert.equal(r.rows.length, values.length,
+    `every value must be tried — got ${r.rows.length} of ${values.length}`);
+  for (const row of r.rows) {
+    assert.ok(row.refused !== undefined,
+      `ZAI_BASE_URL=${JSON.stringify(row.v)} must be refused, not resolved — got ${JSON.stringify(row.url ?? row)}`);
+    assert.match(row.refused, /ZAI_BASE_URL/,
+      `ZAI_BASE_URL=${JSON.stringify(row.v)}: the refusal must name the variable — got ${JSON.stringify(row.refused)}`);
+    assert.match(row.refused, /not replaced with the default/,
+      `ZAI_BASE_URL=${JSON.stringify(row.v)}: the refusal must say the default is not substituted — got ${JSON.stringify(row.refused)}`);
   }
 });
 
