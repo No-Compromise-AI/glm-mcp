@@ -636,6 +636,53 @@ test('#40 a repeated pattern is answered once per occurrence, on position', () =
   }
 });
 
+test('#40 a limit stops the argument whose walk hit it, never the spelling it shares', () => {
+  // The entries budget belongs to the CALL, so the same spelling can cross it
+  // on its second walk and not its first — and an excuse keyed by the spelling
+  // then silenced the first occurrence too: an argument that completed its
+  // walk, contributed nothing its own position could claim, and was owed an
+  // answer received nothing. The stopped-walk excuse belongs to the position
+  // that was being walked.
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-limit-twin-')));
+  try {
+    mkdirSync(join(dir, 'src'));
+    for (const n of ['confine.ts', 'glm.ts', 'glob.ts', 'index.ts', 'limits.ts'])
+      writeFileSync(join(dir, 'src', n), n.toUpperCase());
+    // Five directory entries: the first src/gl[m].ts walk reads src at
+    // entriesSeen=5 (not over the cap), the second crosses at 10.
+    const r = ctx(['src/glm.ts', 'src/gl[m].ts', 'src/gl[m].ts'], dir,
+      { GLM_MCP_MAX_ENTRIES: 5 });
+    assert.ok(r.text.includes('GLM.TS'),
+      `the literal's file must still be delivered — ${JSON.stringify(r.text)}`);
+    const named = r.notes.filter((n) => n.includes('src/gl[m].ts'));
+    assert.equal(named.length, 2,
+      `each glob argument is owed one note — the first's answer, the second's limit — ${JSON.stringify(r.notes)}`);
+    assert.ok(named.some((n) => /^skipped \(no matches\): src\/gl\[m\]\.ts$/.test(n)),
+      `the glob whose walk completed and whose match was already claimed must be named for its own position — ${JSON.stringify(r.notes)}`);
+    assert.ok(named.some((n) => /GLM_MCP_MAX_ENTRIES/.test(n)),
+      `the glob whose walk crossed the entries limit must keep the limit's note — ${JSON.stringify(r.notes)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#40 a repeated uncompilable pattern is refused once per argument, not once per spelling', () => {
+  // Both walks refuse, and the refusal note is the same string either way —
+  // so a de-dup keyed on the message text answered one argument and left the
+  // other excused-by-note-but-unnamed. A refusal speaks for the position
+  // whose walk it was, once each.
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-malformed-twin-')));
+  try {
+    const r = ctx(['[z-a].txt', '[z-a].txt'], dir);
+    assert.equal(r.notes.length, 2,
+      `two arguments, two refusals, one note per argument — ${JSON.stringify(r.notes)}`);
+    assert.ok(r.notes.every((n) => n.includes('[z-a].txt') && /malformed|expansion failed/i.test(n)),
+      `each refusal names its argument's own spelling in this project's words — ${JSON.stringify(r.notes)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // --------------------------------- #41: a severed answer says so
 
 // The stand-in for z.ai, answering with a chosen stop_reason: the shape ask()

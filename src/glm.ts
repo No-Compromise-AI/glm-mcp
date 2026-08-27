@@ -438,29 +438,36 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // The walk-wide limits of decision 5 (#16, #17), shared by every pattern of
   // this call: depth, entries and the wall clock are budgets of the call, not
   // of each pattern, and every limit note lands here. A note also means part of
-  // this entry's expansion was stopped, which is why `limitedPatterns`
+  // this entry's expansion was stopped, which is why `limitedArgs`
   // suppresses the "no matches" note below — a pattern cut short by a limit is
   // not a pattern that matched nothing, and reading it as one is the silent
-  // truncation decision 5 exists to end. The suppression is per pattern: the
-  // sink records WHICH patterns have been limited — expansion sets
-  // budget.pattern before any walk can trip — so a limit stops the pattern
-  // that hit it and leaves the rest of the call alone instead of swallowing
-  // their notes too. Every pattern it limited, never only the latest one: the
-  // sink de-duplicates a repeated note, so its callback does not fire a second
-  // time for a pattern it has already recorded, and a single slot would go
-  // stale the moment a later pattern tripped a limit of its own.
-  const limitedPatterns = new Set<string>();
-  // The patterns whose walk a confinement refusal cut short, the other half of
+  // truncation decision 5 exists to end. The suppression is by ARGUMENT
+  // POSITION, the one fact everything in this function is answered on (#40):
+  // the sink records which positions were stopped, so a limit silences the
+  // argument whose walk hit it and nobody else. Keying it by the spelling the
+  // walk was named after excused every occurrence of a repeated spelling at
+  // once: under a tight entries budget,
+  // ['src/glm.ts', 'src/gl[m].ts', 'src/gl[m].ts'] trips the limit only on the
+  // second glob's walk, and the first glob — which completed, contributed
+  // nothing its own argument could claim, and was owed an answer — was
+  // silenced by a limit that happened to somebody else, one note short of one
+  // per argument.
+  const limitedArgs = new Set<number>();
+  // The arguments whose walk a confinement refusal cut short, the other half of
   // "stopped" — a "no matches" note would misdescribe those exactly as it
-  // misdescribes a limited one, wherever about them it is filed.
-  const refusedPatterns = new Set<string>();
+  // misdescribes a limited one, wherever about them it is filed. Keyed by
+  // position for the same reason as the limits: the refusal stops the argument
+  // whose walk it pruned, and an argument that shares its spelling but was
+  // stopped differently — or not stopped at all — is answered on its own
+  // position.
+  const refusedArgs = new Set<number>();
   // The argument being worked. The budget's note sink and the mid-walk refusal
   // callback fire from inside glob.ts's own loops, synchronously within the
   // iteration they belong to, so this is how they learn which argument to file
   // their note under.
   let argAt = -1;
   const budget = walkBudget((msg) => {
-    limitedPatterns.add(budget.pattern);
+    limitedArgs.add(argAt);
     notes.push({ arg: argAt, msg });
   });
   const maxFileBytes = envLimit("GLM_MCP_MAX_FILE_BYTES", DEFAULT_MAX_FILE_BYTES);
@@ -535,6 +542,17 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   const pendings: Array<{ arg: number; via: string }> = [];
   for (const [arg, p] of paths.entries()) {
     argAt = arg;
+    // One note per argument per limit, never one per spelling. budgetNote
+    // de-duplicates on the message text, and every limit note names the
+    // pattern it stopped, so two arguments sending the same spelling produce
+    // byte-identical messages — and the de-dup ate the second argument's note
+    // whole: `['[z-a].txt', '[z-a].txt']` walked and refused both, and said so
+    // once. Clearing the de-dup at each argument keeps what it existed for —
+    // a walk that prunes a hundred directories at the depth cut-off is still
+    // one note, because the reset happens between arguments, never inside a
+    // walk — while making the scope of "once" the argument, the unit every
+    // other once-per here is counted in (#40).
+    budget.said.clear();
     // The credential rule runs before any existence check (decision 3), so
     // /proc/self/environ is reported as refused, not missing, where it does
     // not exist. A path that exists on disk is then read literally — judged
@@ -586,7 +604,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       // match would carry, so the note names both it and the pattern that
       // reached it.
       const matches = expandGlob(p, cwd, roots ?? undefined, (refused) => {
-        refusedPatterns.add(p);
+        refusedArgs.add(arg);
         notes.push({
           arg,
           msg: `refused: ${refused} (matched by ${p}) resolves outside the allowed roots`,
@@ -766,7 +784,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // landing on someone else's file) each closed one case and revealed the
   // next because arrival was inferred from what was READ rather than tracked
   // per argument; per position it needs no lookup of what else happened, so
-  // there is no next arrangement to reveal. The one exception is a pattern
+  // there is no next arrangement to reveal. The one exception is an argument
   // whose walk was stopped — by a limit, or by a boundary refusal: refused
   // is not the same as absent, that note already speaks for it, and "no
   // matches" beside it would claim it was simply wrong.
@@ -788,9 +806,12 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       : skipNote(pending.via);
 
   for (const pending of pendings) {
-    // A pattern whose walk a limit or a boundary refusal cut short is excused
-    // entirely — see the comment above answerNote.
-    if (limitedPatterns.has(pending.via) || refusedPatterns.has(pending.via)) continue;
+    // An argument whose walk a limit or a boundary refusal cut short is excused
+    // entirely — see the comment above answerNote. By position: the excuse is
+    // that THIS argument already has a note speaking for it, and the argument
+    // that hit the limit is the one that was being walked, not every argument
+    // that happens to spell the same pattern.
+    if (limitedArgs.has(pending.arg) || refusedArgs.has(pending.arg)) continue;
     // The one test, on the caller's own fact: did a file arrive on THIS
     // position's behalf? Not "was its file spoken for" — an earlier argument
     // may have read, truncated or blown the cap on that very file, and the
