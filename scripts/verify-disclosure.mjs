@@ -18,7 +18,7 @@
 // removing it would reintroduce the silent narrowing #13's notes exist to
 // prevent. This gate asserts both halves so a fix cannot overshoot into one.
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, symlinkSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir, homedir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -265,6 +265,33 @@ out.notes = glm.buildFileContext(['*.md'], ${JSON.stringify(dir)}).notes;`,
     const without = capProbe(false);
     if (JSON.stringify(withIt.notes) !== JSON.stringify(without.notes)) {
       fail(`#26: the character cap tells a caller an unreadable file exists:\n  present: ${JSON.stringify(withIt.notes)}\n  absent:  ${JSON.stringify(without.notes)}`);
+    }
+  }
+
+  // A twin that de-duplicates against an earlier argument. Whether the third
+  // argument is a symlink to the first file or simply absent, nothing is read
+  // on its behalf — so it must be answered the same way. Crediting it because
+  // its resolved key was already spoken for made the NOTE COUNT the answer to
+  // "does this file exist?".
+  {
+    const twin = (asSymlink) => {
+      const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-twin-')));
+      try {
+        writeFileSync(join(dir, 'a.md'), 'm'.repeat(300));
+        writeFileSync(join(dir, 'big.txt'), 'b'.repeat(900));
+        if (asSymlink) symlinkSync(join(dir, 'a.md'), join(dir, 'a[.]md'));
+        return child(`
+process.env.GLM_MCP_ROOTS = ${JSON.stringify(dir)};
+out.notes = glm.buildFileContext(['a.md', 'big.txt', 'a[.]md'], ${JSON.stringify(dir)}).notes;`,
+          { GLM_MCP_MAX_FILE_CHARS: 700 });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+    const linked = twin(true);
+    const absent = twin(false);
+    if (JSON.stringify(linked.notes) !== JSON.stringify(absent.notes)) {
+      fail(`#26: an argument that de-duplicates against an earlier one is answered differently from an absent one, so the note count reveals the file exists:\n  symlink twin: ${JSON.stringify(linked.notes)}\n  absent twin:  ${JSON.stringify(absent.notes)}`);
     }
   }
 
