@@ -26,6 +26,7 @@
     "verify:limits": "node scripts/verify-limits.mjs",
     "verify:redos": "node scripts/verify-redos.mjs",
     "verify:release": "node scripts/verify-release.mjs",
+    "verify:api": "node scripts/verify-api.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
