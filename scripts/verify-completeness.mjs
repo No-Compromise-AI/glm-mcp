@@ -100,7 +100,13 @@ try {
   }
 
   // ------------------------------- #41 an answer that was cut off says so
-  for (const [reason, mustWarn] of [['max_tokens', true], ['end_turn', false]]) {
+  // The body text differs per case on purpose. Reusing "cut off mid-sent" for
+  // the end_turn probe made the check match the MODEL'S OWN WORDS rather than
+  // the footer, so no correct implementation could pass it.
+  for (const [reason, mustWarn, answer] of [
+    ['max_tokens', true, 'cut off mid-sent'],
+    ['end_turn', false, 'an ordinary finished answer'],
+  ]) {
     const upstream = createServer((req, res) => {
       let raw = '';
       req.on('data', (c) => { raw += c; });
@@ -109,7 +115,7 @@ try {
         res.end(JSON.stringify({
           model: 'glm-5.3',
           stop_reason: reason,
-          content: [{ type: 'text', text: 'cut off mid-sent' }],
+          content: [{ type: 'text', text: answer }],
           usage: { input_tokens: 10, output_tokens: 99 },
         }));
       });
@@ -133,12 +139,17 @@ try {
         arguments: { prompt: 'hi', model: 'glm-5.3', reasoning: 'low' },
       });
       const text = res.content?.[0]?.text ?? '';
-      const warns = /max_tokens|cut off|truncated|stopped at/i.test(text);
+      // Only the footer is ours to write; the body is whatever the model said.
+      // Searching the whole result would let the model's own wording answer for
+      // us — which is exactly how the first version of this check went wrong.
+      const footer = (text.match(/^\[.*\]$/m) ?? [''])[0];
+      if (!footer) fail(`#41: no footer line found in the tool result — ${JSON.stringify(text.slice(-160))}`);
+      const warns = /max_tokens|truncated|stopped at|cut off/i.test(footer);
       if (mustWarn && !warns) {
-        fail(`#41: the model stopped at max_tokens and the result reads as a finished answer. A caller cannot tell a complete second opinion from a severed one.\n  ${JSON.stringify(text.slice(-160))}`);
+        fail(`#41: the model stopped at max_tokens and the footer says nothing, so the result reads as a finished answer. A caller cannot tell a complete second opinion from a severed one.\n  footer: ${JSON.stringify(footer)}`);
       }
       if (!mustWarn && warns) {
-        fail(`#41: a normally finished answer is flagged as truncated — ${JSON.stringify(text.slice(-160))}`);
+        fail(`#41: a normally finished answer is flagged as truncated — footer: ${JSON.stringify(footer)}`);
       }
     } finally {
       await client.close().catch(() => {});

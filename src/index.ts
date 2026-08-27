@@ -117,6 +117,11 @@ server.registerTool(
         `in ${result.usage.input} / out ${result.usage.output} tok`,
         result.usage.cacheRead ? `cached ${result.usage.cacheRead}` : null,
         result.thinkingChars ? `reasoned ${result.thinkingChars} chars` : null,
+        // #41: an answer the output cap severed mid-reply is not a finished
+        // one, and this footer is where the caller already reads what the
+        // answer cost — so the marker sits beside it. A normally finished
+        // answer says nothing: flagging it would cry wolf on every reply.
+        result.stopReason === "max_tokens" ? "stopped at max_tokens" : null,
       ]
         .filter(Boolean)
         .join(" · ");

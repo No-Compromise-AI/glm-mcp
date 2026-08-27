@@ -348,6 +348,42 @@ function takeUnits(s: string, maxUnits: number): string {
  */
 const skipNote = (p: string): string => `skipped (no matches): ${p}`;
 
+/**
+ * How many leading bytes are inspected for a NUL before a file is believed to
+ * be text. 8,000 is git's own sniffing length and the conventional one: no
+ * human-written text encoding contains a NUL, while nearly every binary
+ * format is dense with them.
+ */
+const BINARY_SNIFF_BYTES = 8_000;
+
+const REPLACEMENT_CHAR = "\u{FFFD}";
+
+/**
+ * Whether a file's bytes are binary rather than text (#39). A NUL in the
+ * first {@link BINARY_SNIFF_BYTES} bytes is the cheap, conventional verdict.
+ * The backstop catches the binary formats that happen to hold no zero byte:
+ * undecodable UTF-8 decodes to U+FFFD, so a body that is one replacement
+ * character in ten or more is bytes the model cannot read. The ratio is
+ * deliberately high — a text file carrying a few literal replacement
+ * characters (itself mojibake, but its author's) is still read, and accented
+ * Latin, CJK and emoji are valid UTF-8 and ordinary source; a detector that
+ * rejects them would be worse than the bug it exists to fix.
+ */
+function isBinary(raw: Buffer): boolean {
+  if (raw.subarray(0, BINARY_SNIFF_BYTES).includes(0)) return true;
+  const body = raw.toString("utf8");
+  let replacements = 0;
+  for (
+    let i = body.indexOf(REPLACEMENT_CHAR);
+    i !== -1;
+    i = body.indexOf(REPLACEMENT_CHAR, i + 1)
+  ) {
+    replacements++;
+    if (replacements * 10 >= body.length) return true;
+  }
+  return false;
+}
+
 export interface FileContext {
   text: string;
   notes: string[];
@@ -583,6 +619,13 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     }
   }
 
+  // #40: the argument whose read the char cap cut, or -1 when it never cut.
+  // Files are read in argument order, so everything from here on was never
+  // attempted — and the pendings loop below needs to know it, because the
+  // answer it owes those arguments is not the one it owes an argument that
+  // was read and yielded nothing.
+  let capCutAt = -1;
+
   for (const { p, via, resolved, arg } of files) {
     // Re-checked at read time because a glob match may be a symlink whose
     // target leaves the roots only once resolved; the anchor could not see it.
@@ -632,12 +675,27 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       spokenFor.add(resolved);
       continue;
     }
-    let body: string;
+    let raw: Buffer;
     try {
-      body = readFileSync(abs, "utf8");
+      raw = readFileSync(abs);
     } catch {
       continue; // nothing was read; the argument's answer below says so
     }
+    // #39: the bytes are judged before they become text. Decoding a binary
+    // file as UTF-8 turns every undecodable byte into U+FFFD and flows it
+    // into the prompt — silently spending the char budget on characters the
+    // model cannot read, which since #35 is a budget with room for whole
+    // images and fonts to crowd out the source the caller asked about. The
+    // file is skipped and named instead, and because nothing of it enters
+    // the prompt, none of its bytes count against the budget.
+    if (isBinary(raw)) {
+      notes.push({ arg, msg: `skipped (binary file): ${p}${matchedBy}` });
+      // The note speaks for the file, so the argument's answer below does not
+      // add `no matches` beside it — skipped is not absent.
+      spokenFor.add(resolved);
+      continue;
+    }
+    const body = raw.toString("utf8");
     // Content will be delivered — in full or truncated — so the result
     // speaks for this file either way.
     spokenFor.add(resolved);
@@ -664,11 +722,11 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         msg: `truncated at ${MAX_FILE_CHARS} total chars starting with: ${p}`,
       });
       // The cap cut the loop here, so the entries after this one were never
-      // attempted — and each is still answered below, exactly as a pattern
-      // after the cut always was. Silencing the literals among them was this
-      // oracle wearing the cap's hat: which branch an entry took is decided
-      // by whether the file exists, so a literal silenced where a pattern
-      // would be noted tells a caller the named file is there.
+      // attempted. `capCutAt` records whose read was underway (#40): every
+      // argument from here on is answered below as never read rather than as
+      // having matched nothing, so the caller can tell what reached the model
+      // and retry with a curated list — the only useful thing it can do next.
+      capCutAt = arg;
       break;
     }
     chunks.push(`${sep}${header}${body}`);
@@ -690,10 +748,26 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // limit, or by a boundary refusal — is excused entirely: refused is not
   // the same as absent, that note already speaks for it, and "no matches"
   // beside it would claim it was simply wrong.
+  // The answer an unfulfilled argument receives (#40). Before the cap cuts
+  // the reads it is `no matches`, the merged wording #26 settled on, because
+  // whether the file was absent or unreadable must not be tellable. From the
+  // cut on it changes: those arguments were never read, and saying `no
+  // matches` about a file that is sitting there unread forecloses the retry
+  // the note exists to enable. The line is drawn at the argument POSITION the
+  // cap cut at, never at whether a file entry exists for the argument —
+  // position is the caller's own choice and existence is the machine's
+  // answer, so a wording that depended on it would reopen the oracle #26
+  // closed: absent, unreadable and simply-never-reached must all produce this
+  // same note.
+  const answerNote = (pending: (typeof pendings)[number]): string =>
+    capCutAt >= 0 && pending.arg >= capCutAt
+      ? `skipped (char cap reached, not read): ${pending.via}`
+      : skipNote(pending.via);
+
   for (const pending of pendings) {
     if (pending.kind === "literal") {
       if (!spokenFor.has(pending.key)) {
-        notes.push({ arg: pending.arg, msg: skipNote(pending.via) });
+        notes.push({ arg: pending.arg, msg: answerNote(pending) });
       }
       continue;
     }
@@ -705,7 +779,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         break;
       }
     }
-    if (!contributed) notes.push({ arg: pending.arg, msg: skipNote(pending.via) });
+    if (!contributed) notes.push({ arg: pending.arg, msg: answerNote(pending) });
   }
 
   // The separators were budgeted per chunk above, so joining is the identity:
@@ -732,6 +806,13 @@ export interface AskResult {
   thinkingChars: number;
   model: string;
   usage: { input: number; output: number; cacheRead: number };
+  /**
+   * Why the answer ended, exactly as the API reported it (#41). "end_turn" is
+   * a finished answer; "max_tokens" is one the output cap severed mid-reply,
+   * which a caller must be able to tell from a complete second opinion — the
+   * footer in index.ts says it where the caller already reads the result.
+   */
+  stopReason: string | undefined;
 }
 
 export async function ask(args: AskArgs): Promise<AskResult> {
@@ -801,6 +882,7 @@ export async function ask(args: AskArgs): Promise<AskResult> {
 
   const res = (await getClient().messages.create(body as never)) as {
     model?: string;
+    stop_reason?: string;
     content?: Array<{ type: string; text?: string; thinking?: string }>;
     usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number };
   };
@@ -821,6 +903,7 @@ export async function ask(args: AskArgs): Promise<AskResult> {
       output: res.usage?.output_tokens ?? 0,
       cacheRead: res.usage?.cache_read_input_tokens ?? 0,
     },
+    stopReason: res.stop_reason,
   };
 }
 
