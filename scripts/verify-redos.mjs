@@ -209,6 +209,42 @@ process.stdout.write(JSON.stringify({ text: r.text, notes: r.notes }));
     if (!malformed(br.notes, '{[z-a].ts,ok.ts}')) {
       fail(`an uncompilable brace branch must be reported even when another branch succeeds — notes=${JSON.stringify(br.notes)}`);
     }
+    // A segment that cannot compile matches nothing, so walking for it buys
+    // nothing — but the walk still spends the call's shared entry budget, and
+    // the bill lands on whichever honest pattern is sitting beside it. A
+    // malformed argument must cost its neighbours nothing.
+    const starve = `
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { buildFileContext } from ${JSON.stringify(GLM)};
+const R = ${JSON.stringify(bad)};
+mkdirSync(join(R, 'src'), { recursive: true });
+for (let i = 0; i < 8; i++) writeFileSync(join(R, 'src', 'f' + i + '.ts'), 'BODY' + i);
+for (let d = 0; d < 6; d++) {
+  mkdirSync(join(R, 'd' + d), { recursive: true });
+  for (let i = 0; i < 8; i++) writeFileSync(join(R, 'd' + d, 'g' + i + '.ts'), 'x');
+}
+process.env.GLM_MCP_ROOTS = R;
+process.env.GLM_MCP_MAX_ENTRIES = '10';
+const both = buildFileContext(['**/[z-a].ts', 'src/*.ts'], R);
+const alone = buildFileContext(['src/*.ts'], R);
+process.stdout.write(JSON.stringify({
+  both: both.text.split('--- src/').length - 1,
+  alone: alone.text.split('--- src/').length - 1,
+  notes: both.notes,
+}));
+`;
+    let st;
+    try {
+      st = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', starve],
+        { cwd: bad, encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+    } catch (e) {
+      fail(`the starvation case threw\n${e.stderr || e.message}`);
+    }
+    if (st.both !== st.alone) {
+      fail(`an uncompilable pattern spent the budget its neighbour needed: with it, ${st.both} of ${st.alone} files — a pattern that can never match must not walk at all\n  notes=${JSON.stringify(st.notes)}`);
+    }
+
     // And the correction must not swallow the ordinary case: a pattern that
     // genuinely matched nothing still says so.
     if (!br.notes.some((n) => n.includes('absent-*.zzz') && /no matches/i.test(n))) {
