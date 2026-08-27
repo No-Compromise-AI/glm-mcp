@@ -238,6 +238,36 @@ out.notes = glm.buildFileContext(['[z-a].txt'], ${JSON.stringify(dir)}).notes;`)
     }
   }
 
+  // The cap, a pattern, and an unreadable match together. The completeness
+  // work (#40) reopened this exact combination by naming a pattern's unread
+  // matches — names that can only be produced when the files exist — and this
+  // sweep did not cover it, so the gate that should have caught the regression
+  // passed it.
+  {
+    const capProbe = (present) => {
+      const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-cap-oracle-')));
+      try {
+        for (const n of ['a-one.md', 'b-two.md']) writeFileSync(join(dir, n), 'm'.repeat(600));
+        if (present) {
+          writeFileSync(join(dir, 'c-secret.md'), 'S'.repeat(600));
+          chmodSync(join(dir, 'c-secret.md'), 0o000);
+        }
+        return child(`
+process.env.GLM_MCP_ROOTS = ${JSON.stringify(dir)};
+out.notes = glm.buildFileContext(['*.md'], ${JSON.stringify(dir)}).notes;`,
+          { GLM_MCP_MAX_FILE_CHARS: 1000 });
+      } finally {
+        try { chmodSync(join(dir, 'c-secret.md'), 0o600); } catch { /* absent */ }
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+    const withIt = capProbe(true);
+    const without = capProbe(false);
+    if (JSON.stringify(withIt.notes) !== JSON.stringify(without.notes)) {
+      fail(`#26: the character cap tells a caller an unreadable file exists:\n  present: ${JSON.stringify(withIt.notes)}\n  absent:  ${JSON.stringify(without.notes)}`);
+    }
+  }
+
   // A good file beside a skipped one is still read.
   const mixed = notes(['locked.txt', 'readable.txt']);
   if (!mixed.text.includes('READABLE-BODY')) {

@@ -91,11 +91,18 @@ try {
   // Every file the caller named that did not reach the model must be
   // recoverable from the notes. Otherwise the caller cannot retry with a
   // curated list, which is the only useful thing it can do next.
+  // ARGUMENT granularity, deliberately, and this is the correction of an
+  // earlier version of this gate. Requiring each dropped FILE to be named
+  // reopened #26: a file that matched a pattern and was never read can only be
+  // named if it exists, so the note became an existence oracle again. What the
+  // caller actually needs is to know WHICH OF ITS ARGUMENTS did not fully
+  // arrive, so it can curate and retry — and an argument is something it
+  // supplied, not something it learns.
   const said = r.notes.join(' ');
-  for (const n of NAMED) {
-    const reached = r.text.includes(`--- ${n} ---`);
-    if (!reached && !said.includes(n)) {
-      fail(`#40: ${n} never reached the model and no note names it. The caller is told where the cut began and nothing about what fell past it.\n  notes=${JSON.stringify(r.notes)}`);
+  for (const arg of NAMED) {
+    const reached = r.text.includes(`--- ${arg} ---`);
+    if (!reached && !said.includes(arg)) {
+      fail(`#40: the caller named ${arg}, it never reached the model, and no note says so. It is told where the cut began and nothing about what fell past it.\n  notes=${JSON.stringify(r.notes)}`);
     }
   }
 
@@ -106,10 +113,17 @@ try {
   const MD = ['a-one.md', 'b-two.md', 'c-three.md'];
   for (const n of MD) writeFileSync(join(ROOT, n), 'm'.repeat(600));
   r = ctx(['*.md'], ROOT, { GLM_MCP_MAX_FILE_CHARS: 1000 });
-  for (const n of MD) {
-    const reached = r.text.includes(`--- ${n} ---`);
-    if (!reached && !r.notes.join(' ').includes(n)) {
-      fail(`#40: ${n} matched the caller's pattern, never reached the model, and no note names it. Coming in through a glob is not a reason to vanish.\n  notes=${JSON.stringify(r.notes)}`);
+  const arrived = MD.filter((n) => r.text.includes(`--- ${n} ---`));
+  if (arrived.length === MD.length) fail('#40: the cap fixture no longer truncates — it proves nothing');
+  if (!r.notes.join(' ').includes('*.md')) {
+    fail(`#40: '*.md' did not fully arrive and no note names the pattern, so the caller cannot tell which argument to curate.\n  notes=${JSON.stringify(r.notes)}`);
+  }
+  // And it must NOT enumerate the matches it did not read: those names exist
+  // only because the files do, which is #26's oracle wearing the cap's hat.
+  const unread = MD.filter((n) => !arrived.includes(n));
+  for (const n of unread) {
+    if (r.notes.join(' ').includes(n)) {
+      fail(`#40/#26: the note names ${n}, a file that was never read. Naming a pattern's unread matches tells the caller which files exist.\n  notes=${JSON.stringify(r.notes)}`);
     }
   }
 
