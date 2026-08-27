@@ -18,9 +18,6 @@ export function isGlobPattern(path: string): boolean {
   return GLOB_META.test(path);
 }
 
-/** Escape a character so it matches literally inside a RegExp body. */
-const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
 /** Directories glob expansion refuses to enter: dependencies, VCS state, build output. */
 const DEFAULT_GLOB_IGNORE = [
   "node_modules",
@@ -163,30 +160,84 @@ function expandBracesCapped(pattern: string, budget: WalkBudget): string[] | nul
 }
 
 
-/** Translate one path segment into a RegExp over directory entry names. */
-function compileSegment(seg: string): RegExp {
+/** Token kinds one compiled segment is built from. */
+const LITERAL = 0;
+const STAR = 1;
+const ANY = 2;
+const CLASS = 3;
+
+/**
+ * One path segment compiled into a matcher over directory entry names. This
+ * used to be a RegExp — every `*` a `[^/]*` group — and a name that nearly
+ * matched made V8 try every distribution of its characters across those groups,
+ * exponentially many of them, for seconds at a time and synchronously on the
+ * thread serving every other MCP call (#18). A `test` here runs the two-cursor
+ * glob match instead, whose cost is bounded by the pattern's length whatever
+ * the subject looks like.
+ */
+interface SegmentMatcher {
+  test(name: string): boolean;
+}
+
+/**
+ * The segment an uncompilable character class leaves behind: `[z-a]` cannot
+ * become a matcher, so the segment matches no name at all. The pattern still
+ * gets its note — see compileSegment's `onUncompilable` — so an invalid branch
+ * cannot hide beside a good one; what the note replaces is the thrown error
+ * that used to take the whole call down (the half of #28 that lives here).
+ */
+const MATCHES_NOTHING: SegmentMatcher = { test: () => false };
+
+/**
+ * Translate one path segment into a matcher over directory entry names.
+ *
+ * The tokens are walked with two cursors, the pattern's and the name's, and the
+ * only backtracking there is runs through the most recent `*`: on a mismatch
+ * that star is retried swallowing one more character than last time, and
+ * everything after it replays forward. A star's retry position only ever moves
+ * forward, so a `test` costs at most (tokens × characters) — never the
+ * exponential sweep a `*`-per-group RegExp performs on a near-match.
+ *
+ * Character classes stay RegExps, built exactly as before: a class matches one
+ * character and holds no quantifier, so it cannot backtrack, and keeping the
+ * body text identical keeps its parsing — ranges, `[!]`/`[^]` negation,
+ * escapes, the unclosed and empty forms staying literal — unchanged. One that
+ * will not compile turns the whole segment into MATCHES_NOTHING, and
+ * `onUncompilable` — when the caller passes one — reports it, because a
+ * segment that quietly matches nothing is a pattern the caller never hears
+ * about again: a `{[z-a].ts,ok.ts}` would read its good branch and drop the
+ * bad one without a word, the silent narrowing this file exists to prevent.
+ */
+function compileSegment(seg: string, onUncompilable?: (e: Error) => void): SegmentMatcher {
+  // Hidden entries only match when the pattern spells the dot out, as in minimatch.
   const allowsDot = seg.startsWith(".") || seg.startsWith("\\.");
-  let body = "";
+  const kinds: number[] = [];
+  /** What each token matches: a literal character, or the class's one-character RegExp. */
+  const atoms: (string | RegExp)[] = [];
+  const push = (kind: number, atom: string | RegExp): void => {
+    kinds.push(kind);
+    atoms.push(atom);
+  };
   for (let i = 0; i < seg.length; i++) {
     const c = seg[i];
     if (c === "\\") {
       const next = seg[++i];
-      body += next === undefined ? "\\\\" : escapeRe(next);
+      push(LITERAL, next === undefined ? "\\" : next); // a lone backslash matches itself
       continue;
     }
     if (c === "*") {
       while (seg[i + 1] === "*") i++; // '**' only means something as a whole segment
-      body += "[^/]*";
+      push(STAR, "");
       continue;
     }
     if (c === "?") {
-      body += "[^/]";
+      push(ANY, "");
       continue;
     }
     if (c === "[") {
       const close = closeClass(seg, i);
       if (close >= seg.length) {
-        body += "\\["; // unclosed — treat the bracket literally
+        push(LITERAL, "["); // unclosed — treat the bracket literally
         continue;
       }
       let inner = seg.slice(i + 1, close);
@@ -196,21 +247,59 @@ function compileSegment(seg: string): RegExp {
         inner = inner.slice(1);
       }
       if (inner === "") {
-        body += "\\["; // an empty class matches nothing usable — keep it literal
+        push(LITERAL, "["); // an empty class matches nothing usable — keep it literal
         continue;
       }
-      body += `[${negated}${inner.replace(/[\]\\^]/g, "\\$&")}]`;
+      try {
+        push(CLASS, new RegExp(`[${negated}${inner.replace(/[\]\\^]/g, "\\$&")}]`));
+      } catch (e) {
+        // A reversed range, say — reported through the caller's sink, not thrown.
+        onUncompilable?.(e instanceof Error ? e : new Error(String(e)));
+        return MATCHES_NOTHING;
+      }
       i = close;
       continue;
     }
-    body += escapeRe(c);
+    push(LITERAL, c);
   }
-  // Hidden entries only match when the pattern spells the dot out, as in minimatch.
-  return new RegExp(`^(?:${allowsDot ? "" : "(?!\\.)"}${body})$`);
+  return {
+    test(name: string): boolean {
+      // The old RegExp spelled this `(?!\.)` ahead of the body: a name the
+      // pattern does not spell the leading dot of never matches at all.
+      if (!allowsDot && name.startsWith(".")) return false;
+      let p = 0; // the token being matched
+      let s = 0; // the character of `name` it is matched against
+      let star = -1; // the token a mismatch rewinds to: the most recent `*`
+      let starAt = 0; // where that star's current run through the name began
+      while (s < name.length) {
+        const k = p < kinds.length ? kinds[p] : -1;
+        if (k === STAR) {
+          star = p++;
+          starAt = s;
+          continue;
+        }
+        let ok = false;
+        if (k === ANY) ok = true;
+        else if (k === LITERAL) ok = atoms[p] === name[s];
+        else if (k === CLASS) ok = (atoms[p] as RegExp).test(name[s]);
+        if (ok) {
+          p++;
+          s++;
+          continue;
+        }
+        if (star < 0) return false; // no star to hand the mismatch to
+        s = ++starAt; // the star takes one more character than it did last time…
+        p = star + 1; // …and matching replays forward from just past it
+      }
+      // The name is spent; only stars may remain, each content to match nothing.
+      while (p < kinds.length && kinds[p] === STAR) p++;
+      return p === kinds.length;
+    },
+  };
 }
 
 /** Marker for the one segment that has meaning beyond a single name. */
-type Segment = RegExp | "**";
+type Segment = SegmentMatcher | "**";
 
 /**
  * The one directory name a segment can match, or undefined when wildcards let
@@ -433,6 +522,28 @@ function collect(
     found.add(root + rel);
   };
 
+  // A class that will not compile becomes a note here — in the shape
+  // buildFileContext's catch used to lend the throw — rather than a thrown
+  // error, because a throw abandons the branches after it: `{[z-a].ts,ok.ts}`
+  // lost ok.ts to it. Reported at the sink instead, the pattern as written is
+  // named (b.pattern, braces included) and the good branches still run.
+  const compiled: Segment[] = rest.map((s) =>
+    s === "**"
+      ? "**"
+      : compileSegment(s, (e) =>
+          budgetNote(b, `refused: ${b.pattern} (expansion failed: ${e.message})`),
+        ),
+  );
+  // A segment that cannot compile matches nothing by construction, so walking
+  // for its matches buys nothing — yet the walk reads real directories, and
+  // every entry it examines is billed to the CALL's shared budget, not this
+  // pattern's: a malformed argument would eat the entries an honest pattern
+  // beside it needed. Nothing can be found and nothing can be spent, so every
+  // compiled segment is checked up front, on every route through here — the
+  // fully literal one that never reaches walk() included — rather than where a
+  // walk would first meet the segment, which is one directory read too late.
+  if (compiled.some((s) => s === MATCHES_NOTHING)) return;
+
   // A pattern that stays literal the whole way through names a single path:
   // one file, or nothing — directories are traversed, never listed.
   if (rest.length === 0) {
@@ -444,7 +555,6 @@ function collect(
     return;
   }
 
-  const compiled: Segment[] = rest.map((s) => (s === "**" ? "**" : compileSegment(s)));
   // An ignored directory is entered only where the pattern spells its name out
   // as a whole segment: `node_modules/foo/**` is an explicit request, while the
   // `*` in `*/body-parser/node_modules/...` must not ride a later literal past
