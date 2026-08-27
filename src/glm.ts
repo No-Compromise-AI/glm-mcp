@@ -145,6 +145,11 @@ export const MIN_ANSWER_TOKENS = 1024;
  * The ZCode fallback reads another application's config file, so it is off unless
  * GLM_MCP_ALLOW_ZCODE_KEY=1 is set. Reading a credential a user configured for a
  * different tool should be their explicit choice, not a convenience they discover.
+ *
+ * A file that exists but cannot be read fails in words that name no path (#26):
+ * the message crosses the trust boundary to the caller, and this machine's
+ * directory layout is not the caller's business — the path and the underlying
+ * error go to stderr for the operator.
  */
 export function resolveApiKey(): string {
   const fromEnv = process.env.ZAI_API_KEY?.trim();
@@ -152,7 +157,23 @@ export function resolveApiKey(): string {
 
   const keyFile = join(homedir(), ".config", "zai", "api-key");
   if (existsSync(keyFile)) {
-    const k = readFileSync(keyFile, "utf8").trim();
+    let raw: string;
+    try {
+      raw = readFileSync(keyFile, "utf8");
+    } catch (e) {
+      // #26: the thrown message is what the caller reads, and V8's errno errors
+      // carry the file's absolute path — the account's home directory and
+      // username with it. The caller hears only that the file could not be
+      // read; the path and the underlying error go to stderr, the operator's
+      // channel — stdout is the MCP protocol and stays clean either way.
+      const why = e instanceof Error ? e.message : String(e);
+      console.error(`glm-mcp: could not read the key file ${keyFile}: ${why}`);
+      throw new Error(
+        "The configured z.ai key file could not be read. Check that this " +
+          "server's account is allowed to read it, or set ZAI_API_KEY instead.",
+      );
+    }
+    const k = raw.trim();
     if (k) return k;
   }
 
@@ -162,8 +183,12 @@ export function resolveApiKey(): string {
       const cfg = JSON.parse(readFileSync(zcode, "utf8"));
       const k = cfg?.provider?.["builtin:zai-coding-plan"]?.options?.apiKey;
       if (typeof k === "string" && k.trim()) return k.trim();
-    } catch {
-      /* fall through to the error below */
+    } catch (e) {
+      // Unreadable is not unusable-silently: the caller still gets the plain
+      // guidance below, but the operator who opted in (#21) loses the reason
+      // unless it lands on stderr — the same split as the key file above.
+      const why = e instanceof Error ? e.message : String(e);
+      console.error(`glm-mcp: could not read the ZCode config ${zcode}: ${why}`);
     }
   }
 
@@ -263,6 +288,16 @@ function takeUnits(s: string, maxUnits: number): string {
     : maxUnits;
   return s.slice(0, cut);
 }
+
+/**
+ * The note for a file nothing was read from, whether because it does not exist
+ * or because it exists and cannot be read (#26). The caller got nothing either
+ * way, and telling the two apart — as `not found` and `unreadable` once did —
+ * is an existence-and-permission oracle for anything inside the roots: probe a
+ * spelling, learn whether it names something and whether the server's account
+ * can read it. One wording, spelling out only what the caller itself sent.
+ */
+const skipNote = (p: string): string => `skipped (could not be read): ${p}`;
 
 export interface FileContext {
   text: string;
@@ -431,7 +466,14 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         files.push({ p: m, via: p, resolved: key });
       }
     } catch (e) {
-      notes.push(`refused: ${p} (expansion failed: ${e instanceof Error ? e.message : String(e)})`);
+      // #28: whatever the engine said — V8's wording describes its regex
+      // compiler, not this project — stays on stderr for the operator, and the
+      // caller is told in plain words that the pattern is unusable, next to the
+      // spelling it sent. The note is a refusal like any other: the caller's
+      // other files are still read.
+      const why = e instanceof Error ? e.message : String(e);
+      console.error(`glm-mcp: expanding ${p} failed: ${why}`);
+      notes.push(`refused: ${p} (expansion failed: malformed pattern)`);
       continue;
     }
   }
@@ -456,7 +498,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     try {
       st = statSync(abs);
     } catch {
-      notes.push(`skipped (not found): ${p}`);
+      notes.push(skipNote(p));
       continue;
     }
     // Regular files only (#15): a FIFO blocks the read forever, a device like
@@ -479,7 +521,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     try {
       body = readFileSync(abs, "utf8");
     } catch {
-      notes.push(`skipped (unreadable): ${p}`);
+      notes.push(skipNote(p));
       continue;
     }
     // #19: the header and the separator count toward the cap with the body, so

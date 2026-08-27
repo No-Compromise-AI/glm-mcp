@@ -526,13 +526,17 @@ function collect(
   // buildFileContext's catch used to lend the throw — rather than a thrown
   // error, because a throw abandons the branches after it: `{[z-a].ts,ok.ts}`
   // lost ok.ts to it. Reported at the sink instead, the pattern as written is
-  // named (b.pattern, braces included) and the good branches still run.
+  // named (b.pattern, braces included) and the good branches still run. The
+  // note is this project's own wording (#28): V8's message names its regex
+  // engine's internals, which is the operator's diagnostics, not the caller's
+  // answer — it goes to stderr, stdout being the MCP protocol.
   const compiled: Segment[] = rest.map((s) =>
     s === "**"
       ? "**"
-      : compileSegment(s, (e) =>
-          budgetNote(b, `refused: ${b.pattern} (expansion failed: ${e.message})`),
-        ),
+      : compileSegment(s, (e) => {
+          console.error(`glm-mcp: pattern ${b.pattern} has a segment that will not compile: ${e.message}`);
+          budgetNote(b, `refused: ${b.pattern} (expansion failed: malformed pattern)`);
+        }),
   );
   // A segment that cannot compile matches nothing by construction, so walking
   // for its matches buys nothing — yet the walk reads real directories, and
