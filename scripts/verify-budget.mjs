@@ -59,10 +59,15 @@ const ROOT = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-budget-')));
  * a case can assert on the requests that actually arrived rather than on what
  * the code claims to have sent.
  */
-function child(body, env = {}, timeoutMs = 90_000) {
+function child(body, env = {}, timeoutMs = 90_000, { lazy = false } = {}) {
+  // `lazy` imports the module inside the try instead of at the top. glm.ts
+  // evaluates `baseUrl()` at module scope (`export const BASE_URL = ...`), so a
+  // resolver that REFUSES a bad value throws during import — which a static
+  // import turns into a dead child rather than an observable refusal, and the
+  // rule below has to be able to tell those apart.
   const src = `
 import { createServer } from 'node:http';
-import * as glm from ${JSON.stringify(GLM)};
+${lazy ? '' : `import * as glm from ${JSON.stringify(GLM)};`}
 
 const stubs = [];
 async function upstream({ status = 200, delayMs = 0 } = {}) {
@@ -90,6 +95,7 @@ async function upstream({ status = 200, delayMs = 0 } = {}) {
 
 const out = {};
 try {
+${lazy ? `const glm = await import(${JSON.stringify(GLM)});` : ''}
 ${body}
 } catch (e) {
   out.threw = String(e && e.message ? e.message : e);
@@ -212,6 +218,33 @@ out.text = res.text;`,
       { HOME, USERPROFILE: HOME, ZAI_BASE_URL: 'http://127.0.0.1:1/' });
     if (r.same !== true) {
       fail('#42: two getClient() calls under an unchanged environment returned different clients. Freshness does not require rebuilding on every call — it requires rebuilding when the resolved configuration actually changed.');
+    }
+  }
+
+  // ------ rule 4b: a base URL the operator SET is never silently replaced
+  // Normalising the endpoint is for COMPARING it against the spelling the
+  // cached client was built with — never for deciding what to send. The
+  // difference matters because ZAI_BASE_URL is how an operator scopes egress
+  // (#22): a value that normalises to nothing must not fall back to the
+  // default, or `ZAI_BASE_URL="${HOST}/"` with HOST unset quietly ships the
+  // bearer token to api.z.ai instead of failing. Before this rule existed, "/"
+  // did exactly that; the unnormalised code sent an invalid URL the SDK
+  // rejected, so the fix for #42 made the scoping weaker than it found it.
+  {
+    const unset = child(`out.url = glm.baseUrl();`, { HOME, USERPROFILE: HOME, ZAI_BASE_URL: undefined });
+    if (!unset.url) fail(`#42: baseUrl() returned nothing with ZAI_BASE_URL unset — ${JSON.stringify(unset.threw ?? unset)}`);
+    const DEFAULT = unset.url;
+
+    // Every one of these is SET, and none of them names an endpoint. The rule
+    // is about the class, not these spellings: whatever an operator wrote,
+    // resolving it to the default is the one answer that must not happen.
+    for (const value of ['/', '//', '///', ' ', '  /  ', '\t']) {
+      const r = child(`out.url = glm.baseUrl();`,
+        { HOME, USERPROFILE: HOME, ZAI_BASE_URL: value }, 90_000, { lazy: true });
+      if (r.threw) continue;                 // refusing is the other right answer
+      if (r.url === DEFAULT) {
+        fail(`#42: ZAI_BASE_URL=${JSON.stringify(value)} resolved to the default endpoint ${DEFAULT}. That variable is how an operator scopes egress, so a value they SET must never be silently replaced by the vendor's own host — "\${HOST}/" with HOST unset would ship the bearer token to z.ai rather than fail. Normalise for the comparison that decides whether to rebuild the client; send what the operator wrote, or refuse.`);
+      }
     }
   }
 
