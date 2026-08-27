@@ -29,6 +29,7 @@
     "verify:api": "node scripts/verify-api.mjs",
     "verify:capacity": "node scripts/verify-capacity.mjs",
     "verify:disclosure": "node scripts/verify-disclosure.mjs",
+    "verify:supplychain": "node scripts/verify-supplychain.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
