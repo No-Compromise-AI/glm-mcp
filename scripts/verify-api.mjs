@@ -351,12 +351,25 @@ for (const cap of ${JSON.stringify([1, 100, 1024, 2047, 2048, 2049, 3000, 4096, 
     fail('#20: no cap in the sweep produced a request — the largest ones must work');
   }
 
-  // Reasoning off, on a model that permits it: nothing is inflated.
+  // Reasoning off, on a model that permits it: nothing is inflated — the cap
+  // is exact. This check's third assertion used to demand NO thinking block,
+  // because absence was what "off" looked like when #20 was written; that was
+  // the #60 defect, escalated rather than worked around: omitting `thinking`
+  // is z.ai's documented `enabled` default, so the very absence this gate
+  // asked for was what silently reasoned. It now asks for the intent stated
+  // out loud — a disabled block, with no budget on it — which is the property
+  // under #60's contract rather than a number (or an absence) pinned from the
+  // world before it.
   r = ask({ prompt: 'hi', model: 'glm-4.6', reasoning: 'none', maxTokens: 100 });
   sent = r.seen?.[0]?.body;
   if (!sent) fail(`#20: no request captured with reasoning off — ${JSON.stringify(r.threw ?? r)}`);
   if (sent.max_tokens !== 100) fail(`#20: with reasoning off, max_tokens must be exactly what was asked — got ${sent.max_tokens}`);
-  if (sent.thinking) fail(`#20: reasoning "none" must send no thinking block — got ${JSON.stringify(sent.thinking)}`);
+  if (sent.thinking?.type !== 'disabled') {
+    fail(`#60: reasoning "none" must send an explicit disabled block — got ${sent.thinking === undefined ? 'no thinking parameter at all, which z.ai defaults to "enabled"' : JSON.stringify(sent.thinking)}`);
+  }
+  if (sent.thinking?.budget_tokens !== undefined) {
+    fail(`#60: a disabled thinking block carried budget_tokens ${sent.thinking.budget_tokens} — disabled and a budget are contradictory`);
+  }
 } finally {
   rmSync(fixture, { recursive: true, force: true });
 }
