@@ -25,6 +25,7 @@
     "verify:confinement": "node scripts/verify-confinement.mjs",
     "verify:limits": "node scripts/verify-limits.mjs",
     "verify:redos": "node scripts/verify-redos.mjs",
+    "verify:release": "node scripts/verify-release.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
