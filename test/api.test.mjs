@@ -230,14 +230,19 @@ test('#25 a code the message itself labels as a code still maps', () => {
 });
 
 test('#25 a code is a whole token, not the prefix of one', () => {
-  // `1113abc` and `1113_retry` are different codes from `1113`. A guard that
-  // stops a trailing digit but not a trailing letter or underscore explains a
+  // `1113abc`, `1113_retry`, `1113-retry`, `1113.0` and `1113é` are all
+  // different codes from `1113`. A guard that stops a trailing digit but not a
+  // trailing letter, underscore, hyphen, dot or accented letter explains a
   // vendor-suffixed code as the bare code's problem — the same mistake the bare
   // substring made, one character narrower.
   const suffixed = [
     '400 {"error":{"code":"1113abc"}}',
     '400 {"error":{"code":"1113_retry"}}',
+    '400 {"error":{"code":"1113-retry"}}',
+    '400 {"error":{"code":"1113.0"}}',
+    '400 {"error":{"code":"1113é"}}',
     '400 {"error":{"code":"1210x"}}',
+    '400 {"error":{"code":"1210.1"}}',
   ];
   for (const message of suffixed) {
     const explained = explainError(new Error(message));
@@ -247,8 +252,11 @@ test('#25 a code is a whole token, not the prefix of one', () => {
     }
     assert.ok(explained.includes(message), 'a code that is not ours to explain passes through untranslated');
   }
-  // The whole value still maps — the guard narrows the token, not the code.
+  // The whole value still maps — the guard narrows the token, not the code —
+  // in the quoted form and in the labelled prose one, where a space, not a
+  // value character, follows the digits.
   assert.match(explainError(new Error('400 {"error":{"code":"1113"}}')), BALANCE);
+  assert.match(explainError(new Error('Error code: 1113 - {"error":{}}')), BALANCE);
 });
 
 test('#25 an error nobody has a translation for passes through unchanged', () => {

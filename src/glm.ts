@@ -497,10 +497,13 @@ function zaiCode(e: unknown): string | undefined {
   const fromBody = body?.error?.code ?? body?.code;
   if (typeof fromBody === "number" || typeof fromBody === "string") return String(fromBody);
   const msg = e instanceof Error ? e.message : String(e);
-  // A code is a whole token, so the digits must end where the code's value
-  // ends: `1113abc` and `1113_retry` are different codes from `1113`, exactly
-  // as `11130` is, and none of them may be read as the bare code.
-  const labelled = /\bcode\b["']?\s*[:=]?\s*["']?(?<!\w)(\d+)(?!\w)/i.exec(msg);
+  // A code is a whole token, so the digits must run the whole length of the
+  // code's value: they may not touch, on either side, a character a code value
+  // can carry — a letter in any script, a digit, `_`, `-` or `.`. `1113abc`,
+  // `1113-retry`, `1113.0` and `1113é` are all different codes from `1113`,
+  // exactly as `11130` is, and none of them may be read as the bare code.
+  const labelled =
+    /\bcode\b["']?\s*[:=]?\s*["']?(?<![\p{L}\p{N}_.-])(\d+)(?![\p{L}\p{N}_.-])/iu.exec(msg);
   return labelled?.[1];
 }
 
