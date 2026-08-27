@@ -348,6 +348,42 @@ function takeUnits(s: string, maxUnits: number): string {
  */
 const skipNote = (p: string): string => `skipped (no matches): ${p}`;
 
+/**
+ * How many leading bytes are inspected for a NUL before a file is believed to
+ * be text. 8,000 is git's own sniffing length and the conventional one: no
+ * human-written text encoding contains a NUL, while nearly every binary
+ * format is dense with them.
+ */
+const BINARY_SNIFF_BYTES = 8_000;
+
+const REPLACEMENT_CHAR = "\u{FFFD}";
+
+/**
+ * Whether a file's bytes are binary rather than text (#39). A NUL in the
+ * first {@link BINARY_SNIFF_BYTES} bytes is the cheap, conventional verdict.
+ * The backstop catches the binary formats that happen to hold no zero byte:
+ * undecodable UTF-8 decodes to U+FFFD, so a body that is one replacement
+ * character in ten or more is bytes the model cannot read. The ratio is
+ * deliberately high — a text file carrying a few literal replacement
+ * characters (itself mojibake, but its author's) is still read, and accented
+ * Latin, CJK and emoji are valid UTF-8 and ordinary source; a detector that
+ * rejects them would be worse than the bug it exists to fix.
+ */
+function isBinary(raw: Buffer): boolean {
+  if (raw.subarray(0, BINARY_SNIFF_BYTES).includes(0)) return true;
+  const body = raw.toString("utf8");
+  let replacements = 0;
+  for (
+    let i = body.indexOf(REPLACEMENT_CHAR);
+    i !== -1;
+    i = body.indexOf(REPLACEMENT_CHAR, i + 1)
+  ) {
+    replacements++;
+    if (replacements * 10 >= body.length) return true;
+  }
+  return false;
+}
+
 export interface FileContext {
   text: string;
   notes: string[];
@@ -402,29 +438,36 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // The walk-wide limits of decision 5 (#16, #17), shared by every pattern of
   // this call: depth, entries and the wall clock are budgets of the call, not
   // of each pattern, and every limit note lands here. A note also means part of
-  // this entry's expansion was stopped, which is why `limitedPatterns`
+  // this entry's expansion was stopped, which is why `limitedArgs`
   // suppresses the "no matches" note below — a pattern cut short by a limit is
   // not a pattern that matched nothing, and reading it as one is the silent
-  // truncation decision 5 exists to end. The suppression is per pattern: the
-  // sink records WHICH patterns have been limited — expansion sets
-  // budget.pattern before any walk can trip — so a limit stops the pattern
-  // that hit it and leaves the rest of the call alone instead of swallowing
-  // their notes too. Every pattern it limited, never only the latest one: the
-  // sink de-duplicates a repeated note, so its callback does not fire a second
-  // time for a pattern it has already recorded, and a single slot would go
-  // stale the moment a later pattern tripped a limit of its own.
-  const limitedPatterns = new Set<string>();
-  // The patterns whose walk a confinement refusal cut short, the other half of
+  // truncation decision 5 exists to end. The suppression is by ARGUMENT
+  // POSITION, the one fact everything in this function is answered on (#40):
+  // the sink records which positions were stopped, so a limit silences the
+  // argument whose walk hit it and nobody else. Keying it by the spelling the
+  // walk was named after excused every occurrence of a repeated spelling at
+  // once: under a tight entries budget,
+  // ['src/glm.ts', 'src/gl[m].ts', 'src/gl[m].ts'] trips the limit only on the
+  // second glob's walk, and the first glob — which completed, contributed
+  // nothing its own argument could claim, and was owed an answer — was
+  // silenced by a limit that happened to somebody else, one note short of one
+  // per argument.
+  const limitedArgs = new Set<number>();
+  // The arguments whose walk a confinement refusal cut short, the other half of
   // "stopped" — a "no matches" note would misdescribe those exactly as it
-  // misdescribes a limited one, wherever about them it is filed.
-  const refusedPatterns = new Set<string>();
+  // misdescribes a limited one, wherever about them it is filed. Keyed by
+  // position for the same reason as the limits: the refusal stops the argument
+  // whose walk it pruned, and an argument that shares its spelling but was
+  // stopped differently — or not stopped at all — is answered on its own
+  // position.
+  const refusedArgs = new Set<number>();
   // The argument being worked. The budget's note sink and the mid-walk refusal
   // callback fire from inside glob.ts's own loops, synchronously within the
   // iteration they belong to, so this is how they learn which argument to file
   // their note under.
   let argAt = -1;
   const budget = walkBudget((msg) => {
-    limitedPatterns.add(budget.pattern);
+    limitedArgs.add(argAt);
     notes.push({ arg: argAt, msg });
   });
   const maxFileBytes = envLimit("GLM_MCP_MAX_FILE_BYTES", DEFAULT_MAX_FILE_BYTES);
@@ -467,23 +510,26 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // argument, so the notes the reads push are filed under it too.
   const files: Array<{ p: string; via: string; resolved: string; arg: number }> = [];
   const included = new Set<string>();
-  // Every pattern of this call and the resolved matches it found — the
-  // de-duplicated ones too, because the note these exist to write asks the
-  // pattern a question (did it contribute anything?) that a match claimed by
-  // an earlier entry still answers. A Map, so a spelling repeated in the
-  // argument list pools one found-set instead of walking twice — but the note
-  // is owed to every argument that sent the spelling, not to the spelling,
-  // because the literal route answers each repetition separately and the count
-  // of answers is itself an answer: merge them and a caller learns whether a
-  // repeated spelling named a file by counting what came back.
-  const patternMatches = new Map<string, { found: Set<string> }>();
-  // The files this result already speaks for, by resolved identity: one
-  // delivered its content, was truncated, or was refused in a note naming
-  // it. A file that yielded nothing readable is deliberately not here — that
-  // absence is what tells the answer at the end which arguments contributed
-  // nothing at all, and it is why a refusal marks its file: refused is not
-  // absent, and filing a refused entry under "no matches" would claim it was.
-  const spokenFor = new Set<string>();
+  // The ARGUMENT POSITIONS this result already speaks for: the position's
+  // own entry — the one its spelling created, never one an earlier argument
+  // claimed first — delivered content, was truncated, or was refused in a
+  // note naming it. This, and only this, is what "the argument arrived"
+  // means (#40): arrival is a fact about a POSITION, not about a key. Keying
+  // it by the resolved file credited a later argument with an earlier one's
+  // read, and keying it by the spelling credited a repeat with its twin's —
+  // and either way the note COUNT came to answer "does this file exist?"
+  // (#26): a symlink twin de-duplicating against an earlier argument was
+  // answered with a silence an absent twin answered with a note, though
+  // nothing was read on the third argument's behalf in either world. The
+  // position is the caller's own fact, computable from the argument list
+  // alone, so every arrangement of one spelling — repeated, aliased,
+  // overlapping, cut off by the cap — is answered exactly as the arrangement
+  // that matched nothing at all. An argument that yielded nothing readable
+  // is deliberately not here: that absence is what tells the answer at the
+  // end which arguments contributed nothing, and it is why a refusal marks
+  // its argument — refused is not absent, and filing a refused entry under
+  // "no matches" would claim it was.
+  const spokenArgs = new Set<number>();
   // One answer owed to each argument, written when the reads have settled
   // (#26). The literal route used to say its note at once and the pattern
   // route only after the reads; the answer is owed to the ARGUMENT either
@@ -493,12 +539,20 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // still got nothing it could not equally have got from the file not
   // existing, and that is the answer it receives. First appearance is the
   // arguments' own order, so the answers already read in it.
-  const pendings: Array<
-    | { arg: number; via: string; kind: "literal"; key: string }
-    | { arg: number; via: string; kind: "pattern"; found: Set<string> }
-  > = [];
+  const pendings: Array<{ arg: number; via: string }> = [];
   for (const [arg, p] of paths.entries()) {
     argAt = arg;
+    // One note per argument per limit, never one per spelling. budgetNote
+    // de-duplicates on the message text, and every limit note names the
+    // pattern it stopped, so two arguments sending the same spelling produce
+    // byte-identical messages — and the de-dup ate the second argument's note
+    // whole: `['[z-a].txt', '[z-a].txt']` walked and refused both, and said so
+    // once. Clearing the de-dup at each argument keeps what it existed for —
+    // a walk that prunes a hundred directories at the depth cut-off is still
+    // one note, because the reset happens between arguments, never inside a
+    // walk — while making the scope of "once" the argument, the unit every
+    // other once-per here is counted in (#40).
+    budget.said.clear();
     // The credential rule runs before any existence check (decision 3), so
     // /proc/self/environ is reported as refused, not missing, where it does
     // not exist. A path that exists on disk is then read literally — judged
@@ -519,11 +573,12 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       if (!included.has(resolved)) {
         if (roots && !insideRoots(resolved, roots)) {
           notes.push({ arg, msg: `refused: ${p} resolves outside the allowed roots` });
-          // The refusal speaks for the file, so an entry naming the same
-          // identity later is neither re-refused nor filed under "no
-          // matches": refused is not absent, and this note already says it.
+          // The refusal speaks for this argument, which gets no pending of
+          // its own; an entry naming the same identity later is neither
+          // re-refused nor folded into this note, but answered for its own
+          // position below — refused is not absent, and a later argument
+          // naming the same file still got nothing of its own.
           included.add(resolved);
-          spokenFor.add(resolved);
           continue;
         }
         included.add(resolved);
@@ -531,7 +586,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       }
       // Registered whether this argument created the file entry or was
       // de-duplicated into an earlier one — see pendings.
-      pendings.push({ arg, via: p, kind: "literal", key: resolved });
+      pendings.push({ arg, via: p });
       continue;
     }
     // Limits are notes, never throws — and that goes for hostile input this
@@ -549,23 +604,19 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       // match would carry, so the note names both it and the pattern that
       // reached it.
       const matches = expandGlob(p, cwd, roots ?? undefined, (refused) => {
-        refusedPatterns.add(p);
+        refusedArgs.add(arg);
         notes.push({
           arg,
           msg: `refused: ${refused} (matched by ${p}) resolves outside the allowed roots`,
         });
       }, budget);
-      // Every match is recorded against the pattern, de-duplicated or not;
-      // a pattern that matched nothing is recorded the same way, with no
-      // matches. The answer this feeds is written after the reads, because
-      // whether an argument contributed anything is known only then. A pending
-      // per argument that sent the spelling — see patternMatches above.
-      let rec = patternMatches.get(p);
-      if (!rec) patternMatches.set(p, (rec = { found: new Set<string>() }));
-      pendings.push({ arg, via: p, kind: "pattern", found: rec.found });
+      // The answer this argument is owed is written after the reads have
+      // settled, because whether it arrived is known only then. A pending per
+      // argument that sent the spelling — the walk above is per argument too,
+      // but de-duplication decides what is read, not what the caller is told.
+      pendings.push({ arg, via: p });
       for (const m of matches) {
         const key = keyOf(m);
-        rec.found.add(key);
         if (included.has(key)) continue;
         included.add(key);
         files.push({ p: m, via: p, resolved: key, arg });
@@ -583,6 +634,13 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     }
   }
 
+  // #40: the argument whose read the char cap cut, or -1 when it never cut.
+  // Files are read in argument order, so everything from here on was never
+  // attempted — and the pendings loop below needs to know it, because the
+  // answer it owes those arguments is not the one it owes an argument that
+  // was read and yielded nothing.
+  let capCutAt = -1;
+
   for (const { p, via, resolved, arg } of files) {
     // Re-checked at read time because a glob match may be a symlink whose
     // target leaves the roots only once resolved; the anchor could not see it.
@@ -591,7 +649,9 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         arg,
         msg: `refused (credential path): ${p}${via === p ? "" : ` (matched by ${via})`}`,
       });
-      spokenFor.add(resolved);
+      // The refusal is this argument's one note: it speaks for the position,
+      // so the answer below stays silent about it.
+      spokenArgs.add(arg);
       continue;
     }
     if (roots && !insideRoots(resolved, roots)) {
@@ -599,7 +659,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         arg,
         msg: `refused: ${p}${via === p ? "" : ` (matched by ${via})`} resolves outside the allowed roots`,
       });
-      spokenFor.add(resolved);
+      spokenArgs.add(arg);
       continue;
     }
     const abs = resolve(cwd, p);
@@ -620,7 +680,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     const matchedBy = via === p ? "" : ` (matched by ${via})`;
     if (!st.isFile()) {
       notes.push({ arg, msg: `refused (not a regular file): ${p}${matchedBy}` });
-      spokenFor.add(resolved);
+      spokenArgs.add(arg);
       continue;
     }
     if (st.size > maxFileBytes) {
@@ -629,18 +689,35 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         msg: `refused (too large): ${p}${matchedBy} is ${st.size} bytes, over the ` +
           `GLM_MCP_MAX_FILE_BYTES limit of ${maxFileBytes}`,
       });
-      spokenFor.add(resolved);
+      spokenArgs.add(arg);
       continue;
     }
-    let body: string;
+    let raw: Buffer;
     try {
-      body = readFileSync(abs, "utf8");
+      raw = readFileSync(abs);
     } catch {
       continue; // nothing was read; the argument's answer below says so
     }
+    // #39: the bytes are judged before they become text. Decoding a binary
+    // file as UTF-8 turns every undecodable byte into U+FFFD and flows it
+    // into the prompt — silently spending the char budget on characters the
+    // model cannot read, which since #35 is a budget with room for whole
+    // images and fonts to crowd out the source the caller asked about. The
+    // file is skipped and named instead, and because nothing of it enters
+    // the prompt, none of its bytes count against the budget.
+    if (isBinary(raw)) {
+      notes.push({ arg, msg: `skipped (binary file): ${p}${matchedBy}` });
+      // The note speaks for the argument, so its answer below does not add
+      // `no matches` beside it — skipped is not absent.
+      spokenArgs.add(arg);
+      continue;
+    }
+    const body = raw.toString("utf8");
     // Content will be delivered — in full or truncated — so the result
-    // speaks for this file either way.
-    spokenFor.add(resolved);
+    // speaks for this argument either way: THIS entry was read on its
+    // behalf, and an entry read on an argument's behalf is the one thing
+    // that credits the argument with having arrived.
+    spokenArgs.add(arg);
     // #19: the header and the separator count toward the cap with the body, so
     // 300 empty files cannot produce a five-figure prompt under a
     // multimillion-char "cap" with no note. `total` is the assembled length so
@@ -659,16 +736,32 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         chunks.push(`${sep}${theader}${taken}`);
         total += (sep ? 2 : 0) + theader.length + taken.length;
       }
+      // #40, at argument granularity: the note says where the cut began by
+      // naming the ARGUMENT that was being read — `via`, the caller's own
+      // spelling — never the file. For a literal the two are the same string,
+      // and naming it tells the caller nothing it did not supply. For a
+      // pattern's match the filename is something the caller would be
+      // LEARNING — it sent the pattern — and naming which match the cap
+      // reached, or which matches it never reached, can only happen for files
+      // that exist, which is #26's existence oracle wearing the cap's hat.
+      // What the caller needs in order to curate and retry is which of ITS
+      // arguments did not fully arrive, and an argument is something it
+      // already knows. The truncated match's partial body still stands in the
+      // text under its own (truncated) header, so the model loses nothing;
+      // the note keeps to the caller's side of the boundary. This one note is
+      // also that argument's whole answer: the entry was read on its behalf,
+      // so the pendings loop below stays silent about it and the argument is
+      // said exactly once.
       notes.push({
         arg,
-        msg: `truncated at ${MAX_FILE_CHARS} total chars starting with: ${p}`,
+        msg: `truncated at ${MAX_FILE_CHARS} total chars starting with: ${via}`,
       });
       // The cap cut the loop here, so the entries after this one were never
-      // attempted — and each is still answered below, exactly as a pattern
-      // after the cut always was. Silencing the literals among them was this
-      // oracle wearing the cap's hat: which branch an entry took is decided
-      // by whether the file exists, so a literal silenced where a pattern
-      // would be noted tells a caller the named file is there.
+      // attempted. `capCutAt` records whose read was underway (#40): every
+      // argument from here on is answered below as never read rather than as
+      // having matched nothing, so the caller can tell what reached the model
+      // and retry with a curated list — the only useful thing it can do next.
+      capCutAt = arg;
       break;
     }
     chunks.push(`${sep}${header}${body}`);
@@ -676,36 +769,65 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   }
 
   // The reads have settled, so every argument can be answered now, in the
-  // arguments' own order (#26). The question is the same for a literal and a
-  // pattern alike: did anything this argument names appear in the result?
-  // Nothing spoken for — not delivered, not truncated, not refused in a note
-  // naming it — and the argument is told `no matches`, the one wording,
-  // because the caller must not be able to tell the reasons apart: the
-  // branch its entry took was chosen by whether the file exists, so a
-  // difference between the reasons is a difference about the machine. A
-  // pattern some of whose matches WERE read says nothing — `no matches`
-  // beside content that came from this very pattern would not be the truth,
-  // and the note would still disclose that another of its matches existed
-  // and could not be read. And a pattern whose walk was stopped — by a
-  // limit, or by a boundary refusal — is excused entirely: refused is not
-  // the same as absent, that note already speaks for it, and "no matches"
-  // beside it would claim it was simply wrong.
+  // arguments' own order (#26). The question is one question for a literal
+  // and a pattern alike, and it is about the POSITION: did anything arrive
+  // ON THIS ARGUMENT'S BEHALF — was the entry this argument's own spelling
+  // created delivered, truncated, or refused in a note naming it? Nothing
+  // was, and the argument is named, whatever the reason: it matched nothing,
+  // its match was unreadable, its file had already been read through another
+  // spelling, or the cap cut before its turn. The reasons differ only in
+  // ways that depend on what exists on disk, which is precisely what must
+  // not be inferable (#26) — the branch an entry takes is chosen by whether
+  // the file exists, so both the silence and the note of any finer test
+  // would vary with the machine's answer. Five arrangements of one spelling
+  // (repeated, overlapping, a metacharacter twin, a symlink twin, the cap
+  // landing on someone else's file) each closed one case and revealed the
+  // next because arrival was inferred from what was READ rather than tracked
+  // per argument; per position it needs no lookup of what else happened, so
+  // there is no next arrangement to reveal. The one exception is an argument
+  // whose walk was stopped — by a limit, or by a boundary refusal: refused
+  // is not the same as absent, that note already speaks for it, and "no
+  // matches" beside it would claim it was simply wrong.
+  //
+  // The answer an unfulfilled argument receives (#40). Before the cap cuts
+  // the reads it is `no matches`, the merged wording #26 settled on, because
+  // whether the file was absent or unreadable must not be tellable. From the
+  // cut on it changes: those arguments were never read, and saying `no
+  // matches` about a file that is sitting there unread forecloses the retry
+  // the note exists to enable. The line is drawn at the argument POSITION the
+  // cap cut at, never at whether a file entry exists for the argument —
+  // position is the caller's own choice and existence is the machine's
+  // answer, so a wording that depended on it would reopen the oracle #26
+  // closed: absent, unreadable and simply-never-reached must all produce this
+  // same note.
+  const answerNote = (pending: (typeof pendings)[number]): string =>
+    capCutAt >= 0 && pending.arg >= capCutAt
+      ? `skipped (char cap reached, not read): ${pending.via}`
+      : skipNote(pending.via);
+
   for (const pending of pendings) {
-    if (pending.kind === "literal") {
-      if (!spokenFor.has(pending.key)) {
-        notes.push({ arg: pending.arg, msg: skipNote(pending.via) });
-      }
-      continue;
-    }
-    if (limitedPatterns.has(pending.via) || refusedPatterns.has(pending.via)) continue;
-    let contributed = false;
-    for (const key of pending.found) {
-      if (spokenFor.has(key)) {
-        contributed = true;
-        break;
-      }
-    }
-    if (!contributed) notes.push({ arg: pending.arg, msg: skipNote(pending.via) });
+    // An argument whose walk a limit or a boundary refusal cut short is excused
+    // entirely — see the comment above answerNote. By position: the excuse is
+    // that THIS argument already has a note speaking for it, and the argument
+    // that hit the limit is the one that was being walked, not every argument
+    // that happens to spell the same pattern.
+    if (limitedArgs.has(pending.arg) || refusedArgs.has(pending.arg)) continue;
+    // The one test, on the caller's own fact: did a file arrive on THIS
+    // position's behalf? Not "was its file spoken for" — an earlier argument
+    // may have read, truncated or blown the cap on that very file, and the
+    // third argument of ['a.md', 'big.txt', 'a[.]md'] with big.txt exhausting
+    // the cap was the shape that proved it: a symlink twin de-duplicating
+    // into a.md was answered with a silence an absent twin answered with a
+    // note, and the count of notes said which world it was. Not "was its
+    // spelling spoken for" either — a repeated spelling rides an earlier
+    // argument's credit the same way. The entry set is not consulted at all:
+    // which entries exist is decided by what matches on disk, so both a
+    // silence and a note computed from it would vary with existence. The
+    // position is settled the moment the caller writes the list, which is
+    // why this is the last arrangement: every spelling of "nothing was read
+    // for me" — matched nothing, unreadable, already read through another
+    // spelling, never reached past the cap — answers here identically.
+    if (!spokenArgs.has(pending.arg)) notes.push({ arg: pending.arg, msg: answerNote(pending) });
   }
 
   // The separators were budgeted per chunk above, so joining is the identity:
@@ -732,6 +854,13 @@ export interface AskResult {
   thinkingChars: number;
   model: string;
   usage: { input: number; output: number; cacheRead: number };
+  /**
+   * Why the answer ended, exactly as the API reported it (#41). "end_turn" is
+   * a finished answer; "max_tokens" is one the output cap severed mid-reply,
+   * which a caller must be able to tell from a complete second opinion — the
+   * footer in index.ts says it where the caller already reads the result.
+   */
+  stopReason: string | undefined;
 }
 
 export async function ask(args: AskArgs): Promise<AskResult> {
@@ -801,6 +930,7 @@ export async function ask(args: AskArgs): Promise<AskResult> {
 
   const res = (await getClient().messages.create(body as never)) as {
     model?: string;
+    stop_reason?: string;
     content?: Array<{ type: string; text?: string; thinking?: string }>;
     usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number };
   };
@@ -821,6 +951,7 @@ export async function ask(args: AskArgs): Promise<AskResult> {
       output: res.usage?.output_tokens ?? 0,
       cacheRead: res.usage?.cache_read_input_tokens ?? 0,
     },
+    stopReason: res.stop_reason,
   };
 }
 

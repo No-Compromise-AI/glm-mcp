@@ -20,7 +20,7 @@
     "prepare": "npm run build",
     "start": "node dist/index.js",
     "smoke": "node scripts/smoke.mjs",
-    "test": "npm run build && node --test test/glob.test.mjs test/api-key.test.mjs test/confinement.test.mjs test/limits.test.mjs test/redos.test.mjs test/api.test.mjs test/capacity.test.mjs test/disclosure.test.mjs",
+    "test": "npm run build && node --test test/glob.test.mjs test/api-key.test.mjs test/confinement.test.mjs test/limits.test.mjs test/redos.test.mjs test/api.test.mjs test/capacity.test.mjs test/disclosure.test.mjs test/completeness.test.mjs",
     "verify:ignore": "node scripts/verify-ignore.mjs",
     "verify:globs": "node scripts/verify-globs.mjs",
     "verify:confinement": "node scripts/verify-confinement.mjs",
@@ -31,6 +31,7 @@
     "verify:capacity": "node scripts/verify-capacity.mjs",
     "verify:disclosure": "node scripts/verify-disclosure.mjs",
     "verify:supplychain": "node scripts/verify-supplychain.mjs",
+    "verify:completeness": "node scripts/verify-completeness.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

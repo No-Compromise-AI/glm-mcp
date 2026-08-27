@@ -47,6 +47,7 @@ jobs:
       - run: npm run verify:capacity
       - run: npm run verify:disclosure
       - run: npm run verify:supplychain
+      - run: npm run verify:completeness
 
   build:
     # Deliberately NO id-token here. This job runs repository code; it must not

@@ -429,9 +429,12 @@ test('a unix socket is refused as not a regular file, its neighbour survives', (
 
 test('headers and separators count toward GLM_MCP_MAX_FILE_CHARS', (t) => {
   const r = childCtx(t, { paths: ['many/*.txt'], env: { GLM_MCP_MAX_FILE_CHARS: 2000 } });
+  // The truncation note names the ARGUMENT the cut began at (#40): a
+  // pattern's match is a filename the caller would be learning, and naming
+  // it — or the matches past the cut — says which files exist (#26).
   assert.ok(
-    r.notes.some((n) => /truncat/i.test(n) && n.includes('many/empty-')),
-    `300 empty files must be truncated and noted: ${JSON.stringify(r.notes)}`,
+    r.notes.some((n) => /truncat/i.test(n) && n.includes('many/*.txt')),
+    `300 empty files must be truncated and noted, naming the argument: ${JSON.stringify(r.notes)}`,
   );
   assert.ok(r.text.length <= 2000, `assembled text is ${r.text.length} chars against a 2,000-char cap`);
 });
