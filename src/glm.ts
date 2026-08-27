@@ -165,24 +165,38 @@ function comparableEndpoint(url: string): string {
  * they did not. #22 made ZAI_BASE_URL the egress-scoping knob, so the two
  * states are not interchangeable: an operator who scoped where the key goes
  * did not scope it so that a mistyped value would fall back to the vendor's
- * own host. And whether a SET value names an endpoint at all is answered the
- * one way it can be — by trying to make a URL of the exact string the SDK
- * will parse at request time, base and request path already joined — never
- * of the base alone, and never by deleting characters and
- * judging what is left: two rounds went to that, each fix closing the
- * spellings it knew ("/", "//", whitespace) and the next arrangement
- * ("/ /", "//\t//") walking through, because a rule written against a
- * character class always has one more spelling outside it. A value no request
- * URL can be made of — which is exactly what `ZAI_BASE_URL="${HOST}/"` with
- * HOST unset leaves — is refused here, naming the variable, rather than
- * replaced. That the question is asked of the JOIN and not of the base bare
- * is the third round's lesson: `ZAI_BASE_URL="http://host "` parses bare,
- * because the parser drops a trailing space, while the joined
- * `http://host /v1/messages` has that space inside the authority, where no
- * URL can be made of it — so a resolver asking the easier question started
- * servers whose every glm_ask failed with the SDK's anonymous "Invalid URL",
- * the late unnamed failure the refusal exists to prevent, one character class
- * later.
+ * own host. And whether a SET value names an endpoint at all is a question
+ * about HOSTS, not about strings: two rounds went to enumerating spellings
+ * ("/", "//", whitespace; then "/ /", "//\t//"), and each fix closed only the
+ * arrangement it knew because a rule written against a character class always
+ * has one more spelling outside it. The question is asked twice below, of two
+ * different strings, and both answers have to agree:
+ *
+ *   1. the value ITSELF must parse as a URL with a non-empty host — the
+ *      value bare, before anything is appended, because appending can
+ *      MANUFACTURE a host: "http://" is not a URL on its own, but
+ *      "http://" + "v1/messages" is, and its host is `v1`. The resolver this
+ *      replaced asked only that joined question, so it accepted
+ *      `ZAI_BASE_URL="http://"` — and "http:", "https:/" and every other
+ *      partial scheme — and the bearer token left for a host called `v1`
+ *      that nobody configured. "Can a URL be made of it" is a question about
+ *      a string DERIVED from the value; egress is scoped by the value, so
+ *      the value itself has to name where it goes.
+ *
+ *   2. the request built from the value must reach that SAME host — the
+ *      SDK's own join of base and /v1/messages, the exact string its
+ *      buildURL() parses at request time. This is the third round's lesson
+ *      in the other direction: `ZAI_BASE_URL="http://host "` passes question
+ *      1, because the parser drops a trailing space, while the joined
+ *      `http://host /v1/messages` has that space inside the authority, where
+ *      no URL can be made of it — so a resolver asking only the easier
+ *      question started servers whose every glm_ask failed with the SDK's
+ *      anonymous "Invalid URL", the late unnamed failure the refusal exists
+ *      to prevent.
+ *
+ * A value that fails either question — which is exactly what
+ * `ZAI_BASE_URL="${HOST}/"` with HOST unset leaves — is refused here, naming
+ * the variable, rather than replaced.
  *
  * Refusing rather than sending the value as written for the SDK to reject (the
  * behaviour before #42) is a deliberate choice with two grounds. The SDK does
@@ -204,32 +218,37 @@ function comparableEndpoint(url: string): string {
 export function baseUrl(): string {
   const raw = process.env.ZAI_BASE_URL;
   if (raw === undefined) return DEFAULT_BASE_URL;
-  // The parse is a TEST, not a normalisation. A value that passes is returned
-  // exactly as written — the operator's spelling is what gets sent, spaces,
-  // extra slashes and all, and the href of the parse is not consulted, because
-  // what is SENT is not the parse's business (comparableEndpoint owns the one
-  // job a normalised form has: comparing). A value that fails is refused.
-  // Nothing here trims or strips, because every such rule has a spelling
-  // outside it. And the string parsed is the SDK's own join, not the value
-  // bare — the SDK's buildURL() asks `new URL(baseURL + "/v1/messages")` at
-  // request time, minus the path's leading slash where the base supplies its
-  // own trailing one, and the bare question does not agree with it: the
-  // parser DROPS a trailing space off a bare value and REJECTS it once the
-  // request path lands it inside the authority, so `http://host ` asked bare
-  // started a server whose every glm_ask died on the SDK's anonymous
-  // "Invalid URL". Asking the SDK's question, of the SDK's string, is the
-  // same verdict at resolution as at request time by construction — there is
-  // no spelling left for this side to get wrong on its own. The expression is
+  // The parses are TESTS, not normalisations. A value that passes both is
+  // returned exactly as written — the operator's spelling is what gets sent,
+  // spaces, extra slashes and all, and no href from either parse is
+  // consulted, because what is SENT is not the parse's business
+  // (comparableEndpoint owns the one job a normalised form has: comparing).
+  // A value that fails either is refused. Nothing here trims or strips,
+  // because every such rule has a spelling outside it.
+  const hostOf = (u: string): string => {
+    try {
+      return new URL(u).host;
+    } catch {
+      return "";
+    }
+  };
+  // Question 1, of the value bare — before anything is appended to it, so
+  // that appending cannot be what supplies the host.
+  const namedHost = hostOf(raw);
+  // Question 2, of the SDK's own join — the string its buildURL() parses at
+  // request time, base and request path already joined. The expression is
   // comparableEndpoint()'s own (the same join, for comparing); if either copy
   // ever moves, the other must follow it.
-  try {
-    new URL(raw + (raw.endsWith("/") ? "" : "/") + "v1/messages");
-  } catch {
+  const requestHost = hostOf(raw + (raw.endsWith("/") ? "" : "/") + "v1/messages");
+  if (!namedHost || requestHost !== namedHost) {
     throw new Error(
-      `ZAI_BASE_URL is set to ${JSON.stringify(raw)}, which no request URL can be made of. It ` +
-        `is not replaced with the default (${DEFAULT_BASE_URL}): the variable is how ` +
-        `egress is scoped, so a value that is set is sent as written or refused, never ` +
-        `quietly swapped for a host the operator did not name. Unset it to use ` +
+      `ZAI_BASE_URL is set to ${JSON.stringify(raw)}, which names no host a request ` +
+        `can be made to reach: either it is not a URL with a host of its own, or ` +
+        `joining the request path onto it does not stay on the host it names. It is ` +
+        `not replaced with the default (${DEFAULT_BASE_URL}): the variable is how ` +
+        `egress is scoped, so a value that is set is sent as written or refused, ` +
+        `never quietly swapped for a host the operator did not name — and the ` +
+        `request path cannot be allowed to supply one either. Unset it to use ` +
         `${DEFAULT_BASE_URL}, or set it to the endpoint requests should go to.`,
     );
   }

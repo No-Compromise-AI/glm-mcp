@@ -15,16 +15,20 @@
 //        stops resolving mid-life serves the call from the last good client
 //        with the reason on stderr — a warning that must send the operator to
 //        the repair, never to a restart the per-call re-read made pointless.
-//        And: a base URL the operator SET but that names no endpoint is
-//        refused, never replaced with the default — ZAI_BASE_URL is how
-//        egress is scoped (#22), so a set value is sent as written or
+//        And: a base URL the operator SET but that names no host a request
+//        can reach is refused, never replaced with the default — ZAI_BASE_URL
+//        is how egress is scoped (#22), so a set value is sent as written or
 //        refused, while normalisation stays on the comparison that decides
-//        whether to rebuild the client. "Names an endpoint" means a REQUEST
-//        URL can be made of it — the SDK's own join of base and /v1/messages,
-//        the exact string it will parse — not that the base parses bare: a
-//        trailing space after the authority passes the second question and
-//        fails the first, and a resolver that asked the easier one started
-//        servers whose every glm_ask died on the SDK's anonymous
+//        whether to rebuild the client. "Names an endpoint" is a question
+//        about HOSTS, asked of two strings: the value itself must parse as a
+//        URL with a non-empty host — of the value bare, never of a string
+//        derived from it, because joining the request path onto "http://"
+//        manufactures a host called "v1" and ships the bearer to it — and
+//        the request the SDK builds from it must then reach that same host,
+//        which the bare question alone cannot see: a trailing space after
+//        the authority parses bare yet joins into a space inside the
+//        authority, and a resolver that asked only the easier question
+//        started servers whose every glm_ask died on the SDK's anonymous
 //        "Invalid URL".
 //
 // #20 and #22 are captured against a real local HTTP server rather than a mock
@@ -40,6 +44,11 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
+// The oracle's authority for "the request built from it": the SDK's own
+// buildURL() constructs the URL of every real request, so asking it — rather
+// than re-deriving a join of our own — keeps the test's expectation anchored
+// to the code that actually sends.
+import Anthropic from '@anthropic-ai/sdk';
 
 const execFileAsync = promisify(execFile);
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
@@ -444,33 +453,52 @@ test('#42 with ZAI_BASE_URL unset the chat endpoint is exactly what it has alway
     `operators who set nothing must get today's URL, got ${JSON.stringify(r.url ?? r.threw)}`);
 });
 
-test('#42 a base URL the operator SET but that names no endpoint is refused, never replaced', async () => {
+test('#42 a base URL the operator SET but that names no host a request can reach is refused, never replaced', async () => {
   // The CLASS, not a list of spellings — a list is what cost two rounds,
   // each closing the arrangement it knew ("/", "//", whitespace) and
-  // reopening for the next ("/ /", "//\t//"). The third round cost one more:
-  // the resolver asked the SDK's question of the WRONG STRING, so the class
-  // here is generated and then classified by the oracle the resolver must
-  // match — the SDK's own join of base and /v1/messages, the exact string
-  // its buildURL() parses at request time. Two families:
+  // reopening for the next ("/ /", "//\t//"). Rounds three and four each
+  // cost one more, and both were failures of the ORACLE as much as of the
+  // resolver: a test that re-derives the value the same way the
+  // implementation does agrees with the bug instead of catching it. So the
+  // oracle here is the PROPERTY, asserted on hosts and never on spellings:
+  // a value the resolver ACCEPTS must itself parse as a URL with a
+  // non-empty host, and the request built from it must reach that same
+  // host. The request half is settled by asking the SDK — buildURL() is the
+  // code that constructs every real request's URL — rather than by
+  // re-deriving a join of our own. Three families:
   //
   //   A  every string of length 1..4 over '/', ' ' and '\t', plus "" — the
   //      empty string being `ZAI_BASE_URL="${HOST}"` with HOST unset, the
-  //      ordinary way an operator reaches this class. None is a URL under
-  //      either question; all must be refused.
+  //      ordinary way an operator reaches this class. None names a host;
+  //      all must be refused.
   //
   //   B  bare-parseable bases with trailing whitespace runs appended — the
-  //      family the BARE question cannot catch, because the URL parser
-  //      drops surrounding space while REJECTING a space the join lands
-  //      inside the authority. The join splits it: a space after the
-  //      authority ("http://h ", "http://h \t") is refused; a tab anywhere
-  //      is deleted by the parser rather than rejected, and a space after a
+  //      family a BARE-only question cannot classify, because the URL
+  //      parser drops surrounding space while REJECTING a space the join
+  //      lands inside the authority. The SDK splits it: "http://h " names a
+  //      host no request can reach and is refused; a tab anywhere is
+  //      deleted by the parser rather than rejected, and a space after a
   //      path is a legal (if odd) path character, so those spellings are
   //      SENT as written. Asserting the accepted half too is not filler: a
   //      resolver that refused every trailing-whitespace value would pass a
   //      refusal-only test while replacing the SDK's own verdict with a
-  //      character class of our own — the exact move this round closes.
-  const joins = (v) => { try { return new URL(v + (v.endsWith('/') ? '' : '/') + 'v1/messages').href; } catch { return undefined; } };
-  const bare = (v) => { try { return new URL(v).href; } catch { return undefined; } };
+  //      character class of our own.
+  //
+  //   C  every prefix of a scheme, bare and with one trailing space or one
+  //      trailing slash — the shapes a half-written endpoint takes. None
+  //      names a host, yet the SDK's join MANUFACTURES one for the
+  //      complete-looking prefixes: "http://" + "v1/messages" parses, and
+  //      its host is "v1". That is how twelve values walked through a
+  //      resolver that asked only the joined question, with the bearer
+  //      token bound for a host nobody configured — the defect of the
+  //      fourth round, and the reason the oracle asks the bare question
+  //      first.
+  const bareHost = (v) => { try { const h = new URL(v).host; return h === '' ? undefined : h; } catch { return undefined; } };
+  const sdkHost = (v) => {
+    try {
+      return new URL(new Anthropic({ apiKey: 'oracle', baseURL: v }).buildURL('/v1/messages', null)).host;
+    } catch { return undefined; }
+  };
 
   const alphabet = ['/', ' ', '\t'];
   const familyA = [''];
@@ -483,24 +511,34 @@ test('#42 a base URL the operator SET but that names no endpoint is refused, nev
   for (const base of ['http://127.0.0.1:1', 'http://example.com', 'https://api.example.com:8443', ' http://127.0.0.1:1/x']) {
     for (const suffix of ['', ' ', '\t', '  ', ' \t', '\t ', '\t\t']) familyB.push(base + suffix);
   }
+  const familyC = [];
+  for (const scheme of ['http://', 'https://']) {
+    for (let n = 1; n <= scheme.length; n++) {
+      const prefix = scheme.slice(0, n);
+      familyC.push(prefix, prefix + ' ', prefix + '/');
+    }
+  }
 
-  // The generators answer to the oracle before the resolver does: if family A
-  // ever produces a value the SDK join accepts, or family B one the BARE
-  // parse rejects, the generator drifted and must say so rather than check
-  // the wrong thing.
-  for (const v of familyA) assert.equal(joins(v), undefined,
-    `family A produced ${JSON.stringify(v)}, which the SDK join accepts — the class is wrong, not the resolver`);
-  for (const v of familyB) assert.notEqual(bare(v), undefined,
+  // The generators answer to the oracle before the resolver does: if family
+  // A or C ever produces a value that names a host bare, or family B one
+  // that does not parse bare, the generator drifted and must say so rather
+  // than check the wrong thing. Family C must also still contain a value
+  // whose join manufactures a host — the shape this round exists for.
+  for (const v of [...familyA, ...familyC]) assert.equal(bareHost(v), undefined,
+    `${JSON.stringify(v)} names a host bare, so it is not in the class the refusal half pins — the generator is wrong, not the resolver`);
+  for (const v of familyB) assert.notEqual(bareHost(v), undefined,
     `family B produced ${JSON.stringify(v)}, which does not even parse bare — the class is wrong, not the resolver`);
-  assert.ok(familyB.some((v) => joins(v) === undefined),
-    'family B no longer contains a value the bare parse accepts and the join refuses — it has stopped exercising the defect it exists for');
-  assert.ok(familyB.some((v) => joins(v) !== undefined && /\s$/.test(v)),
-    'family B no longer contains a whitespace-suffixed value the join accepts — the sent-as-written half of the property has nothing to pin');
+  assert.ok(familyB.some((v) => sdkHost(v) === undefined),
+    'family B no longer contains a value that names a host no request can reach — it has stopped exercising the defect it exists for');
+  assert.ok(familyB.some((v) => sdkHost(v) === bareHost(v) && /\s$/.test(v)),
+    'family B no longer contains a whitespace-suffixed value the request reaches as written — the sent-as-written half of the property has nothing to pin');
+  assert.ok(familyC.some((v) => sdkHost(v) !== undefined),
+    'family C no longer contains a value whose join manufactures a host the value itself does not name — it has stopped exercising the manufactured-host defect this round exists for');
 
-  // One child for all of family A and B: a spawn each would make this the
+  // One child for all of family A, B and C: a spawn each would make this the
   // slowest test in the file for no extra evidence, and the assertion is
   // per-value either way.
-  const values = [...familyA, ...familyB];
+  const values = [...familyA, ...familyB, ...familyC];
   const r = await child(`
 const values = ${JSON.stringify(values)};
 out.rows = [];
@@ -514,20 +552,33 @@ for (const v of values) {
     `the class case must run at all — ${JSON.stringify(r.threw)}`);
   assert.equal(r.rows.length, values.length,
     `every value must be tried — got ${r.rows.length} of ${values.length}`);
+  let noHost = 0, unreachable = 0, accepted = 0;
   for (const row of r.rows) {
-    const joinHref = joins(row.v);
-    if (joinHref === undefined) {
+    const host = bareHost(row.v);
+    if (host === undefined || sdkHost(row.v) !== host) {
+      // The property, refusal half: no host of its own, or a host the
+      // request built from it cannot reach — either way the value is sent
+      // nowhere, not replaced, and not joined into a host nobody named.
+      host === undefined ? noHost++ : unreachable++;
       assert.ok(row.refused !== undefined,
-        `ZAI_BASE_URL=${JSON.stringify(row.v)} names nothing the SDK could send — the resolver must refuse it, got ${JSON.stringify(row.url ?? row)}`);
+        `ZAI_BASE_URL=${JSON.stringify(row.v)} names ${host === undefined ? 'no host of its own' : `the host ${JSON.stringify(host)}, which no request can reach`} — the resolver must refuse it, got ${JSON.stringify(row.url ?? row)}`);
       assert.match(row.refused, /ZAI_BASE_URL/,
         `ZAI_BASE_URL=${JSON.stringify(row.v)}: the refusal must name the variable — got ${JSON.stringify(row.refused)}`);
       assert.match(row.refused, /not replaced with the default/,
         `ZAI_BASE_URL=${JSON.stringify(row.v)}: the refusal must say the default is not substituted — got ${JSON.stringify(row.refused)}`);
     } else {
+      // The property, accepted half: the value names the host the request
+      // reaches, and what is returned is the operator's own spelling.
+      accepted++;
       assert.equal(row.url, row.v,
-        `ZAI_BASE_URL=${JSON.stringify(row.v)} sends a working request (${joinHref}) and must be returned exactly as written, never normalised — got ${JSON.stringify(row.url ?? row.refused)}`);
+        `ZAI_BASE_URL=${JSON.stringify(row.v)} names the host ${JSON.stringify(host)} the request reaches and must be returned exactly as written, never normalised — got ${JSON.stringify(row.url ?? row.refused)}`);
     }
   }
+  // Both questions of the property must have been exercised, or the class
+  // has quietly stopped covering one of them.
+  assert.ok(noHost > 0, 'the class must contain values naming no host of their own (families A and C)');
+  assert.ok(unreachable > 0, 'the class must contain values naming a host no request can reach (family B)');
+  assert.ok(accepted > 0, 'the class must contain values the request reaches as written');
 });
 
 test('#42 a repoint to a value the SDK cannot join a request onto fails with the refusal, not its own anonymous one', async () => {
