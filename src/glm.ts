@@ -123,14 +123,136 @@ const DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic";
 const DEFAULT_MODELS_URL = "https://api.z.ai/api/paas/v4/models";
 
 /**
+ * One spelling of an endpoint, for COMPARISON only (#42): the href a request
+ * would go to, computed by the SDK's own join. That join appends the request
+ * path without its leading slash when the base ends in "/" and parses the
+ * whole string as one URL otherwise, so what is writing and what is substance
+ * is settled by URL semantics, not by us: ONE trailing slash and surrounding
+ * whitespace are writing only (the parse drops them, both spellings send the
+ * same request, the cached client stays), while several trailing slashes, or
+ * whitespace the path lands inside, are substance — they reach the request
+ * path as written, as empty segments or %20. A key that folded those too
+ * would pin the cached client's spelling over the operator's current one, and
+ * the request would go where it went last time rather than where it is now
+ * told to go. It has no other job, and in particular it never decides what is
+ * SENT — that is baseUrl()'s to answer below.
+ */
+function comparableEndpoint(url: string): string {
+  try {
+    // /v1/messages is the path every request through getClient() starts with,
+    // so this is the SDK's join on a path this client really sends.
+    return new URL(url + (url.endsWith("/") ? "" : "/") + "v1/messages").href;
+  } catch {
+    // A spelling no URL can be made of never sends anything anywhere — the
+    // SDK rejects the join before a request exists — so values that can only
+    // ever fail alike may share this loose spelling for free.
+    return url.trim().replace(/\/+$/, "");
+  }
+}
+
+/**
  * The endpoints, resolved when a call is made rather than when the module
  * loads. BASE_URL and MODELS_URL below are the values as of startup, exported
  * for anything that wants to display them; the requests themselves re-read
  * the environment so a caller that pins a variable after import — a test, an
- * operator's launcher — still sends the key where they said (#22).
+ * operator's launcher — still sends the key where they said (#22). That
+ * promise holds for both routes: listModels() fetches modelsUrl() per call,
+ * and getClient() re-resolves the chat endpoint, key and timeout on every
+ * call, rebuilding the client only when one of them actually changed (#42).
+ *
+ * The chat endpoint a request is SENT to is the operator's own value exactly
+ * as written when they set one, the vendor's default when — and only when —
+ * they did not. #22 made ZAI_BASE_URL the egress-scoping knob, so the two
+ * states are not interchangeable: an operator who scoped where the key goes
+ * did not scope it so that a mistyped value would fall back to the vendor's
+ * own host. And whether a SET value names an endpoint at all is a question
+ * about HOSTS, not about strings: two rounds went to enumerating spellings
+ * ("/", "//", whitespace; then "/ /", "//\t//"), and each fix closed only the
+ * arrangement it knew because a rule written against a character class always
+ * has one more spelling outside it. The question is asked twice below, of two
+ * different strings, and both answers have to agree:
+ *
+ *   1. the value ITSELF must parse as a URL with a non-empty host — the
+ *      value bare, before anything is appended, because appending can
+ *      MANUFACTURE a host: "http://" is not a URL on its own, but
+ *      "http://" + "v1/messages" is, and its host is `v1`. The resolver this
+ *      replaced asked only that joined question, so it accepted
+ *      `ZAI_BASE_URL="http://"` — and "http:", "https:/" and every other
+ *      partial scheme — and the bearer token left for a host called `v1`
+ *      that nobody configured. "Can a URL be made of it" is a question about
+ *      a string DERIVED from the value; egress is scoped by the value, so
+ *      the value itself has to name where it goes.
+ *
+ *   2. the request built from the value must reach that SAME host — the
+ *      SDK's own join of base and /v1/messages, the exact string its
+ *      buildURL() parses at request time. This is the third round's lesson
+ *      in the other direction: `ZAI_BASE_URL="http://host "` passes question
+ *      1, because the parser drops a trailing space, while the joined
+ *      `http://host /v1/messages` has that space inside the authority, where
+ *      no URL can be made of it — so a resolver asking only the easier
+ *      question started servers whose every glm_ask failed with the SDK's
+ *      anonymous "Invalid URL", the late unnamed failure the refusal exists
+ *      to prevent.
+ *
+ * A value that fails either question — which is exactly what
+ * `ZAI_BASE_URL="${HOST}/"` with HOST unset leaves — is refused here, naming
+ * the variable, rather than replaced.
+ *
+ * Refusing rather than sending the value as written for the SDK to reject (the
+ * behaviour before #42) is a deliberate choice with two grounds. The SDK does
+ * not reject an empty baseURL, it substitutes api.anthropic.com — a third host
+ * the operator named even less than z.ai's — and the ordinary way into this
+ * class (`"${HOST}"` with HOST unset, no slash) is exactly that spelling. And
+ * for the rest of the class the SDK's rejection arrives as a bare "Invalid
+ * URL" that names no variable, long after the configuration left the
+ * operator's hands; refusing at resolution names ZAI_BASE_URL while the value
+ * is still in front of whoever set it.
+ *
+ * The refusal therefore fires at module scope too, through BASE_URL below: a
+ * server whose egress scope does not resolve does not start. That is the
+ * earliest moment the right person is looking — the MCP host surfaces a
+ * startup failure to the operator who just configured it — and the
+ * alternative is a server that starts, answers glm_models, and fails every
+ * glm_ask with the SDK's bare "Invalid URL", which names nothing.
  */
 export function baseUrl(): string {
-  return process.env.ZAI_BASE_URL ?? DEFAULT_BASE_URL;
+  const raw = process.env.ZAI_BASE_URL;
+  if (raw === undefined) return DEFAULT_BASE_URL;
+  // The parses are TESTS, not normalisations. A value that passes both is
+  // returned exactly as written — the operator's spelling is what gets sent,
+  // spaces, extra slashes and all, and no href from either parse is
+  // consulted, because what is SENT is not the parse's business
+  // (comparableEndpoint owns the one job a normalised form has: comparing).
+  // A value that fails either is refused. Nothing here trims or strips,
+  // because every such rule has a spelling outside it.
+  const hostOf = (u: string): string => {
+    try {
+      return new URL(u).host;
+    } catch {
+      return "";
+    }
+  };
+  // Question 1, of the value bare — before anything is appended to it, so
+  // that appending cannot be what supplies the host.
+  const namedHost = hostOf(raw);
+  // Question 2, of the SDK's own join — the string its buildURL() parses at
+  // request time, base and request path already joined. The expression is
+  // comparableEndpoint()'s own (the same join, for comparing); if either copy
+  // ever moves, the other must follow it.
+  const requestHost = hostOf(raw + (raw.endsWith("/") ? "" : "/") + "v1/messages");
+  if (!namedHost || requestHost !== namedHost) {
+    throw new Error(
+      `ZAI_BASE_URL is set to ${JSON.stringify(raw)}, which names no host a request ` +
+        `can be made to reach: either it is not a URL with a host of its own, or ` +
+        `joining the request path onto it does not stay on the host it names. It is ` +
+        `not replaced with the default (${DEFAULT_BASE_URL}): the variable is how ` +
+        `egress is scoped, so a value that is set is sent as written or refused, ` +
+        `never quietly swapped for a host the operator did not name — and the ` +
+        `request path cannot be allowed to supply one either. Unset it to use ` +
+        `${DEFAULT_BASE_URL}, or set it to the endpoint requests should go to.`,
+    );
+  }
+  return raw;
 }
 
 export function modelsUrl(): string {
@@ -289,19 +411,100 @@ export function resolveApiKey(): string {
   );
 }
 
+/**
+ * The wall-clock budget GLM_MCP_TIMEOUT_MS names, for the WHOLE call however
+ * many times the SDK retries underneath (#46). It is not divided between
+ * attempts: one attempt may spend nearly all of it — the output default is
+ * 65,536 tokens and a long single call is the normal case — so the client's
+ * per-attempt timeout and the request's deadline signal both carry this same
+ * number, and the per-attempt cap never has to be smaller than the total.
+ *
+ * envLimit (#24): Number("abc") is NaN, and NaN as a timeout is not a wrong
+ * limit but an absent one — every comparison against it is false.
+ */
+function callBudgetMs(): number {
+  return envLimit("GLM_MCP_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
+}
+
+/**
+ * The chat client, cached against the configuration it was built with and
+ * rebuilt only when that configuration changes (#42). The construct-once
+ * singleton this replaced pinned baseURL and key on the first successful
+ * call, so a key rotated on disk or an endpoint repointed in the environment
+ * was never picked up and a long-running server had to be restarted. The fix
+ * is not to build per call: that trades connection reuse away for a freshness
+ * nothing asked to pay for. The resolved configuration is compared instead,
+ * so an unchanged environment returns the identical object and a changed one
+ * gets a client built for it.
+ *
+ * Re-resolution can also start failing mid-life, and a credential that
+ * already resolved is proof one exists: the call is then served from the last
+ * good client rather than failed, and the reason goes to stderr (#26) — the
+ * operator's channel; stdout is the MCP protocol. The key itself is never
+ * logged. The warning that lands there points at the repair, never at a
+ * restart: this function re-resolves on every call, so the call after the
+ * source is repaired — or rotated — is the one that picks it up, while a
+ * restart while it is still broken would leave nothing cached to serve with.
+ *
+ * The endpoint enters the comparison in ONE spelling — comparableEndpoint —
+ * while the client itself is built with the operator's value as written:
+ * normalising is for comparing (#42), never for deciding what to send.
+ */
 let client: Anthropic | undefined;
+let clientBuiltWith: { endpoint: string; key: string; timeout: number } | undefined;
+
 export function getClient(): Anthropic {
-  if (!client) {
-    client = new Anthropic({
-      baseURL: baseUrl(),
-      authToken: resolveApiKey(),
-      apiKey: null,
-      // envLimit (#24): Number("abc") is NaN, and NaN as a timeout is not a
-      // wrong limit but an absent one — every comparison against it is false.
-      timeout: envLimit("GLM_MCP_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
-      maxRetries: 2,
-    });
+  // Resolved OUTSIDE the credential fallback below, on purpose. A key that
+  // stops resolving is a source that failed to re-read, and one that already
+  // resolved is proof one exists; a base URL that throws here is a value the
+  // operator SET that names no endpoint — a repoint, not a flaky read — so
+  // serving the call from the last good client would send the key to an
+  // endpoint they just stopped naming. The refusal stands.
+  const baseURL = baseUrl();
+  const timeout = callBudgetMs();
+  let key: string;
+  try {
+    key = resolveApiKey();
+  } catch (e) {
+    if (client !== undefined) {
+      const why = e instanceof Error ? e.message : String(e);
+      // The warning points at the repair, never at a restart. A restart was
+      // the pickup path of the singleton this function replaced; against the
+      // re-read it is wrong in both directions — the next call resolves the
+      // source again, so a repaired or rotated key is picked up with nothing
+      // but another call, and while the source stays broken a restart is the
+      // one move that makes things worse, because the restarted process has
+      // no client cached to serve with.
+      console.error(
+        `glm-mcp: the z.ai key stopped resolving — ${why} ` +
+          "Continuing on the client built with the last key that did. Repair " +
+          "the credential source; the next call resolves it again and picks " +
+          "up a repaired or rotated key by itself.",
+      );
+      return client;
+    }
+    // Nothing was ever built, so there is no client to fall back to — the
+    // caller has to hear what is missing.
+    throw e;
   }
+  const endpoint = comparableEndpoint(baseURL);
+  if (
+    client !== undefined &&
+    clientBuiltWith &&
+    clientBuiltWith.endpoint === endpoint &&
+    clientBuiltWith.key === key &&
+    clientBuiltWith.timeout === timeout
+  ) {
+    return client;
+  }
+  client = new Anthropic({
+    baseURL,
+    authToken: key,
+    apiKey: null,
+    timeout,
+    maxRetries: 2,
+  });
+  clientBuiltWith = { endpoint, key, timeout };
   return client;
 }
 
@@ -940,7 +1143,12 @@ export async function ask(args: AskArgs): Promise<AskResult> {
     );
   }
 
-  const body: Record<string, unknown> = {
+  // #45: the body carries the SDK's own parameter type, so a field the
+  // Messages API would reject — a max_tokens that is not a number, a message
+  // role outside its union — is a compile error here rather than a runtime
+  // error against the live endpoint. The `as never` this replaces switched
+  // the compiler off for the whole request.
+  const body: Anthropic.Messages.MessageCreateParamsNonStreaming = {
     model,
     max_tokens: maxTokens,
     messages: [{ role: "user", content: prompt }],
@@ -982,11 +1190,26 @@ export async function ask(args: AskArgs): Promise<AskResult> {
     body.thinking = { type: "enabled", budget_tokens: budget };
   }
 
-  const res = (await getClient().messages.create(body as never)) as {
+  // #46: the budget is the call's, not one attempt's. The client's per-attempt
+  // `timeout` bounds nothing once the SDK retries — maxRetries 2 behind a
+  // 600,000ms timeout is three ten-minute attempts — so the request also
+  // carries the same number as an AbortSignal, which the SDK honours across
+  // its whole retry loop (an aborted signal fails without retrying). The
+  // SDK's own retry behaviour is kept, not replaced: status classification,
+  // retry-after, backoff and connection-error retries all still apply
+  // underneath the deadline. One residual, documented beside the knob in the
+  // README: the SDK's backoff sleep between attempts is not abort-aware, so
+  // an abort landing inside it overshoots by up to that sleep.
+  const res = (await getClient().messages.create(body, {
+    signal: AbortSignal.timeout(callBudgetMs()),
+  })) as {
+    // The response is read defensively rather than through the SDK's Message:
+    // z.ai's compatibility is its own claim, and a missing content array or
+    // usage object should cost the caller a zero, not a crash.
     model?: string;
-    stop_reason?: string;
+    stop_reason?: string | null;
     content?: Array<{ type: string; text?: string; thinking?: string }>;
-    usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number };
+    usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number | null };
   };
 
   let text = "";
@@ -1005,7 +1228,7 @@ export async function ask(args: AskArgs): Promise<AskResult> {
       output: res.usage?.output_tokens ?? 0,
       cacheRead: res.usage?.cache_read_input_tokens ?? 0,
     },
-    stopReason: res.stop_reason,
+    stopReason: res.stop_reason ?? undefined,
   };
 }
 
@@ -1017,7 +1240,7 @@ export async function listModels(): Promise<string[]> {
   // through the same validated parsing, so a bare fetch cannot hang the server.
   const r = await fetch(modelsUrl(), {
     headers: { authorization: `Bearer ${key}` },
-    signal: AbortSignal.timeout(envLimit("GLM_MCP_TIMEOUT_MS", DEFAULT_TIMEOUT_MS)),
+    signal: AbortSignal.timeout(callBudgetMs()),
   });
   if (!r.ok) throw new Error(`model list failed: HTTP ${r.status}`);
   const d = (await r.json()) as { data?: Array<{ id: string }> };

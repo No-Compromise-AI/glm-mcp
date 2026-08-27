@@ -24,8 +24,10 @@ Worth stating plainly, since this server holds an API key:
   `https://api.z.ai/api/anthropic` for the tools and
   `https://api.z.ai/api/paas/v4/models` for the model list. `ZAI_BASE_URL` replaces that
   destination — if you set it, your key is transmitted to whatever host it names, so only
-  point it at endpoints you trust. There is no telemetry and no phone-home beyond the
-  configured endpoint.
+  point it at endpoints you trust. A set value that no URL can be made of is refused — the
+  server does not start — rather than replaced with the z.ai default: the variable is how
+  egress is scoped, and it is never silently unscoped.
+  There is no telemetry and no phone-home beyond the configured endpoint.
 - **Your key, your account, your billing.** Nothing routes through the maintainer.
 
 ## Prompt injection through file context

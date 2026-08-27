@@ -241,7 +241,7 @@ variable that set it — nothing is ever silently truncated or silently dropped.
 | Directory entries examined per call | `GLM_MCP_MAX_ENTRIES` | 200,000 |
 | Wall-clock budget for glob expansion | `GLM_MCP_GLOB_TIMEOUT_MS` | 10,000 |
 | Total `{a,b}` brace expansions | `GLM_MCP_MAX_BRACE_EXPANSIONS` | 1,024 |
-| Request timeout | `GLM_MCP_TIMEOUT_MS` | 600,000 |
+| Request timeout, the whole call — all retries included | `GLM_MCP_TIMEOUT_MS` | 600,000 |
 
 The character budget is **derived**, not chosen: the assumed context window,
 less the model's default output and a prompt reserve, at 3 characters per token.
@@ -258,6 +258,17 @@ models. Asking for more than a model allows is refused locally, naming the
 ceiling, rather than discovered as an API error. A model this table does not
 know is not capped here: z.ai's own limits govern it.
 
+`GLM_MCP_TIMEOUT_MS` bounds the **whole call, including retries** — not one
+attempt. Retryable failures (408/409/429/5xx, connection errors) are retried
+twice with the SDK's own backoff, and the one number you set covers every
+attempt together: at the default, a call ends after ten minutes however many
+attempts it has made, not thirty. The first attempt is entitled to nearly the
+whole budget — the output default is 65,536 tokens and long single calls are
+the normal case, so the budget is never divided to reserve room for retries
+that may never happen. One residual: the SDK's backoff sleep between attempts
+is not abort-aware, so a deadline that fires during a backoff wait overshoots
+by up to that sleep — bounded by whatever `retry-after` the server sent.
+
 - Only regular files are read. A FIFO, device or socket is refused rather than
   blocking the server on a read that may never return.
 - Truncation cuts on code points, so it never splits an emoji in half.
@@ -272,14 +283,18 @@ be the error's own code: a request id or token count that happens to contain tho
 passed through untranslated rather than explained as something it is not.
 
 Requests go to `https://api.z.ai/api/anthropic` unless `ZAI_BASE_URL` says otherwise. Your key
-is sent to whatever host it names, so only point it at endpoints you trust.
+is sent to whatever host it names, so only point it at endpoints you trust. A `ZAI_BASE_URL`
+that is set but that no URL can be made of — which is what `ZAI_BASE_URL="${HOST}/"` with
+`HOST` unset leaves — makes the server refuse to start with an error naming the variable,
+rather than quietly falling back to the default: the variable is how egress is scoped, so a
+value you set is sent as written or refused, never swapped for a host you did not name.
 
 `glm_models` reads a different endpoint on a different path prefix, so it does not follow
 `ZAI_BASE_URL` — pointing the two at one host would only be a guess about your gateway's
 layout. It defaults to `https://api.z.ai/api/paas/v4/models` and is set explicitly with
 `ZAI_MODELS_URL`. **If you set `ZAI_BASE_URL` to scope where your key is sent, set
 `ZAI_MODELS_URL` too**, or `glm_models` will keep sending the key to z.ai. Both requests
-observe `GLM_MCP_TIMEOUT_MS`.
+observe `GLM_MCP_TIMEOUT_MS` as a whole-call budget.
 
 ## Testing
 

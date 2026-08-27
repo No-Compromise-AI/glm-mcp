@@ -11,6 +11,25 @@
 //   #20  max_tokens is a cap: never exceeded, the thinking budget scaled down
 //        to fit beneath it, and a cap too small to reason on a model that
 //        always reasons refused before anything is sent.
+//   #42  getClient() re-reads the configuration per call; a credential that
+//        stops resolving mid-life serves the call from the last good client
+//        with the reason on stderr — a warning that must send the operator to
+//        the repair, never to a restart the per-call re-read made pointless.
+//        And: a base URL the operator SET but that names no host a request
+//        can reach is refused, never replaced with the default — ZAI_BASE_URL
+//        is how egress is scoped (#22), so a set value is sent as written or
+//        refused, while normalisation stays on the comparison that decides
+//        whether to rebuild the client. "Names an endpoint" is a question
+//        about HOSTS, asked of two strings: the value itself must parse as a
+//        URL with a non-empty host — of the value bare, never of a string
+//        derived from it, because joining the request path onto "http://"
+//        manufactures a host called "v1" and ships the bearer to it — and
+//        the request the SDK builds from it must then reach that same host,
+//        which the bare question alone cannot see: a trailing space after
+//        the authority parses bare yet joins into a space inside the
+//        authority, and a resolver that asked only the easier question
+//        started servers whose every glm_ask died on the SDK's anonymous
+//        "Invalid URL".
 //
 // #20 and #22 are captured against a real local HTTP server rather than a mock
 // of our own code — that is how #20 was reproduced. #20's server lives in this
@@ -25,9 +44,14 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
+// The oracle's authority for "the request built from it": the SDK's own
+// buildURL() constructs the URL of every real request, so asking it — rather
+// than re-deriving a join of our own — keeps the test's expectation anchored
+// to the code that actually sends.
+import Anthropic from '@anthropic-ai/sdk';
 
 const execFileAsync = promisify(execFile);
-import { mkdtempSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -88,11 +112,17 @@ after(async () => {
  * The child is spawned asynchronously because #20's child calls THIS process's
  * server: a synchronous spawn would block the event loop serving it, and the
  * two would wait on each other until the timeout killed them both.
+ *
+ * `lazy` imports the module inside the try instead of at the top. glm.ts
+ * evaluates `baseUrl()` at module scope (`export const BASE_URL = ...`), and a
+ * resolver that REFUSES a set-but-unusable value throws during import — which
+ * a static import turns into a dead child rather than an observable refusal,
+ * and the cases below have to tell those two apart.
  */
-async function child(body, env = {}, timeoutMs = 20_000) {
+async function child(body, env = {}, timeoutMs = 20_000, { lazy = false } = {}) {
   const src = `
 import { createServer } from 'node:http';
-import * as glm from ${JSON.stringify(GLM)};
+${lazy ? '' : `import * as glm from ${JSON.stringify(GLM)};`}
 const respond = ${respond.toString()};
 const seen = [];
 const server = createServer((req, res) => {
@@ -118,14 +148,20 @@ globalThis.fetch = (url, init) => {
 };
 const out = {};
 try {
+${lazy ? `const glm = await import(${JSON.stringify(GLM)});` : ''}
 ${body}
 } catch (e) {
   out.threw = String(e && e.message ? e.message : e);
 }
 out.seen = seen;
-process.stdout.write(JSON.stringify(out));
 server.close();
-process.exit(0);
+// process.exit() does NOT wait for a pipe to drain, so exiting straight after
+// the write truncates any result too big for the pipe buffer — which arrives
+// as a JSON parse error and reads like a malformed result rather than a lost
+// one. It only appeared once a case returned 121 rows (the endpoint-class case
+// below); verify-budget.mjs's child learned this the same way. Exit from the
+// write's own callback.
+process.stdout.write(JSON.stringify(out), () => process.exit(0));
 `;
   const childEnv = { ...process.env };
   for (const k of Object.keys(childEnv)) if (/^(GLM_MCP_|ZAI_)/.test(k)) delete childEnv[k];
@@ -135,18 +171,23 @@ process.exit(0);
     else childEnv[k] = String(v);
   }
   let out;
+  let stderr = '';
   try {
     const r = await execFileAsync(process.execPath, ['--input-type=module', '-e', src],
       { encoding: 'utf8', env: childEnv, timeout: timeoutMs,
         maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     out = r.stdout;
+    stderr = r.stderr;
   } catch (e) {
     if (e.killed) {
       assert.fail(`the case did not return within ${timeoutMs}ms — a hang is not a result`);
     }
     assert.fail(`child failed\n${e.stderr || e.message}`);
   }
-  return JSON.parse(out);
+  // stderr stays a PIPE here: the promisified execFile silently drops numeric
+  // stdio fds (execFileSync does not), and the #42 case below reads a
+  // SUCCEEDING child's warning from this field.
+  return { ...JSON.parse(out), stderr };
 }
 
 // ------------------------------------------- #24: env numerics are validated
@@ -342,6 +383,331 @@ out.ms = Date.now() - t;`, {}, 15_000);
   // process would satisfy the other assertions without exercising a timeout.
   assert.ok(r.seen.length >= 1, `the timeout case never reached the server: ${JSON.stringify(r.error ?? r)}`);
 assert.ok(r.ms < 5_000, `listModels waited ${r.ms}ms — the timeout must cut it off`);
+});
+
+// ------------------------------------------ #42: the fallback warning
+
+test('#42 the fallback warning points at the repair, not at a restart', async () => {
+  // Re-reading the configuration per call (#42) means resolution can start
+  // failing mid-life, and the call is then served from the last good client
+  // with the reason on stderr. WHAT that warning says is load-bearing: it
+  // used to end "restart the server to pick the configuration up again" —
+  // advice from the singleton world #42 removed, wrong in both directions
+  // now. The next call re-resolves, so a repaired or rotated key is picked
+  // up with no restart anywhere; and while the source stays broken a restart
+  // is the one move that makes things worse, because the restarted process
+  // has no client cached to serve with. The warning has to send the operator
+  // to the repair and say the next call retries — this test drives one child
+  // through healthy, broken, and repaired-rotated, with no restart between
+  // them, so the pickup it asserts on is the very pickup the warning
+  // describes.
+  const home = mkdtempSync(join(tmpdir(), 'glm-fallback-'));
+  mkdirSync(join(home, '.config', 'zai'), { recursive: true });
+  const keyFile = join(home, '.config', 'zai', 'api-key');
+  try {
+    const r = await child(`
+process.env.ZAI_BASE_URL = origin;
+const { writeFileSync, unlinkSync } = await import('node:fs');
+const keyFile = ${JSON.stringify(keyFile)};
+writeFileSync(keyFile, 'KEY-ONE');
+await glm.ask({ prompt: 'one', model: 'glm-5.3', reasoning: 'low' });
+unlinkSync(keyFile);
+const second = await glm.ask({ prompt: 'two', model: 'glm-5.3', reasoning: 'low' });
+writeFileSync(keyFile, 'KEY-TWO');
+const third = await glm.ask({ prompt: 'three', model: 'glm-5.3', reasoning: 'low' });
+out.second = second.text; out.third = third.text;
+out.bearers = seen.map((s) => (s.auth ?? '').replace(/^Bearer\\s+/i, ''));`,
+      { HOME: home, USERPROFILE: home, ZAI_API_KEY: undefined });
+
+    // The premise the warning's advice rests on: the broken-source call was
+    // served, and the third request carried the rotated key with no restart
+    // in this child. If this ever stops holding, "the next call picks it up"
+    // is no longer true and the warning has to change again.
+    assert.equal(r.threw, undefined,
+      `the broken-source call must be served from the last good client — ${JSON.stringify(r.threw)}`);
+    assert.equal(r.second, 'ok');
+    assert.equal(r.third, 'ok');
+    assert.deepEqual(r.bearers, ['KEY-ONE', 'KEY-ONE', 'KEY-TWO'],
+      'no restart happened here, so the third request carrying KEY-TWO is the pickup the warning must describe');
+    // The finding itself. The warning is on stderr (rule 7 of the budget
+    // gate pins its existence) and it directs the operator at the repair and
+    // the next call's retry — never at a restart.
+    assert.match(r.stderr ?? '', /stopped resolving/i,
+      'the operator must hear on stderr that the key stopped resolving');
+    assert.doesNotMatch(r.stderr ?? '', /restart/i,
+      'the warning must not send the operator to a restart: the next call re-resolves and picks the repair up, and a restart while the source is broken leaves nothing cached to serve with');
+    assert.match(r.stderr ?? '', /repair/i,
+      'the warning must direct the operator at the repair');
+    assert.match(r.stderr ?? '', /next call/i,
+      'the warning must say the next call retries resolution');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ------------------- #42/#22: a SET base URL is never silently replaced
+
+test('#42 with ZAI_BASE_URL unset the chat endpoint is exactly what it has always been', async () => {
+  const r = await child('out.url = glm.baseUrl();');
+  assert.equal(r.url, 'https://api.z.ai/api/anthropic',
+    `operators who set nothing must get today's URL, got ${JSON.stringify(r.url ?? r.threw)}`);
+});
+
+test('#42 a base URL the operator SET but that names no host a request can reach is refused, never replaced', async () => {
+  // The CLASS, not a list of spellings — a list is what cost two rounds,
+  // each closing the arrangement it knew ("/", "//", whitespace) and
+  // reopening for the next ("/ /", "//\t//"). Rounds three and four each
+  // cost one more, and both were failures of the ORACLE as much as of the
+  // resolver: a test that re-derives the value the same way the
+  // implementation does agrees with the bug instead of catching it. So the
+  // oracle here is the PROPERTY, asserted on hosts and never on spellings:
+  // a value the resolver ACCEPTS must itself parse as a URL with a
+  // non-empty host, and the request built from it must reach that same
+  // host. The request half is settled by asking the SDK — buildURL() is the
+  // code that constructs every real request's URL — rather than by
+  // re-deriving a join of our own. Three families:
+  //
+  //   A  every string of length 1..4 over '/', ' ' and '\t', plus "" — the
+  //      empty string being `ZAI_BASE_URL="${HOST}"` with HOST unset, the
+  //      ordinary way an operator reaches this class. None names a host;
+  //      all must be refused.
+  //
+  //   B  bare-parseable bases with trailing whitespace runs appended — the
+  //      family a BARE-only question cannot classify, because the URL
+  //      parser drops surrounding space while REJECTING a space the join
+  //      lands inside the authority. The SDK splits it: "http://h " names a
+  //      host no request can reach and is refused; a tab anywhere is
+  //      deleted by the parser rather than rejected, and a space after a
+  //      path is a legal (if odd) path character, so those spellings are
+  //      SENT as written. Asserting the accepted half too is not filler: a
+  //      resolver that refused every trailing-whitespace value would pass a
+  //      refusal-only test while replacing the SDK's own verdict with a
+  //      character class of our own.
+  //
+  //   C  every prefix of a scheme, bare and with one trailing space or one
+  //      trailing slash — the shapes a half-written endpoint takes. None
+  //      names a host, yet the SDK's join MANUFACTURES one for the
+  //      complete-looking prefixes: "http://" + "v1/messages" parses, and
+  //      its host is "v1". That is how twelve values walked through a
+  //      resolver that asked only the joined question, with the bearer
+  //      token bound for a host nobody configured — the defect of the
+  //      fourth round, and the reason the oracle asks the bare question
+  //      first.
+  const bareHost = (v) => { try { const h = new URL(v).host; return h === '' ? undefined : h; } catch { return undefined; } };
+  const sdkHost = (v) => {
+    try {
+      return new URL(new Anthropic({ apiKey: 'oracle', baseURL: v }).buildURL('/v1/messages', null)).host;
+    } catch { return undefined; }
+  };
+
+  const alphabet = ['/', ' ', '\t'];
+  const familyA = [''];
+  let round = [''];
+  for (let n = 0; n < 4; n++) {
+    round = round.flatMap((p) => alphabet.map((c) => p + c));
+    familyA.push(...round);
+  }
+  const familyB = [];
+  for (const base of ['http://127.0.0.1:1', 'http://example.com', 'https://api.example.com:8443', ' http://127.0.0.1:1/x']) {
+    for (const suffix of ['', ' ', '\t', '  ', ' \t', '\t ', '\t\t']) familyB.push(base + suffix);
+  }
+  const familyC = [];
+  for (const scheme of ['http://', 'https://']) {
+    for (let n = 1; n <= scheme.length; n++) {
+      const prefix = scheme.slice(0, n);
+      familyC.push(prefix, prefix + ' ', prefix + '/');
+    }
+  }
+
+  // The generators answer to the oracle before the resolver does: if family
+  // A or C ever produces a value that names a host bare, or family B one
+  // that does not parse bare, the generator drifted and must say so rather
+  // than check the wrong thing. Family C must also still contain a value
+  // whose join manufactures a host — the shape this round exists for.
+  for (const v of [...familyA, ...familyC]) assert.equal(bareHost(v), undefined,
+    `${JSON.stringify(v)} names a host bare, so it is not in the class the refusal half pins — the generator is wrong, not the resolver`);
+  for (const v of familyB) assert.notEqual(bareHost(v), undefined,
+    `family B produced ${JSON.stringify(v)}, which does not even parse bare — the class is wrong, not the resolver`);
+  assert.ok(familyB.some((v) => sdkHost(v) === undefined),
+    'family B no longer contains a value that names a host no request can reach — it has stopped exercising the defect it exists for');
+  assert.ok(familyB.some((v) => sdkHost(v) === bareHost(v) && /\s$/.test(v)),
+    'family B no longer contains a whitespace-suffixed value the request reaches as written — the sent-as-written half of the property has nothing to pin');
+  assert.ok(familyC.some((v) => sdkHost(v) !== undefined),
+    'family C no longer contains a value whose join manufactures a host the value itself does not name — it has stopped exercising the manufactured-host defect this round exists for');
+
+  // One child for all of family A, B and C: a spawn each would make this the
+  // slowest test in the file for no extra evidence, and the assertion is
+  // per-value either way.
+  const values = [...familyA, ...familyB, ...familyC];
+  const r = await child(`
+const values = ${JSON.stringify(values)};
+out.rows = [];
+for (const v of values) {
+  process.env.ZAI_BASE_URL = v;
+  const row = { v };
+  try { row.url = glm.baseUrl(); } catch (e) { row.refused = String(e && e.message ? e.message : e); }
+  out.rows.push(row);
+}`);
+  assert.equal(r.threw, undefined,
+    `the class case must run at all — ${JSON.stringify(r.threw)}`);
+  assert.equal(r.rows.length, values.length,
+    `every value must be tried — got ${r.rows.length} of ${values.length}`);
+  let noHost = 0, unreachable = 0, accepted = 0;
+  for (const row of r.rows) {
+    const host = bareHost(row.v);
+    if (host === undefined || sdkHost(row.v) !== host) {
+      // The property, refusal half: no host of its own, or a host the
+      // request built from it cannot reach — either way the value is sent
+      // nowhere, not replaced, and not joined into a host nobody named.
+      host === undefined ? noHost++ : unreachable++;
+      assert.ok(row.refused !== undefined,
+        `ZAI_BASE_URL=${JSON.stringify(row.v)} names ${host === undefined ? 'no host of its own' : `the host ${JSON.stringify(host)}, which no request can reach`} — the resolver must refuse it, got ${JSON.stringify(row.url ?? row)}`);
+      assert.match(row.refused, /ZAI_BASE_URL/,
+        `ZAI_BASE_URL=${JSON.stringify(row.v)}: the refusal must name the variable — got ${JSON.stringify(row.refused)}`);
+      assert.match(row.refused, /not replaced with the default/,
+        `ZAI_BASE_URL=${JSON.stringify(row.v)}: the refusal must say the default is not substituted — got ${JSON.stringify(row.refused)}`);
+    } else {
+      // The property, accepted half: the value names the host the request
+      // reaches, and what is returned is the operator's own spelling.
+      accepted++;
+      assert.equal(row.url, row.v,
+        `ZAI_BASE_URL=${JSON.stringify(row.v)} names the host ${JSON.stringify(host)} the request reaches and must be returned exactly as written, never normalised — got ${JSON.stringify(row.url ?? row.refused)}`);
+    }
+  }
+  // Both questions of the property must have been exercised, or the class
+  // has quietly stopped covering one of them.
+  assert.ok(noHost > 0, 'the class must contain values naming no host of their own (families A and C)');
+  assert.ok(unreachable > 0, 'the class must contain values naming a host no request can reach (family B)');
+  assert.ok(accepted > 0, 'the class must contain values the request reaches as written');
+});
+
+test('#42 a repoint to a value the SDK cannot join a request onto fails with the refusal, not its own anonymous one', async () => {
+  // The third round's regression, end to end. `ZAI_BASE_URL=<origin> ` — one
+  // trailing space — parses bare, so before this round the repoint was
+  // accepted, the cached client was rebuilt for it, and the next call died
+  // inside the SDK's buildURL with a bare "Invalid URL" that named no
+  // variable: the late anonymous failure the refusal at resolution exists to
+  // prevent. The call must instead fail with the refusal that names
+  // ZAI_BASE_URL, and nothing may be sent — not to the stub, so not to the
+  // old endpoint either.
+  const r = await child(`
+process.env.ZAI_BASE_URL = origin;
+await glm.ask({ prompt: 'one', model: 'glm-5.3', reasoning: 'low' });
+const before = seen.length;
+process.env.ZAI_BASE_URL = origin + ' ';
+try {
+  await glm.ask({ prompt: 'two', model: 'glm-5.3', reasoning: 'low' });
+  out.sentAnyway = true;
+} catch (e) { out.refusal = String(e && e.message ? e.message : e); }
+out.requestsAfter = seen.length - before;`);
+  assert.ok(r.refusal,
+    `the repointed call must fail — ${JSON.stringify(r.sentAnyway ?? r.threw)}`);
+  assert.match(r.refusal, /ZAI_BASE_URL/,
+    `the failure must be the resolver's refusal naming the variable, not the SDK's anonymous "Invalid URL" — got ${JSON.stringify(r.refusal)}`);
+  assert.equal(r.requestsAfter, 0,
+    'nothing may be sent after the repoint — a value no request URL can be made of sends nothing');
+});
+
+test('#42 a startup ZAI_BASE_URL the SDK cannot join a request onto stops the server', async () => {
+  // The module-scope half: BASE_URL resolves at import, so the refusal an
+  // operator gets for configuring egress this way is a server that does not
+  // start — the earliest moment the right person is looking — rather than
+  // one that starts, answers glm_models, and fails every glm_ask with
+  // "Invalid URL" attached to nothing.
+  const r = await child(`out.url = glm.baseUrl();`,
+    { ZAI_BASE_URL: 'http://example.com ' }, 20_000, { lazy: true });
+  assert.match(r.threw ?? '', /ZAI_BASE_URL/,
+    `the import must refuse, naming the variable the operator just set — got ${JSON.stringify(r.threw ?? r)}`);
+  assert.match(r.threw ?? '', /not replaced with the default/,
+    `the startup refusal must still say the default is not substituted — got ${JSON.stringify(r.threw)}`);
+});
+
+test('#42 a repoint to a value that names no endpoint sends nothing — not to the default, not to the old endpoint', async () => {
+  // The regression this round exists for, end to end: before it, "/" and " "
+  // resolved to the default and the bearer went to z.ai. The fetch fence makes
+  // any such attempt visible as its own error, and the call must instead fail
+  // with the refusal. Falling back to the CACHED client would be just as
+  // wrong: the operator changed where egress is allowed to go, and the last
+  // good endpoint is one they just stopped naming — the credential fallback
+  // covers a source that failed to RE-READ, not a repoint, and this pins that
+  // the difference is deliberate.
+  const r = await child(`
+process.env.ZAI_BASE_URL = origin;
+await glm.ask({ prompt: 'one', model: 'glm-5.3', reasoning: 'low' });
+const before = seen.length;
+process.env.ZAI_BASE_URL = '/';
+try {
+  await glm.ask({ prompt: 'two', model: 'glm-5.3', reasoning: 'low' });
+  out.sentAnyway = true;
+} catch (e) { out.refusal = String(e && e.message ? e.message : e); }
+out.requestsAfter = seen.length - before;`);
+  assert.ok(r.refusal,
+    `the repointed call must fail — ${JSON.stringify(r.sentAnyway ?? r.threw)}`);
+  assert.match(r.refusal, /ZAI_BASE_URL/,
+    `the failure must be the refusal, not a fetch-fence trip or anything else — got ${JSON.stringify(r.refusal)}`);
+  assert.equal(r.requestsAfter, 0,
+    'nothing may be sent after the repoint — not to the default, not to the old endpoint');
+});
+
+test('#42 a difference that is only spelling does not rebuild the client', async () => {
+  // The other half of the split: normalisation STAYS, on the comparison. But
+  // "spelling" means what the SDK cannot tell apart, and its own join folds
+  // exactly ONE trailing slash (it appends the request path without its
+  // leading slash when the base ends in "/") while the URL parse drops
+  // surrounding whitespace — so those reuse the cached client, connection
+  // reuse being what the cache exists for, and a value written that way must
+  // still produce a working request, because what is sent is the operator's
+  // own spelling. A different endpoint still rebuilds.
+  const r = await child(`
+process.env.ZAI_BASE_URL = ' ' + origin + '/';
+const res = await glm.ask({ prompt: 'slash', model: 'glm-5.3', reasoning: 'low' });
+out.worked = res.text === 'ok' && seen.length === 1;
+const first = glm.getClient();
+process.env.ZAI_BASE_URL = origin;
+const second = glm.getClient();
+process.env.ZAI_BASE_URL = origin + '/';
+const third = glm.getClient();
+out.spellingsReuse = first === second && second === third;
+process.env.ZAI_BASE_URL = 'http://127.0.0.1:1';
+out.repointRebuilds = glm.getClient() !== third;`);
+  assert.equal(r.worked, true,
+    `a slashed, space-padded spelling of a real endpoint must still produce a working request — ${JSON.stringify(r.threw ?? r)}`);
+  assert.equal(r.spellingsReuse, true,
+    'one trailing slash and padding are spelling the SDK cannot tell apart — the cached client must be reused');
+  assert.equal(r.repointRebuilds, true,
+    'a different endpoint must still rebuild the client');
+});
+
+test('#42 a re-spelling the SDK sends differently goes where the operator now points', async () => {
+  // A history-dependent routing bug: several trailing slashes, or whitespace
+  // the request path lands inside, are NOT differences in writing — the SDK
+  // joins the base with the path as written, so "/prefix///" requests
+  // /prefix///v1/messages and "/prefix " requests /prefix%20/v1/messages —
+  // yet trim-and-strip-all folded them all into one cache key. After a call
+  // on /prefix, a call configured for /prefix/// kept the client built for
+  // /prefix and the request went where it went LAST time, not where the
+  // operator now pointed it. The assertion is on the request that actually
+  // arrives, not on object identity — identity was exactly what let this
+  // survive the last round's test.
+  for (const [respelling, expectedPath] of [
+    ['/prefix///', '/prefix///v1/messages'],
+    ['/prefix ', '/prefix%20/v1/messages'],
+  ]) {
+    const r = await child(`
+process.env.ZAI_BASE_URL = origin + '/prefix';
+await glm.ask({ prompt: 'one', model: 'glm-5.3', reasoning: 'low' });
+const first = glm.getClient();
+process.env.ZAI_BASE_URL = origin + ${JSON.stringify(respelling)};
+await glm.ask({ prompt: 'two', model: 'glm-5.3', reasoning: 'low' });
+out.rebuilt = glm.getClient() !== first;
+out.paths = seen.map((s) => s.url);`);
+    assert.equal(r.threw, undefined,
+      `the respelled call must succeed — ${JSON.stringify(r.threw ?? r)}`);
+    assert.deepEqual(r.paths, ['/prefix/v1/messages', expectedPath],
+      `ZAI_BASE_URL respelled to ${JSON.stringify(respelling)} must send its request to ${expectedPath} — it went to ${JSON.stringify(r.paths?.[1])}, the spelling the CACHED client was built with`);
+    assert.equal(r.rebuilt, true,
+      `a spelling the SDK sends differently (${JSON.stringify(respelling)}) must rebuild the client`);
+  }
 });
 
 // ------------------------------------------ #20: max_tokens is a cap
