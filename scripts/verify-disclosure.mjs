@@ -117,10 +117,49 @@ out.text = glm.buildFileContext(${JSON.stringify(paths)}, ${JSON.stringify(WORK)
     fail(`#26 overshoot: the note must still name the path the caller asked for — ${JSON.stringify(absent.notes)}`);
   }
 
+  // The same probe through a GLOB. A pattern can be spelled to match exactly
+  // one name — `secret[.]txt` — so if a matched-but-unreadable file reports
+  // differently from a pattern that matched nothing, the oracle survives the
+  // literal fix. The requirement is not one shared phrasing across literals
+  // and patterns (a caller knows which it used); it is that WITHIN each kind,
+  // absent and unreadable are the same answer.
+  const gAbsent = notes(['absent[.]txt']);
+  const gLocked = notes(['locked[.]txt']);
+  const gA = shape(gAbsent.notes, 'absent[.]txt');
+  const gL = shape(gLocked.notes, 'locked[.]txt');
+  if (JSON.stringify(gA) !== JSON.stringify(gL)) {
+    fail(`#26: a glob spelled to match one name tells a missing file from an unreadable one:\n  missing:    ${JSON.stringify(gAbsent.notes)}\n  unreadable: ${JSON.stringify(gLocked.notes)}`);
+  }
+  if (gLocked.text.includes('LOCKED-BODY')) fail('the glob read a file it should not have');
+
   // A good file beside a skipped one is still read.
   const mixed = notes(['locked.txt', 'readable.txt']);
   if (!mixed.text.includes('READABLE-BODY')) {
     fail(`a skipped file must not take its neighbour down — ${JSON.stringify(mixed)}`);
+  }
+
+  // ------------------- 2b. a key that exists but cannot be reached
+  // existsSync() is false when an ANCESTOR directory is unsearchable, so the
+  // guarded read is never attempted: the operator gets no diagnostic, and the
+  // caller is told no key is configured when one is — it simply cannot be
+  // reached. Absent and unreachable are different problems with different
+  // fixes, and telling them apart is the operator's business, not the
+  // caller's, so the distinction belongs on stderr and the caller gets the
+  // same guarded message either way.
+  chmodSync(join(HOME, '.config'), 0o000);
+  let blocked;
+  try {
+    blocked = child(`out.key = glm.resolveApiKey();`, { HOME, USERPROFILE: HOME });
+  } finally {
+    chmodSync(join(HOME, '.config'), 0o700);
+  }
+  if (blocked.key) fail('the fixture did not deny the traversal (running as root?) — this case cannot be verified here');
+  if (!blocked.threw) fail(`resolveApiKey must fail when the key cannot be reached — ${JSON.stringify(blocked)}`);
+  if (/no .*key found/i.test(blocked.threw)) {
+    fail(`#26: a key file that exists but cannot be reached is reported as absent. The caller is sent to create a key it already has:\n  ${blocked.threw.split('\n')[0]}`);
+  }
+  if (leaks(blocked.threw)) {
+    fail(`#26: the unreachable-key message leaks a path — ${blocked.threw.split('\n')[0]}`);
   }
 
   // ------------------------------- 3. our words, not the regex engine's (#28)
