@@ -194,30 +194,39 @@ test('#40 a file that reached the model before the cut is not among the drops, e
   }
 });
 
-test('#40 a pattern\'s later matches past the cap are named, not vanished', () => {
+test('#40 a pattern cut by the cap is named as its argument, its unread matches are not', () => {
   // The tests above cover the literal route: four named files, each past the
   // cap, each named by its own argument's note. But a glob is how most
   // callers name many files at once, and it takes a different path through
-  // the same code — a pattern that had ANY match spoken for is answered with
-  // silence, so once the cap took one of its matches, the rest fell past the
-  // cut without a word. One pattern, three matches, a cap that delivers the
-  // first and truncates the second: the third must be recoverable from the
-  // notes, and the one argument must still cost one note (#26) — which is
-  // why the names ride inside the truncation's own note rather than adding a
-  // note per dropped match.
+  // the same code. The cap's notes answer ARGUMENTS, not files: the caller
+  // knows what it supplied and needs to know which of THAT did not fully
+  // arrive so it can curate and retry — a filename it never sent would be
+  // something it learns, and a file that matched a pattern and was never read
+  // can only be NAMED if it exists, so enumerating the unread matches
+  // answers "does this file exist?", #26's oracle in the cap's wording. One
+  // pattern, three matches, a cap that delivers the first and truncates the
+  // second: the pattern is named, the matches are not, and the one argument
+  // still costs one note (#26).
   const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-cap-glob-')));
   try {
     const MD = ['a-one.md', 'b-two.md', 'c-three.md'];
     for (const n of MD) writeFileSync(join(dir, n), 'm'.repeat(600));
     const r = ctx(['*.md'], dir, { GLM_MCP_MAX_FILE_CHARS: '1000' });
     assert.ok(r.text.includes('--- a-one.md ---'), 'the fixture must deliver a-one.md whole');
-    assert.ok(r.notes.some((n) => /truncat/i.test(n) && n.includes('b-two.md')),
-      `b-two.md must be where the cut is reported — ${JSON.stringify(r.notes)}`);
-    // As with the literal route: naming alone is not enough, and `no matches`
-    // would claim a file the pattern matched never existed.
-    const dropNote = r.notes.find((x) => x.includes('c-three.md'));
-    assert.ok(dropNote && /not read|cap|truncat/i.test(dropNote) && !/no matches/i.test(dropNote),
-      `c-three.md matched the caller's pattern, never reached the model, and no note honestly names it — ${JSON.stringify(r.notes)}`);
+    assert.ok(r.text.includes('(truncated)'), 'the fixture must truncate b-two.md — it proves nothing');
+    // The pattern is the caller's own argument, so naming it tells the caller
+    // nothing it did not supply; and `no matches` beside content that came
+    // from this very pattern would be the one message that forecloses the
+    // retry — it claims the pattern matched nothing.
+    const argNote = r.notes.find((x) => x.includes('*.md'));
+    assert.ok(argNote && /truncat|not read|cap/i.test(argNote) && !/no matches/i.test(argNote),
+      `'*.md' did not fully arrive and no note names the argument — ${JSON.stringify(r.notes)}`);
+    // Neither the match the cap truncated nor the match it never attempted
+    // may be named: both names exist only because the files do.
+    for (const n of ['b-two.md', 'c-three.md']) {
+      assert.ok(!r.notes.some((x) => x.includes(n)),
+        `${n} is a match of the pattern, not an argument — naming it tells the caller which files exist: ${JSON.stringify(r.notes)}`);
+    }
     assert.equal(r.notes.length, 1,
       `one argument must cost one note — a note per dropped match would reopen #26: ${JSON.stringify(r.notes)}`);
     // The mirror-image lie: a-one arrived whole, and reporting it as dropped
@@ -227,6 +236,48 @@ test('#40 a pattern\'s later matches past the cap are named, not vanished', () =
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('#40 a pattern\'s unread matches under the cap do not tell absent from unreadable', (t) => {
+  // The trade this round exists to undo: naming a pattern's unread matches
+  // under the cap answers "does this file exist?" — a name can only be
+  // produced for a file that is there. The third match of *.md is
+  // present-but-unreadable in one run and absent in the other; the notes
+  // must not say which, while the cap still cuts and the pattern is still
+  // named as the argument that did not fully arrive.
+  const check = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-cap-glob-0-')));
+  writeFileSync(join(check, 'canary'), 'X');
+  const denied = deniesRead(join(check, 'canary'));
+  rmSync(check, { recursive: true, force: true });
+  if (!denied) {
+    t.skip('chmod 000 did not deny the read (running as root?) — the pattern cap oracle cannot be exercised here');
+    return;
+  }
+  const probe = (present) => {
+    const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-cap-glob-oracle-')));
+    try {
+      for (const n of ['a-one.md', 'b-two.md']) writeFileSync(join(dir, n), 'm'.repeat(600));
+      if (present) {
+        const f = join(dir, 'c-secret.md');
+        writeFileSync(f, 'S'.repeat(600));
+        chmodSync(f, 0o000);
+      }
+      return ctx(['*.md'], dir, { GLM_MCP_MAX_FILE_CHARS: '1000' });
+    } finally {
+      try { chmodSync(join(dir, 'c-secret.md'), 0o600); } catch { /* absent */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const present = probe(true);
+  const absent = probe(false);
+  assert.ok(present.notes.some((n) => /truncat/i.test(n)),
+    `the fixture must actually cut the reads — ${JSON.stringify(present.notes)}`);
+  assert.ok(!present.text.includes('S'), 'the unreadable body leaked');
+  assert.ok(present.notes.some((n) => n.includes('*.md')),
+    `the pattern must still be named as the argument that did not fully arrive — ${JSON.stringify(present.notes)}`);
+  assert.deepEqual(present.notes, absent.notes,
+    `the cap plus a pattern tells a caller whether an unreadable file exists — ${JSON.stringify({
+      present: present.notes, absent: absent.notes })}`);
 });
 
 test('#40 naming the drops does not tell absent from unreadable after the cut', (t) => {

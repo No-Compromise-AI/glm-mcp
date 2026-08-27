@@ -626,8 +626,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // was read and yielded nothing.
   let capCutAt = -1;
 
-  for (let fi = 0; fi < files.length; fi++) {
-    const { p, via, resolved, arg } = files[fi];
+  for (const { p, via, resolved, arg } of files) {
     // Re-checked at read time because a glob match may be a symlink whose
     // target leaves the roots only once resolved; the anchor could not see it.
     if (denied.has(resolved)) {
@@ -718,35 +717,24 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         chunks.push(`${sep}${theader}${taken}`);
         total += (sep ? 2 : 0) + theader.length + taken.length;
       }
-      // #40: the cut also owns the entries after it — they were never
-      // attempted, and the pendings loop below answers ARGUMENTS, not the
-      // matches inside them. A literal past the cut is named by its own
-      // argument's note, and a pattern that contributed nothing is named by
-      // its own too; but a pattern that DID contribute something is answered
-      // with silence — any match spoken for suppresses its note — so its
-      // later matches would vanish without a word, and a glob is how most
-      // callers name many files at once. Those matches are named here, inside
-      // the one note the cap event already produced: this note describes the
-      // cut, not an argument, so the list adds no note to any argument
-      // (#26's one-per-argument line) and carries exactly the files no other
-      // note will name.
-      const notRead: string[] = [];
-      for (const later of files.slice(fi + 1)) {
-        // A literal entry is its argument's own spelling, and the note that
-        // argument receives below names it already.
-        if (later.via === later.p) continue;
-        // The same test the pendings loop will apply: a pattern some match of
-        // which was spoken for gets no note there, which is what makes its
-        // remaining matches this note's to carry. `spokenFor` has settled for
-        // the loop by now — everything after the cut is unprocessed — so the
-        // answer here is the one the pendings loop would give.
-        const found = patternMatches.get(later.via)?.found;
-        if (found && [...found].some((key) => spokenFor.has(key))) notRead.push(later.p);
-      }
+      // #40, at argument granularity: the note says where the cut began by
+      // naming the ARGUMENT that was being read — `via`, the caller's own
+      // spelling — never the file. For a literal the two are the same string,
+      // and naming it tells the caller nothing it did not supply. For a
+      // pattern's match the filename is something the caller would be
+      // LEARNING — it sent the pattern — and naming which match the cap
+      // reached, or which matches it never reached, can only happen for files
+      // that exist, which is #26's existence oracle wearing the cap's hat.
+      // What the caller needs in order to curate and retry is which of ITS
+      // arguments did not fully arrive, and an argument is something it
+      // already knows. The truncated match's partial body still stands in the
+      // text under its own (truncated) header, so the model loses nothing;
+      // the note keeps to the caller's side of the boundary. This one note is
+      // also the pattern's answer: the pendings loop below stays silent about
+      // a pattern it cut inside of, so the argument is said exactly once.
       notes.push({
         arg,
-        msg: `truncated at ${MAX_FILE_CHARS} total chars starting with: ${p}` +
-          (notRead.length > 0 ? `; not read: ${notRead.join(", ")}` : ""),
+        msg: `truncated at ${MAX_FILE_CHARS} total chars starting with: ${via}`,
       });
       // The cap cut the loop here, so the entries after this one were never
       // attempted. `capCutAt` records whose read was underway (#40): every
@@ -771,7 +759,11 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // pattern some of whose matches WERE read says nothing — `no matches`
   // beside content that came from this very pattern would not be the truth,
   // and the note would still disclose that another of its matches existed
-  // and could not be read. And a pattern whose walk was stopped — by a
+  // and could not be read. That includes the pattern the cap cut inside of:
+  // the truncation note above has already named the argument, and to say
+  // more here — which matches survived the cut, which never reached the
+  // model — could only be decided by whether those files exist, which is
+  // #26's oracle again. And a pattern whose walk was stopped — by a
   // limit, or by a boundary refusal — is excused entirely: refused is not
   // the same as absent, that note already speaks for it, and "no matches"
   // beside it would claim it was simply wrong.
