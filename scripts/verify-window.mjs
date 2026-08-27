@@ -126,6 +126,7 @@ if (small.context === large.context) {
 }
 
 const fixture = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-window-')));
+const fixtureRoot = fixture;
 try {
   // Larger than the smallest budget and smaller than the largest, so the same
   // file is truncated for one model and whole for the other. That is the
@@ -262,9 +263,7 @@ out.notes = c.notes;`, env);
       upstream.close();
     }
   }
-} finally {
-  rmSync(fixture, { recursive: true, force: true });
-}
+
 
 // ---- rule 6: every model the guidance routes to has a declared window
 // #54 is what made this reachable: before it, every request went to the
@@ -281,6 +280,74 @@ for (const id of namedInGuidance) {
   if (row.context === undefined) {
     fail(`#59: the routing guidance sends callers to ${id} and no window is recorded for it, so its file context is sized against the ${'1,048,576'}-token assumption whatever it actually has. Routing to a model whose window nobody wrote down is exactly how this became reachable — record it, or stop recommending the model.`);
   }
+}
+
+// ---- rule 9: the published numbers, pinned independently of the code
+// Every rule above reads the windows OUT OF the implementation and checks
+// relationships between them, which cannot notice a wrong number: with
+// glm-4.7 mistyped as 2,000,000 instead of 200,000 this gate passed and so did
+// the whole test suite. Relationships need a second source of truth to be
+// anchored to, so these are z.ai's published figures written down — the same
+// thing verify-capacity.mjs does with PUBLISHED for the output limits, and the
+// one place duplication is right: these are facts about the world, confirmed
+// against z.ai's model documentation, not a copy of a spelling in our code.
+const PUBLISHED_WINDOWS = [
+  ['glm-5.3', 1_048_576],
+  ['glm-5.3-flash', 1_048_576],
+  ['glm-4.7', 200_000],
+  ['glm-4.6', 200_000],
+  ['glm-4.5', 128_000],
+  ['glm-4.6v', 128_000],
+];
+for (const [model, tokens] of PUBLISHED_WINDOWS) {
+  const r = child(`out.window = glm.contextWindowTokens(${JSON.stringify(model)});`);
+  if (r.threw) fail(`#59: contextWindowTokens(${model}) threw — ${r.threw}`);
+  if (r.window !== tokens) {
+    fail(`#59: ${model}'s context window resolves to ${r.window}, and z.ai publishes ${tokens}. The budget is derived from this number, so a wrong one sizes every prompt for that model wrongly — and the relationship rules above cannot see it, because they read the same figure they are checking.`);
+  }
+}
+
+// ---- rule 10: a note claims a window only where a window is known
+// #26's rule, in a new place: the note may not state as fact something the
+// code does not know. Three sources produce a budget and only one of them is
+// the model's own window — a model the table does not know keeps the
+// documented ASSUMPTION, and GLM_MCP_CONTEXT_TOKENS is the OPERATOR's figure
+// for every model alike. Reporting either as "<model>'s N-token context
+// window" invents a published number for a model that has none, and for
+// glm-99-unreleased invents one for a model that does not exist.
+{
+  const attributes = (note) => /'s\s[\d,_]+-token context window|\bof\s+\S+'s\s+window/i.test(note ?? '');
+
+  const undeclaredId = KNOWN.find((m) => m.context === undefined)?.id;
+  if (!undeclaredId) fail('#59: every model declares a window, so rule 10 has no undeclared case to check — either the table changed or this gate is misreading it');
+
+  // Big enough to truncate under the widest budget, so the note actually fires.
+  const huge = join(fixtureRoot, 'huge.txt');
+  writeFileSync(huge, 'x'.repeat(3_500_000));
+  const noteFor = (model, env = {}) => {
+    const r = child(`
+process.env.GLM_MCP_ROOTS = ${JSON.stringify(fixtureRoot)};
+const c = glm.buildFileContext(['huge.txt'], ${JSON.stringify(fixtureRoot)}, ${JSON.stringify(model)});
+out.notes = c.notes;`, env);
+    return (r.notes ?? []).find((n) => /truncat/i.test(n)) ?? '';
+  };
+
+  const undeclared = noteFor(undeclaredId);
+  if (!undeclared) fail(`#59: ${undeclaredId} did not truncate a 3,500,000-char file, so rule 10 cannot check its note`);
+  if (attributes(undeclared)) {
+    fail(`#59: the note calls the fallback assumption ${undeclaredId}'s own context window — ${JSON.stringify(undeclared)}. No window is published for it; the figure is this package's documented assumption, and stating it as the model's invents a fact. Say which it is.`);
+  }
+
+  const declaredId = declared[0].id;
+  const overridden = noteFor(declaredId, { GLM_MCP_CONTEXT_TOKENS: 90_000 });
+  if (!overridden) fail(`#59: ${declaredId} did not truncate under GLM_MCP_CONTEXT_TOKENS=90000`);
+  if (attributes(overridden) && !/GLM_MCP_CONTEXT_TOKENS/.test(overridden)) {
+    fail(`#59: with GLM_MCP_CONTEXT_TOKENS set, the note reports the operator's number as the model's own window — ${JSON.stringify(overridden)}. ${declaredId} publishes ${declared[0].context}; 90,000 is the operator's override, and attributing it to the model tells the caller something untrue about the model.`);
+  }
+}
+
+} finally {
+  rmSync(fixture, { recursive: true, force: true });
 }
 
 console.log('WINDOW OK');
