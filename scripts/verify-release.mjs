@@ -123,7 +123,11 @@ for (const [file, yaml] of [['publish.yml', publishYml], ['ci.yml', ciYml]]) {
 
 // ------------------------------- #27: the release gate is no weaker than CI
 // A tag must not be able to ship something a pull request would have caught.
-const verifySteps = (body) => [...body.matchAll(/run:\s*npm run (verify:[a-z]+)/g)].map((m) => m[1]).sort();
+// `[a-z-]`, not `[a-z]`: a hyphenated gate name was invisible to this parser,
+// and invisible on BOTH sides — so the ci-vs-publish comparison below would
+// have passed a gate that ran in one and not the other, which is the exact
+// blindness this file exists to prevent.
+const verifySteps = (body) => [...body.matchAll(/run:\s*npm run (verify:[a-z][a-z-]*)/g)].map((m) => m[1]).sort();
 // Every gate that EXISTS must run in CI. Comparing the release gate to CI
 // only catches the release falling behind CI; when both fall behind the
 // package.json scripts — as they did, by four gates — the comparison passes
