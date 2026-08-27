@@ -229,6 +229,28 @@ test('#25 a code the message itself labels as a code still maps', () => {
   assert.match(explainError(new Error(body)), BALANCE);
 });
 
+test('#25 a code is a whole token, not the prefix of one', () => {
+  // `1113abc` and `1113_retry` are different codes from `1113`. A guard that
+  // stops a trailing digit but not a trailing letter or underscore explains a
+  // vendor-suffixed code as the bare code's problem — the same mistake the bare
+  // substring made, one character narrower.
+  const suffixed = [
+    '400 {"error":{"code":"1113abc"}}',
+    '400 {"error":{"code":"1113_retry"}}',
+    '400 {"error":{"code":"1210x"}}',
+  ];
+  for (const message of suffixed) {
+    const explained = explainError(new Error(message));
+    for (const [label, re] of [['balance', BALANCE], ['reasoning', REASONING], ['credential', CREDENTIAL]]) {
+      assert.ok(!re.test(explained),
+        `${JSON.stringify(message)} carries a suffixed code, which is not the bare ${label} code`);
+    }
+    assert.ok(explained.includes(message), 'a code that is not ours to explain passes through untranslated');
+  }
+  // The whole value still maps — the guard narrows the token, not the code.
+  assert.match(explainError(new Error('400 {"error":{"code":"1113"}}')), BALANCE);
+});
+
 test('#25 an error nobody has a translation for passes through unchanged', () => {
   assert.equal(explainError(new Error('something entirely unexpected')),
     'something entirely unexpected');
@@ -326,4 +348,53 @@ test('#20 with reasoning off on a model that permits it, max_tokens goes through
   assert.equal(sent.max_tokens, 100,
     `with reasoning off, max_tokens must be exactly what was asked — got ${sent.max_tokens}`);
   assert.equal(sent.thinking, undefined, 'reasoning "none" must send no thinking block');
+});
+
+test('#20 every cap sends a request the API accepts, or is refused before sending', async () => {
+  // One cap is exactly what missed this: a whole band of caps scaled the
+  // thinking budget under the minimum the Messages API accepts for
+  // budget_tokens, so the cap was "honoured" locally and rejected on arrival
+  // with a 400. Sweeping the caps around both boundaries holds the invariant
+  // everywhere instead of at the one value the author thought of.
+  const caps = [1, 100, 1024, 1025, 2000, 4096, 4097, 4200, 5000, 5119, 5120, 5200, 8192, 30000];
+  const r = await child(`
+process.env.ZAI_BASE_URL = origin;
+out.cases = [];
+for (const cap of ${JSON.stringify(caps)}) {
+  const before = seen.length;
+  try {
+    await glm.ask({ prompt: 'hi', model: 'glm-5.3', reasoning: 'max', maxTokens: cap });
+    out.cases.push({ cap, sent: seen[before] ? seen[before].body : null });
+  } catch (e) {
+    out.cases.push({ cap, refused: String(e && e.message ? e.message : e), reached: seen.length > before });
+  }
+}`);
+  const MIN_BUDGET = 1024; // the Messages API minimum for thinking.budget_tokens
+  let sentCount = 0;
+  let refusedCount = 0;
+  for (const c of r.cases ?? []) {
+    if (c.refused !== undefined) {
+      refusedCount++;
+      assert.ok(!c.reached,
+        `cap ${c.cap} was refused only after reaching the API — a refusal must come before a request exists`);
+      assert.match(c.refused, /max_tokens/,
+        `cap ${c.cap}: the refusal must name max_tokens — got ${JSON.stringify(c.refused)}`);
+      assert.match(c.refused, /at least \d+/,
+        `cap ${c.cap}: the refusal must say what to change — got ${JSON.stringify(c.refused)}`);
+      continue;
+    }
+    sentCount++;
+    assert.ok(c.sent, `cap ${c.cap} neither sent a request nor refused — ${JSON.stringify(r.threw ?? c)}`);
+    assert.ok(c.sent.max_tokens <= c.cap,
+      `cap ${c.cap} was sent as max_tokens ${c.sent.max_tokens} — the cap is a ceiling`);
+    assert.ok(c.sent.thinking,
+      `cap ${c.cap} sent no thinking block — reasoning was asked for and glm-5.3 rejects a request without one`);
+    const b = c.sent.thinking.budget_tokens;
+    assert.ok(b >= MIN_BUDGET,
+      `cap ${c.cap} sent budget_tokens ${b}, under the API minimum of ${MIN_BUDGET} — a request invalid on arrival honours the cap nowhere`);
+    assert.ok(b < c.sent.max_tokens,
+      `cap ${c.cap} sent budget_tokens ${b} with max_tokens ${c.sent.max_tokens} — nothing left to answer with`);
+  }
+  assert.ok(refusedCount > 0, 'the smallest caps cannot hold any thinking budget — at least one must be refused');
+  assert.ok(sentCount > 0, 'the largest caps must produce requests');
 });

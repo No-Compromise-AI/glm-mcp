@@ -50,11 +50,22 @@ const BUDGET: Record<Exclude<Reasoning, "none">, number> = {
 };
 
 /**
- * Tokens of the output cap reserved for the answer itself. The API requires
- * max_tokens > thinking.budget_tokens, so a request that reasons needs at least
- * this much room beneath the cap or there is nothing left to answer with (#20).
+ * Tokens of the output cap set aside for the answer where the cap can afford
+ * it. The API requires max_tokens > thinking.budget_tokens, so a reasoning
+ * request prefers this much room beneath the cap (#20); where the cap cannot
+ * afford it, the budget bottoms out at {@link MIN_BUDGET_TOKENS} instead and
+ * the answer takes whatever is left — a small cap was the caller's choice, and
+ * it buys less reasoning first.
  */
 const ANSWER_ROOM = 4096;
+
+/**
+ * The least thinking budget the Messages API accepts. Scaling down to fit a
+ * small cap stops here: below this the request is not smaller but invalid, and
+ * the API answers it with a 400 — so the cap it was scaled to honour is
+ * honoured nowhere (#20).
+ */
+export const MIN_BUDGET_TOKENS = 1024;
 
 /**
  * Resolve the z.ai key without ever hardcoding it:
@@ -407,14 +418,22 @@ export async function ask(args: AskArgs): Promise<AskResult> {
     // #20: max_tokens is documented as an output cap, so it is one. The
     // thinking budget scales DOWN to fit beneath it — never up, and never the
     // cap raised to fit the budget, which is how a requested cap of 1 used to
-    // leave as a billable 28,672. What cannot fit is refused below, before a
-    // request exists to send.
-    const budget = Math.min(BUDGET[reasoning], args.maxTokens - ANSWER_ROOM);
-    if (budget <= 0) {
+    // leave as a billable 28,672. The scaling stops at the API's own floor: a
+    // budget pushed under MIN_BUDGET_TOKENS is not a smaller request but an
+    // invalid one, rejected on arrival. A cap that cannot hold even the floor,
+    // with the headroom the API's budget_tokens < max_tokens rule insists on,
+    // is refused here — before a request exists to send, naming the least cap
+    // that would work.
+    const budget = Math.max(
+      MIN_BUDGET_TOKENS,
+      Math.min(BUDGET[reasoning], args.maxTokens - ANSWER_ROOM),
+    );
+    if (budget >= args.maxTokens) {
       throw new Error(
-        `max_tokens ${args.maxTokens} leaves no room to reason: the thinking budget ` +
-          `must fit beneath the cap with at least ${ANSWER_ROOM} tokens for the answer, ` +
-          `so max_tokens must be at least ${ANSWER_ROOM + 1}` +
+        `max_tokens ${args.maxTokens} cannot hold a thinking budget: the budget ` +
+          `cannot be scaled below the API minimum of ${MIN_BUDGET_TOKENS} and must ` +
+          `stay beneath max_tokens, so max_tokens must be at least ` +
+          `${MIN_BUDGET_TOKENS + 1}` +
           (THINKING_REQUIRED.has(model)
             ? `. ${model} always reasons and cannot run with reasoning off — raise ` +
               `max_tokens, or switch to a model that permits it (e.g. glm-4.6).`
@@ -478,7 +497,10 @@ function zaiCode(e: unknown): string | undefined {
   const fromBody = body?.error?.code ?? body?.code;
   if (typeof fromBody === "number" || typeof fromBody === "string") return String(fromBody);
   const msg = e instanceof Error ? e.message : String(e);
-  const labelled = /\bcode\b["']?\s*[:=]?\s*["']?(\d+)(?!\d)/i.exec(msg);
+  // A code is a whole token, so the digits must end where the code's value
+  // ends: `1113abc` and `1113_retry` are different codes from `1113`, exactly
+  // as `11130` is, and none of them may be read as the bare code.
+  const labelled = /\bcode\b["']?\s*[:=]?\s*["']?(?<!\w)(\d+)(?!\w)/i.exec(msg);
   return labelled?.[1];
 }
 

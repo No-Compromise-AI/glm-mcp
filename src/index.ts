@@ -8,6 +8,7 @@ import {
   DEFAULT_MODEL,
   explainError,
   listModels,
+  MIN_BUDGET_TOKENS,
   type Reasoning,
 } from "./glm.js";
 
@@ -60,9 +61,10 @@ server.registerTool(
         .optional()
         .describe(
           "Max output tokens — a hard cap. The request never exceeds it; the thinking " +
-            "budget scales down to fit beneath it, leaving room for the answer. A cap too " +
-            "small to reason under (below 4097) is refused on models that always reason " +
-            "(GLM-5.3) rather than silently raised. Default 8192.",
+            "budget scales down to fit beneath it, leaving room for the answer, but never " +
+            `below the API minimum of ${MIN_BUDGET_TOKENS}. A cap of ${MIN_BUDGET_TOKENS} or ` +
+            "less cannot reason and is refused rather than silently raised — on GLM-5.3, " +
+            "which always reasons, the only fix is a higher cap. Default 8192.",
         ),
     },
   },
