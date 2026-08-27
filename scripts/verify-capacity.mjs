@@ -21,6 +21,9 @@
 //   * an UNKNOWN model is not capped locally. z.ai ships models faster than
 //     this table can be updated, and a tool that refuses tomorrow's model to
 //     protect a guess is the same mistake in a new place.
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { createServer } from 'node:http';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -179,6 +182,60 @@ out.len = c.text.length; out.notes = c.notes; out.cap = glm.MAX_FILE_CHARS;`, en
   }
 } finally {
   rmSync(fixture, { recursive: true, force: true });
+}
+
+// ------------------------------- 4. the tool, not just the function beneath it
+// Everything above calls ask() directly. index.ts is what an MCP client
+// actually reaches, and it had its own `?? 8192`: restoring that would leave
+// every check above green while real callers stayed capped at an eighth of
+// the model's default. So drive the server over stdio, the way smoke.mjs
+// does, and read what comes out the other end.
+{
+  const captured = [];
+  const upstream = createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      captured.push(raw ? JSON.parse(raw) : null);
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({
+        model: 'glm-5.3',
+        content: [{ type: 'text', text: 'ok' }],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }));
+    });
+  });
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${upstream.address().port}`;
+
+  const entry = new URL('../dist/index.js', import.meta.url).pathname;
+  const client = new Client({ name: 'glm-mcp-capacity-gate', version: '1.0.0' });
+  try {
+    await client.connect(new StdioClientTransport({
+      command: process.execPath,
+      args: [entry],
+      env: {
+        PATH: process.env.PATH ?? '',
+        HOME: process.env.HOME ?? '',
+        ZAI_API_KEY: 'dummy-key-for-the-local-server',
+        ZAI_BASE_URL: origin,
+      },
+    }));
+    // No max_tokens: the tool must fall through to the model's own default.
+    const res = await client.callTool({
+      name: 'glm_ask',
+      arguments: { prompt: 'hi', model: 'glm-5.3', reasoning: 'low' },
+    });
+    if (res.isError) fail(`#36: glm_ask failed against the local server — ${res.content?.[0]?.text}`);
+    if (captured.length !== 1) fail(`#36: expected one upstream request from glm_ask, saw ${captured.length}`);
+    const viaTool = captured[0];
+    if (viaTool.max_tokens < 65_536) {
+      fail(`#36: through the MCP tool, glm_ask asked for max_tokens ${viaTool.max_tokens}. The function beneath it defaults correctly, so index.ts is capping callers on its own.`);
+    }
+  } finally {
+    await client.close().catch(() => {});
+    upstream.close();
+  }
 }
 
 console.log('CAPACITY OK');

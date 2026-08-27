@@ -189,6 +189,21 @@ test('#35 the input budget is derived from the window, not guessed', () => {
   const r = ctx({});
   assert.equal(typeof r.cap, 'number', `MAX_FILE_CHARS must be exported — got ${JSON.stringify(r.threw ?? r)}`);
   assert.ok(r.cap > 800_000, `the 800,000 round guess must be gone — got ${r.cap}`);
+
+  // The inputs are asserted BEFORE the derivation that uses them. Computing
+  // the expectation from the module's own constants and comparing it to a cap
+  // built from those same constants is a tautology: it would hold just as well
+  // if the window were 1,000,000 or the ratio 2.9. These are the values this
+  // change was specified against, so they are stated here independently.
+  assert.equal(glm.CONTEXT_WINDOW_TOKENS, 1_048_576,
+    "GLM-5.3's window per the model listings — z.ai publishes output limits but not context length");
+  assert.equal(glm.CHARS_PER_TOKEN, 3.0,
+    'the English-and-code ratio this default is deliberately sized for');
+  assert.ok(glm.PROMPT_RESERVE_TOKENS > 0 && glm.PROMPT_RESERVE_TOKENS <= 32_768,
+    `the prompt reserve must be real but modest — got ${glm.PROMPT_RESERVE_TOKENS}`);
+  assert.equal(glm.outputLimits(glm.DEFAULT_MODEL).def, 65_536,
+    "the output reserve is the default model's own default");
+
   assert.ok(r.cap >= 2_500_000,
     `at ~3 chars/token the budget must use most of the 1,048,576-token window — got ${r.cap}`);
   assert.equal(r.cap, derived(glm.CONTEXT_WINDOW_TOKENS),
