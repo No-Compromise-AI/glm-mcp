@@ -19,7 +19,13 @@
 //        refused, never replaced with the default — ZAI_BASE_URL is how
 //        egress is scoped (#22), so a set value is sent as written or
 //        refused, while normalisation stays on the comparison that decides
-//        whether to rebuild the client.
+//        whether to rebuild the client. "Names an endpoint" means a REQUEST
+//        URL can be made of it — the SDK's own join of base and /v1/messages,
+//        the exact string it will parse — not that the base parses bare: a
+//        trailing space after the authority passes the second question and
+//        fails the first, and a resolver that asked the easier one started
+//        servers whose every glm_ask died on the SDK's anonymous
+//        "Invalid URL".
 //
 // #20 and #22 are captured against a real local HTTP server rather than a mock
 // of our own code — that is how #20 was reproduced. #20's server lives in this
@@ -441,37 +447,60 @@ test('#42 with ZAI_BASE_URL unset the chat endpoint is exactly what it has alway
 test('#42 a base URL the operator SET but that names no endpoint is refused, never replaced', async () => {
   // The CLASS, not a list of spellings — a list is what cost two rounds,
   // each closing the arrangement it knew ("/", "//", whitespace) and
-  // reopening for the next ("/ /", "//\t//"). The class is every string of
-  // length 1..4 over '/', ' ' and '\t', 120 of them, generated the way the
-  // acceptance gate generates it, plus the empty string — which is
-  // `ZAI_BASE_URL="${HOST}"` with HOST unset, the ordinary way an operator
-  // reaches this class and the reason the refusal covers it whole: the SDK
-  // does not reject an empty baseURL, it substitutes api.anthropic.com, so
-  // "send what they wrote" has no honest spelling for ''. The resolver's
-  // question is "can a URL be made of this?", so the test asks the same
-  // question of the class first — if URL ever parses one of these, the
-  // generator is wrong and must say so rather than check the wrong thing.
-  // The refusal must name the variable and say the default is not
-  // substituted, because the operator's next move depends on knowing no
-  // fallback is going to catch them.
+  // reopening for the next ("/ /", "//\t//"). The third round cost one more:
+  // the resolver asked the SDK's question of the WRONG STRING, so the class
+  // here is generated and then classified by the oracle the resolver must
+  // match — the SDK's own join of base and /v1/messages, the exact string
+  // its buildURL() parses at request time. Two families:
+  //
+  //   A  every string of length 1..4 over '/', ' ' and '\t', plus "" — the
+  //      empty string being `ZAI_BASE_URL="${HOST}"` with HOST unset, the
+  //      ordinary way an operator reaches this class. None is a URL under
+  //      either question; all must be refused.
+  //
+  //   B  bare-parseable bases with trailing whitespace runs appended — the
+  //      family the BARE question cannot catch, because the URL parser
+  //      drops surrounding space while REJECTING a space the join lands
+  //      inside the authority. The join splits it: a space after the
+  //      authority ("http://h ", "http://h \t") is refused; a tab anywhere
+  //      is deleted by the parser rather than rejected, and a space after a
+  //      path is a legal (if odd) path character, so those spellings are
+  //      SENT as written. Asserting the accepted half too is not filler: a
+  //      resolver that refused every trailing-whitespace value would pass a
+  //      refusal-only test while replacing the SDK's own verdict with a
+  //      character class of our own — the exact move this round closes.
+  const joins = (v) => { try { return new URL(v + (v.endsWith('/') ? '' : '/') + 'v1/messages').href; } catch { return undefined; } };
+  const bare = (v) => { try { return new URL(v).href; } catch { return undefined; } };
+
   const alphabet = ['/', ' ', '\t'];
-  const values = [''];
+  const familyA = [''];
   let round = [''];
   for (let n = 0; n < 4; n++) {
     round = round.flatMap((p) => alphabet.map((c) => p + c));
-    values.push(...round);
+    familyA.push(...round);
   }
-  for (const v of values) {
-    let parsed = true;
-    try { new URL(v); } catch { parsed = false; }
-    assert.ok(!parsed,
-      `the class generator produced ${JSON.stringify(v)}, which URL parses — the class is wrong, not the resolver`);
+  const familyB = [];
+  for (const base of ['http://127.0.0.1:1', 'http://example.com', 'https://api.example.com:8443', ' http://127.0.0.1:1/x']) {
+    for (const suffix of ['', ' ', '\t', '  ', ' \t', '\t ', '\t\t']) familyB.push(base + suffix);
   }
-  // One child for all 121: a spawn each would make this the slowest test in
-  // the file for no extra evidence, and the assertion is per-value either way.
-  // The last line pins the other half of the property: a value a URL CAN be
-  // made of is returned exactly as written — the parse is the test, never a
-  // normalisation of what gets sent.
+
+  // The generators answer to the oracle before the resolver does: if family A
+  // ever produces a value the SDK join accepts, or family B one the BARE
+  // parse rejects, the generator drifted and must say so rather than check
+  // the wrong thing.
+  for (const v of familyA) assert.equal(joins(v), undefined,
+    `family A produced ${JSON.stringify(v)}, which the SDK join accepts — the class is wrong, not the resolver`);
+  for (const v of familyB) assert.notEqual(bare(v), undefined,
+    `family B produced ${JSON.stringify(v)}, which does not even parse bare — the class is wrong, not the resolver`);
+  assert.ok(familyB.some((v) => joins(v) === undefined),
+    'family B no longer contains a value the bare parse accepts and the join refuses — it has stopped exercising the defect it exists for');
+  assert.ok(familyB.some((v) => joins(v) !== undefined && /\s$/.test(v)),
+    'family B no longer contains a whitespace-suffixed value the join accepts — the sent-as-written half of the property has nothing to pin');
+
+  // One child for all of family A and B: a spawn each would make this the
+  // slowest test in the file for no extra evidence, and the assertion is
+  // per-value either way.
+  const values = [...familyA, ...familyB];
   const r = await child(`
 const values = ${JSON.stringify(values)};
 out.rows = [];
@@ -480,23 +509,66 @@ for (const v of values) {
   const row = { v };
   try { row.url = glm.baseUrl(); } catch (e) { row.refused = String(e && e.message ? e.message : e); }
   out.rows.push(row);
-}
-process.env.ZAI_BASE_URL = ' http://127.0.0.1:1/x ';
-out.asWritten = glm.baseUrl();`);
+}`);
   assert.equal(r.threw, undefined,
     `the class case must run at all — ${JSON.stringify(r.threw)}`);
-  assert.equal(r.asWritten, ' http://127.0.0.1:1/x ',
-    `a set value a URL can be made of is returned as written, not normalised — got ${JSON.stringify(r.asWritten)}`);
   assert.equal(r.rows.length, values.length,
     `every value must be tried — got ${r.rows.length} of ${values.length}`);
   for (const row of r.rows) {
-    assert.ok(row.refused !== undefined,
-      `ZAI_BASE_URL=${JSON.stringify(row.v)} must be refused, not resolved — got ${JSON.stringify(row.url ?? row)}`);
-    assert.match(row.refused, /ZAI_BASE_URL/,
-      `ZAI_BASE_URL=${JSON.stringify(row.v)}: the refusal must name the variable — got ${JSON.stringify(row.refused)}`);
-    assert.match(row.refused, /not replaced with the default/,
-      `ZAI_BASE_URL=${JSON.stringify(row.v)}: the refusal must say the default is not substituted — got ${JSON.stringify(row.refused)}`);
+    const joinHref = joins(row.v);
+    if (joinHref === undefined) {
+      assert.ok(row.refused !== undefined,
+        `ZAI_BASE_URL=${JSON.stringify(row.v)} names nothing the SDK could send — the resolver must refuse it, got ${JSON.stringify(row.url ?? row)}`);
+      assert.match(row.refused, /ZAI_BASE_URL/,
+        `ZAI_BASE_URL=${JSON.stringify(row.v)}: the refusal must name the variable — got ${JSON.stringify(row.refused)}`);
+      assert.match(row.refused, /not replaced with the default/,
+        `ZAI_BASE_URL=${JSON.stringify(row.v)}: the refusal must say the default is not substituted — got ${JSON.stringify(row.refused)}`);
+    } else {
+      assert.equal(row.url, row.v,
+        `ZAI_BASE_URL=${JSON.stringify(row.v)} sends a working request (${joinHref}) and must be returned exactly as written, never normalised — got ${JSON.stringify(row.url ?? row.refused)}`);
+    }
   }
+});
+
+test('#42 a repoint to a value the SDK cannot join a request onto fails with the refusal, not its own anonymous one', async () => {
+  // The third round's regression, end to end. `ZAI_BASE_URL=<origin> ` — one
+  // trailing space — parses bare, so before this round the repoint was
+  // accepted, the cached client was rebuilt for it, and the next call died
+  // inside the SDK's buildURL with a bare "Invalid URL" that named no
+  // variable: the late anonymous failure the refusal at resolution exists to
+  // prevent. The call must instead fail with the refusal that names
+  // ZAI_BASE_URL, and nothing may be sent — not to the stub, so not to the
+  // old endpoint either.
+  const r = await child(`
+process.env.ZAI_BASE_URL = origin;
+await glm.ask({ prompt: 'one', model: 'glm-5.3', reasoning: 'low' });
+const before = seen.length;
+process.env.ZAI_BASE_URL = origin + ' ';
+try {
+  await glm.ask({ prompt: 'two', model: 'glm-5.3', reasoning: 'low' });
+  out.sentAnyway = true;
+} catch (e) { out.refusal = String(e && e.message ? e.message : e); }
+out.requestsAfter = seen.length - before;`);
+  assert.ok(r.refusal,
+    `the repointed call must fail — ${JSON.stringify(r.sentAnyway ?? r.threw)}`);
+  assert.match(r.refusal, /ZAI_BASE_URL/,
+    `the failure must be the resolver's refusal naming the variable, not the SDK's anonymous "Invalid URL" — got ${JSON.stringify(r.refusal)}`);
+  assert.equal(r.requestsAfter, 0,
+    'nothing may be sent after the repoint — a value no request URL can be made of sends nothing');
+});
+
+test('#42 a startup ZAI_BASE_URL the SDK cannot join a request onto stops the server', async () => {
+  // The module-scope half: BASE_URL resolves at import, so the refusal an
+  // operator gets for configuring egress this way is a server that does not
+  // start — the earliest moment the right person is looking — rather than
+  // one that starts, answers glm_models, and fails every glm_ask with
+  // "Invalid URL" attached to nothing.
+  const r = await child(`out.url = glm.baseUrl();`,
+    { ZAI_BASE_URL: 'http://example.com ' }, 20_000, { lazy: true });
+  assert.match(r.threw ?? '', /ZAI_BASE_URL/,
+    `the import must refuse, naming the variable the operator just set — got ${JSON.stringify(r.threw ?? r)}`);
+  assert.match(r.threw ?? '', /not replaced with the default/,
+    `the startup refusal must still say the default is not substituted — got ${JSON.stringify(r.threw)}`);
 });
 
 test('#42 a repoint to a value that names no endpoint sends nothing — not to the default, not to the old endpoint', async () => {

@@ -166,14 +166,23 @@ function comparableEndpoint(url: string): string {
  * states are not interchangeable: an operator who scoped where the key goes
  * did not scope it so that a mistyped value would fall back to the vendor's
  * own host. And whether a SET value names an endpoint at all is answered the
- * one way it can be — by trying to make a URL of it, the same test the SDK
- * applies when it joins the request path — never by deleting characters and
+ * one way it can be — by trying to make a URL of the exact string the SDK
+ * will parse at request time, base and request path already joined — never
+ * of the base alone, and never by deleting characters and
  * judging what is left: two rounds went to that, each fix closing the
  * spellings it knew ("/", "//", whitespace) and the next arrangement
  * ("/ /", "//\t//") walking through, because a rule written against a
- * character class always has one more spelling outside it. A value no URL can
- * be made of — which is exactly what `ZAI_BASE_URL="${HOST}/"` with HOST
- * unset leaves — is refused here, naming the variable, rather than replaced.
+ * character class always has one more spelling outside it. A value no request
+ * URL can be made of — which is exactly what `ZAI_BASE_URL="${HOST}/"` with
+ * HOST unset leaves — is refused here, naming the variable, rather than
+ * replaced. That the question is asked of the JOIN and not of the base bare
+ * is the third round's lesson: `ZAI_BASE_URL="http://host "` parses bare,
+ * because the parser drops a trailing space, while the joined
+ * `http://host /v1/messages` has that space inside the authority, where no
+ * URL can be made of it — so a resolver asking the easier question started
+ * servers whose every glm_ask failed with the SDK's anonymous "Invalid URL",
+ * the late unnamed failure the refusal exists to prevent, one character class
+ * later.
  *
  * Refusing rather than sending the value as written for the SDK to reject (the
  * behaviour before #42) is a deliberate choice with two grounds. The SDK does
@@ -201,12 +210,23 @@ export function baseUrl(): string {
   // what is SENT is not the parse's business (comparableEndpoint owns the one
   // job a normalised form has: comparing). A value that fails is refused.
   // Nothing here trims or strips, because every such rule has a spelling
-  // outside it — the parse is the SDK's own question asked early.
+  // outside it. And the string parsed is the SDK's own join, not the value
+  // bare — the SDK's buildURL() asks `new URL(baseURL + "/v1/messages")` at
+  // request time, minus the path's leading slash where the base supplies its
+  // own trailing one, and the bare question does not agree with it: the
+  // parser DROPS a trailing space off a bare value and REJECTS it once the
+  // request path lands it inside the authority, so `http://host ` asked bare
+  // started a server whose every glm_ask died on the SDK's anonymous
+  // "Invalid URL". Asking the SDK's question, of the SDK's string, is the
+  // same verdict at resolution as at request time by construction — there is
+  // no spelling left for this side to get wrong on its own. The expression is
+  // comparableEndpoint()'s own (the same join, for comparing); if either copy
+  // ever moves, the other must follow it.
   try {
-    new URL(raw);
+    new URL(raw + (raw.endsWith("/") ? "" : "/") + "v1/messages");
   } catch {
     throw new Error(
-      `ZAI_BASE_URL is set to ${JSON.stringify(raw)}, which no URL can be made of. It ` +
+      `ZAI_BASE_URL is set to ${JSON.stringify(raw)}, which no request URL can be made of. It ` +
         `is not replaced with the default (${DEFAULT_BASE_URL}): the variable is how ` +
         `egress is scoped, so a value that is set is sent as written or refused, never ` +
         `quietly swapped for a host the operator did not name. Unset it to use ` +
