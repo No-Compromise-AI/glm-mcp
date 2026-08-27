@@ -40,8 +40,13 @@ const OUTPUT_LIMITS = new Map<string, { def: number; max: number; role: string }
   ["glm-5", { def: 65_536, max: 131_072, role: "the first of the 5 generation" }],
   ["glm-5-turbo", { def: 65_536, max: 131_072, role: "a lower-latency tier of the 5 family" }],
   ["glm-5v-turbo", { def: 65_536, max: 131_072, role: "vision model; this server sends text only, so its image modality goes unused" }],
-  ["glm-4.7", { def: 65_536, max: 131_072, role: "the newer of the 4.6/4.7 text pair; it runs with reasoning off" }],
-  ["glm-4.6", { def: 65_536, max: 131_072, role: "runs with reasoning off; the cheap route for bulk mechanical work" }],
+  // These two CAN run with reasoning off — and the role must keep saying it as
+  // a choice, never as behaviour: glm_ask defaults an omitted reasoning to
+  // "low", so they reason with 2,048 thinking tokens until the caller selects
+  // "none". "Runs with reasoning off" sold the option as the default and cost
+  // the latency-sensitive caller exactly the thinking they came to avoid.
+  ["glm-4.7", { def: 65_536, max: 131_072, role: "the newer of the 4.6/4.7 text pair; it can run with reasoning off when you select reasoning 'none'" }],
+  ["glm-4.6", { def: 65_536, max: 131_072, role: "can run with reasoning off when you select reasoning 'none'; the cheap route for bulk mechanical work" }],
   // The 4.5 text family: the same default against a lower ceiling.
   ["glm-4.5", { def: 65_536, max: 98_304, role: "the 4.5 text family, a generation older with a lower output ceiling" }],
   ["glm-4.5-air", { def: 65_536, max: 98_304, role: "the 4.5 family's light build" }],
