@@ -522,17 +522,6 @@ function collect(
     found.add(root + rel);
   };
 
-  // A pattern that stays literal the whole way through names a single path:
-  // one file, or nothing — directories are traversed, never listed.
-  if (rest.length === 0) {
-    try {
-      if (statSync(base).isFile()) emit(start);
-    } catch {
-      return; // a path that cannot be stat'd matches nothing
-    }
-    return;
-  }
-
   // A class that will not compile becomes a note here — in the shape
   // buildFileContext's catch used to lend the throw — rather than a thrown
   // error, because a throw abandons the branches after it: `{[z-a].ts,ok.ts}`
@@ -545,6 +534,27 @@ function collect(
           budgetNote(b, `refused: ${b.pattern} (expansion failed: ${e.message})`),
         ),
   );
+  // A segment that cannot compile matches nothing by construction, so walking
+  // for its matches buys nothing — yet the walk reads real directories, and
+  // every entry it examines is billed to the CALL's shared budget, not this
+  // pattern's: a malformed argument would eat the entries an honest pattern
+  // beside it needed. Nothing can be found and nothing can be spent, so every
+  // compiled segment is checked up front, on every route through here — the
+  // fully literal one that never reaches walk() included — rather than where a
+  // walk would first meet the segment, which is one directory read too late.
+  if (compiled.some((s) => s === MATCHES_NOTHING)) return;
+
+  // A pattern that stays literal the whole way through names a single path:
+  // one file, or nothing — directories are traversed, never listed.
+  if (rest.length === 0) {
+    try {
+      if (statSync(base).isFile()) emit(start);
+    } catch {
+      return; // a path that cannot be stat'd matches nothing
+    }
+    return;
+  }
+
   // An ignored directory is entered only where the pattern spells its name out
   // as a whole segment: `node_modules/foo/**` is an explicit request, while the
   // `*` in `*/body-parser/node_modules/...` must not ride a later literal past

@@ -23,7 +23,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -82,6 +82,7 @@ let sem;
 let cost;
 let canary;
 let note;
+let starve;
 
 before(() => {
   delete process.env.GLM_MCP_GLOB_IGNORE;
@@ -108,10 +109,22 @@ before(() => {
   put(canary, 'a'.repeat(30) + 'b');
   note = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-redos-note-')));
   put(note, 'ok.ts', 'OK-BODY');
+  // The budget-starvation fixture: src/ holds the neighbour's 8 files, and six
+  // sibling directories of 8 files each are what a walk for a never-matching
+  // `**` pattern would read before giving up. An entries budget of 10 covers
+  // src/ alone and nothing past it, so a single wasted directory read shows up
+  // as the neighbour losing files.
+  starve = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-redos-starve-')));
+  mkdirSync(join(starve, 'src'), { recursive: true });
+  for (let i = 0; i < 8; i++) put(starve, join('src', `f${i}.ts`), `SRC-${i}`);
+  for (let d = 0; d < 6; d++) {
+    mkdirSync(join(starve, `d${d}`), { recursive: true });
+    for (let i = 0; i < 8; i++) put(starve, join(`d${d}`, `g${i}.ts`));
+  }
 });
 
 after(() => {
-  for (const root of [sem, cost, canary, note]) rmSync(root, { recursive: true, force: true });
+  for (const root of [sem, cost, canary, note, starve]) rmSync(root, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------- the cost
@@ -255,5 +268,34 @@ test('an uncompilable class inside braces stays a named note, and the good branc
   } finally {
     if (hadRoots) process.env.GLM_MCP_ROOTS = savedRoots;
     else delete process.env.GLM_MCP_ROOTS;
+  }
+});
+
+test('a pattern that can never match costs its neighbour no budget', () => {
+  // The entry budget is the CALL's, shared across its patterns, so what a
+  // malformed argument costs is measured on the honest pattern beside it:
+  // src/*.ts must return the same files whether or not `**/[z-a].ts` — which
+  // can match nothing, ever — sits in front of it. Before the short-circuit
+  // the never-matching walk read every directory first, and the neighbour
+  // came back with 0 of its 8 files under the same GLM_MCP_MAX_ENTRIES=10.
+  const saved = {};
+  for (const k of ['GLM_MCP_ROOTS', 'GLM_MCP_MAX_ENTRIES']) {
+    saved[k] = { had: k in process.env, value: process.env[k] };
+  }
+  const srcFilesRead = (ctx) => (ctx.text.match(/--- src\/f\d+\.ts ---/g) ?? []).length;
+  process.env.GLM_MCP_ROOTS = starve;
+  process.env.GLM_MCP_MAX_ENTRIES = '10';
+  try {
+    const alone = buildFileContext(['src/*.ts'], starve);
+    assert.equal(srcFilesRead(alone), 8, 'src/*.ts on its own must read its 8 files');
+    const both = buildFileContext(['**/[z-a].ts', 'src/*.ts'], starve);
+    assert.equal(srcFilesRead(both), srcFilesRead(alone),
+      'a pattern that can never match must not spend the budget its neighbour needed');
+    assertMalformed(both.notes, '**/[z-a].ts');
+  } finally {
+    for (const [k, { had, value }] of Object.entries(saved)) {
+      if (had) process.env[k] = value;
+      else delete process.env[k];
+    }
   }
 });
