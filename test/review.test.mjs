@@ -33,7 +33,20 @@ test('verdictOf reads the last verdict line and nothing less exact', () => {
   assert.equal(verdictOf('analysis\nVERDICT: PASS'), 'PASS');
   assert.equal(verdictOf('VERDICT: PASS\nreconsidered below\nVERDICT: CHANGES_REQUIRED'),
     'CHANGES_REQUIRED', 'the final word wins, as bin/glm-review\'s tail -1 has it');
-  assert.equal(verdictOf('  VERDICT: PASS  \r'), 'PASS', 'surrounding whitespace is tolerated');
+  // Strict on purpose. bin/glm-review parses with
+  // `grep -oE '^VERDICT: (PASS|CHANGES_REQUIRED)$'`, so anything this accepts
+  // that the grep rejects is a reply the shell tools cannot read — the exact
+  // drift this tool exists to remove.
+  assert.equal(verdictOf('  VERDICT: PASS'), undefined, 'indented is not the canonical spelling');
+  assert.equal(verdictOf('VERDICT:PASS'), undefined, 'the single space is part of the spelling');
+  assert.equal(verdictOf('VERDICT: PASS\r'), undefined, 'a CR is not the canonical spelling either');
+  // The verdict must END the reply, not merely appear in it: a verdict accepted
+  // from the middle is one that can be accepted from a reply the output cap
+  // severed just after it.
+  assert.equal(verdictOf('VERDICT: PASS\nstill thinking about it'), undefined,
+    'a verdict followed by more prose is not the reply\'s final word');
+  assert.equal(verdictOf('analysis\nVERDICT: PASS\n\n  \n'), 'PASS',
+    'trailing blank lines are manners, not meaning');
   assert.equal(verdictOf('VERDICT: PASSISH'), undefined, 'a longer word is not the verdict');
   assert.equal(verdictOf('The verdict: pass, in prose.'), undefined, 'prose is not a verdict line');
   assert.equal(verdictOf(''), undefined);

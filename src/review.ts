@@ -25,21 +25,30 @@ export type Verdict = "PASS" | "CHANGES_REQUIRED";
  * the pipeline boundary, which is a caller problem the tool's description
  * promises away.
  */
-const VERDICT_LINE = /^\s*VERDICT:\s*(PASS|CHANGES_REQUIRED)\s*$/;
+// The canonical spelling, and deliberately the STRICT one: bin/glm-review
+// parses a verdict with `grep -oE '^VERDICT: (PASS|CHANGES_REQUIRED)$'` —
+// anchored, exactly one space, no surrounding whitespace. A looser regex here
+// would accept `VERDICT:PASS` and hand the shell tools a reply they cannot
+// read, which is precisely the drift this tool exists to remove. The two
+// spellings must be one spelling.
+const VERDICT_LINE = /^VERDICT: (PASS|CHANGES_REQUIRED)$/;
 
 /**
- * The verdict a reply carries, or undefined when it carries none. The LAST
- * matching line wins, as bin/glm-review's `tail -1` has it: a reviewer that
- * rehearses both spellings before committing to one is read by its final
- * word, not its first.
+ * The verdict a reply carries, or undefined when it carries none.
+ *
+ * It must be the FINAL non-blank line, not merely present somewhere. A verdict
+ * accepted from the middle of a reply is a verdict that can be accepted from a
+ * reply the output cap severed after it — an unfinished review read as a
+ * finished one. Trailing blank lines are the model's manners, not its meaning,
+ * so they are dropped before the final line is taken.
  */
 export function verdictOf(reply: string): Verdict | undefined {
-  let verdict: Verdict | undefined;
-  for (const line of reply.split("\n")) {
-    const m = VERDICT_LINE.exec(line);
-    if (m) verdict = m[1] as Verdict;
-  }
-  return verdict;
+  const lines = reply.split("\n");
+  while (lines.length > 0 && lines[lines.length - 1]!.trim() === "") lines.pop();
+  const last = lines[lines.length - 1];
+  if (last === undefined) return undefined;
+  const m = VERDICT_LINE.exec(last);
+  return m ? (m[1] as Verdict) : undefined;
 }
 
 /**

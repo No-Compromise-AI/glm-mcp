@@ -398,6 +398,29 @@ server.registerTool(
         maxTokens: max_tokens,
       });
 
+      // #41 again, and ahead of everything below: a reply the output cap
+      // severed is not a finished review, whatever it happens to contain. The
+      // check has to come BEFORE the verdict is accepted — a truncated reply
+      // that already carried its verdict line would otherwise be relayed as a
+      // clean review, and a downstream grep would read an interrupted review
+      // as approval. That is the failure this whole tool exists to prevent,
+      // arriving through the one door the substance floor does not watch.
+      if (result.stopReason === "max_tokens") {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "The review was cut off by the output cap (stopped at max_tokens), so it " +
+                "is not a finished review — whatever verdict it may already have written. " +
+                "Raise max_tokens and ask again. " +
+                `The model's partial reply was: ${JSON.stringify(result.text)}`,
+            },
+          ],
+        };
+      }
+
       // A reply with no verdict is a shape error, not a review: every
       // consumer of this tool — bin/glm-review's grep included — reads the
       // verdict line first and the analysis second, so relaying a
@@ -412,13 +435,9 @@ server.registerTool(
               type: "text" as const,
               text:
                 "The review came back without a verdict: no line reading VERDICT: PASS " +
-                "or VERDICT: CHANGES_REQUIRED, so nothing downstream can consume it." +
-                // #41: a severed reply never reached its own final line — say
-                // why, rather than let the caller blame the model's manners.
-                (result.stopReason === "max_tokens"
-                  ? " The reply was cut off by the output cap (stopped at max_tokens) " +
-                    "before the verdict could be written — raise max_tokens and ask again."
-                  : "") +
+                "or VERDICT: CHANGES_REQUIRED as the final line, so nothing downstream " +
+                "can consume it. (A reply severed by the output cap is refused above this, " +
+                "so this one ended of its own accord without a verdict.) " +
                 ` The model's reply was: ${JSON.stringify(result.text)}`,
             },
           ],

@@ -30,6 +30,16 @@
 //   5. A model reply with no analysis behind it is NOT relayed as a pass. This
 //      is the rubber-stamp rule and it is checked by driving a stub upstream
 //      that returns exactly that.
+//   7. A reply the output cap SEVERED is never relayed as a review, even when
+//      it already contains a verdict. Found in review: the truncation check sat
+//      inside the no-verdict branch, so a capped reply that had written its
+//      verdict early came back as a clean review and a downstream grep read an
+//      interrupted review as approval.
+//   8. The verdict spelling this tool accepts is EXACTLY the spelling
+//      bin/glm-review can parse. Read out of that script's own grep rather than
+//      copied, so the two cannot drift. Also found in review: `VERDICT:PASS`
+//      was accepted here and is unparsable there, which is the drift the tool
+//      exists to remove.
 //   6. And the rule that forbids the wrong fix: the floor must measure the
 //      MODEL'S REPLY, not the prompt. A floor satisfied by a long prompt is not
 //      a floor at all — it would pass every rubber stamp ever sent, which is
@@ -39,7 +49,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { createServer } from 'node:http';
-import { mkdtempSync, writeFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, realpathSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -51,6 +61,7 @@ const fail = (msg) => { throw new Error(msg); };
 function stub() {
   const seen = [];
   let reply = 'placeholder';
+  let stop = 'end_turn';
   const server = createServer((req, res) => {
     let raw = '';
     req.on('data', (c) => { raw += c; });
@@ -60,6 +71,7 @@ function stub() {
       res.end(JSON.stringify({
         model: 'glm-5.3',
         content: [{ type: 'text', text: reply }],
+        stop_reason: stop,
         usage: { input_tokens: 10, output_tokens: 5 },
       }));
     });
@@ -67,9 +79,20 @@ function stub() {
   return {
     server, seen,
     setReply: (t) => { reply = t; },
+    setStop: (t) => { stop = t; },
     listen: () => new Promise((r) => server.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${server.address().port}`))),
   };
 }
+
+// bin/glm-review's own parser, read rather than restated. If that grep changes,
+// this gate changes with it and rule 8 keeps meaning what it says.
+const SHELL = readFileSync(new URL('../bin/glm-review', import.meta.url), 'utf8');
+const grepLine = SHELL.split('\n').find((l) => l.includes("grep -oE") && l.includes('VERDICT'))
+  ?? fail('rule 8: cannot find bin/glm-review\'s verdict grep — this gate can no longer compare the two parsers');
+const ere = grepLine.match(/'([^']*VERDICT[^']*)'/)?.[1]
+  ?? fail(`rule 8: cannot read the ERE out of bin/glm-review's grep line: ${grepLine.trim()}`);
+const SHELL_VERDICT = new RegExp(ere);
+const SPELLINGS = ['VERDICT: PASS', 'VERDICT:PASS', '  VERDICT: PASS', 'VERDICT:  PASS', 'VERDICT: CHANGES_REQUIRED'];
 
 const work = realpathSync(mkdtempSync(join(tmpdir(), 'glm-review-gate-')));
 writeFileSync(join(work, 'changed.ts'), 'export const answer = 42;\n');
@@ -122,6 +145,25 @@ try {
     diff: '--- a/changed.ts\n+++ b/changed.ts\n@@\n' + '-// padding\n+// padding\n'.repeat(400),
     spec: 'SPEC-SENTINEL-7f3a: ' + 'the answer must become 42. '.repeat(200),
   } }).then((r) => ({ isError: r.isError, text: text(r) }), (e) => ({ isError: true, text: String(e.message ?? e) }));
+  // rule 7 — a severed reply, carrying a verdict AND ample analysis, so the
+  // only thing that can refuse it is the truncation check itself.
+  up.setStop('max_tokens');
+  up.setReply('B'.repeat(400) + '\nVERDICT: PASS');
+  results.capped = await client.callTool({ name: 'glm_review', arguments: {
+    diff: '--- a\n+++ b\n@@\n-x\n+y\n', spec: 's',
+  } }).then((r) => ({ isError: r.isError, text: text(r) }), (e) => ({ isError: true, text: String(e.message ?? e) }));
+  up.setStop('end_turn');
+
+  // rule 8 — one call per candidate spelling, each with ample analysis so the
+  // substance floor cannot be what refuses it.
+  results.spellings = {};
+  for (const cand of SPELLINGS) {
+    up.setReply('C'.repeat(400) + '\n' + cand);
+    const r = await client.callTool({ name: 'glm_review', arguments: {
+      diff: '--- a\n+++ b\n@@\n-x\n+y\n', spec: 's',
+    } }).then((r) => ({ isError: r.isError }), () => ({ isError: true }));
+    results.spellings[cand] = !r.isError;
+  }
 } finally {
   await client.close().catch(() => {});
   up.server.close();
@@ -159,5 +201,16 @@ check(results.stamp.isError || !/^\s*VERDICT:\s*PASS\s*$/im.test(results.stamp.t
 // ------------------------------------------------------------------- rule 6
 check(results.stampLongPrompt.isError || !/^\s*VERDICT:\s*PASS\s*$/im.test(results.stampLongPrompt.text.replace(/\[.*?\]/gs, '').trim()),
   'rule 6: the same rubber stamp passed once the PROMPT was made long. The substance floor must measure the model\'s reply, not the request — measuring the request passes every rubber stamp ever sent');
+
+// ------------------------------------------------------------------- rule 7
+check(results.capped.isError,
+  `rule 7: a reply severed by the output cap came back as a review. It carried a verdict and 400 characters of "analysis", so neither the verdict check nor the substance floor refused it — only a truncation check placed BEFORE the verdict is read can. Got: ${JSON.stringify(results.capped.text.slice(0, 200))}`);
+
+// ------------------------------------------------------------------- rule 8
+for (const [cand, accepted] of Object.entries(results.spellings)) {
+  const shellTakesIt = SHELL_VERDICT.test(cand);
+  check(accepted === shellTakesIt,
+    `rule 8: glm_review ${accepted ? 'ACCEPTS' : 'REJECTS'} ${JSON.stringify(cand)} but bin/glm-review's grep ${shellTakesIt ? 'accepts' : 'rejects'} it. The two parsers must agree, or this tool hands the shell tools replies they cannot read`);
+}
 
 console.log(`verify-review: ${checks} checks passed`);
