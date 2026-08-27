@@ -28,6 +28,7 @@
     "verify:redos": "node scripts/verify-redos.mjs",
     "verify:release": "node scripts/verify-release.mjs",
     "verify:routing": "node scripts/verify-routing.mjs",
+    "verify:budget": "node scripts/verify-budget.mjs",
     "verify:api": "node scripts/verify-api.mjs",
     "verify:capacity": "node scripts/verify-capacity.mjs",
     "verify:disclosure": "node scripts/verify-disclosure.mjs",
