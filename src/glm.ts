@@ -127,10 +127,20 @@ const DEFAULT_MODELS_URL = "https://api.z.ai/api/paas/v4/models";
  * loads. BASE_URL and MODELS_URL below are the values as of startup, exported
  * for anything that wants to display them; the requests themselves re-read
  * the environment so a caller that pins a variable after import — a test, an
- * operator's launcher — still sends the key where they said (#22).
+ * operator's launcher — still sends the key where they said (#22). That
+ * promise holds for both routes: listModels() fetches modelsUrl() per call,
+ * and getClient() re-resolves the chat endpoint, key and timeout on every
+ * call, rebuilding the client only when one of them actually changed (#42).
+ *
+ * The base URL is normalised to one spelling — trailing slashes dropped, an
+ * empty value read as unset — because it is COMPARED, against the spelling
+ * the cached client was built with (#42): a difference that is only a
+ * difference in writing would rebuild a client for nothing, and a comparison
+ * that misses a real difference is the pin this fix exists to remove.
  */
 export function baseUrl(): string {
-  return process.env.ZAI_BASE_URL ?? DEFAULT_BASE_URL;
+  const url = (process.env.ZAI_BASE_URL ?? "").trim().replace(/\/+$/, "");
+  return url !== "" ? url : DEFAULT_BASE_URL;
 }
 
 export function modelsUrl(): string {
@@ -289,19 +299,78 @@ export function resolveApiKey(): string {
   );
 }
 
+/**
+ * The wall-clock budget GLM_MCP_TIMEOUT_MS names, for the WHOLE call however
+ * many times the SDK retries underneath (#46). It is not divided between
+ * attempts: one attempt may spend nearly all of it — the output default is
+ * 65,536 tokens and a long single call is the normal case — so the client's
+ * per-attempt timeout and the request's deadline signal both carry this same
+ * number, and the per-attempt cap never has to be smaller than the total.
+ *
+ * envLimit (#24): Number("abc") is NaN, and NaN as a timeout is not a wrong
+ * limit but an absent one — every comparison against it is false.
+ */
+function callBudgetMs(): number {
+  return envLimit("GLM_MCP_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
+}
+
+/**
+ * The chat client, cached against the configuration it was built with and
+ * rebuilt only when that configuration changes (#42). The construct-once
+ * singleton this replaced pinned baseURL and key on the first successful
+ * call, so a key rotated on disk or an endpoint repointed in the environment
+ * was never picked up and a long-running server had to be restarted. The fix
+ * is not to build per call: that trades connection reuse away for a freshness
+ * nothing asked to pay for. The resolved configuration is compared instead,
+ * so an unchanged environment returns the identical object and a changed one
+ * gets a client built for it.
+ *
+ * Re-resolution can also start failing mid-life, and a credential that
+ * already resolved is proof one exists: the call is then served from the last
+ * good client rather than failed, and the reason goes to stderr (#26) — the
+ * operator's channel; stdout is the MCP protocol. The key itself is never
+ * logged.
+ */
 let client: Anthropic | undefined;
+let clientBuiltWith: { baseURL: string; key: string; timeout: number } | undefined;
+
 export function getClient(): Anthropic {
-  if (!client) {
-    client = new Anthropic({
-      baseURL: baseUrl(),
-      authToken: resolveApiKey(),
-      apiKey: null,
-      // envLimit (#24): Number("abc") is NaN, and NaN as a timeout is not a
-      // wrong limit but an absent one — every comparison against it is false.
-      timeout: envLimit("GLM_MCP_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
-      maxRetries: 2,
-    });
+  const baseURL = baseUrl();
+  const timeout = callBudgetMs();
+  let key: string;
+  try {
+    key = resolveApiKey();
+  } catch (e) {
+    if (client !== undefined) {
+      const why = e instanceof Error ? e.message : String(e);
+      console.error(
+        `glm-mcp: the z.ai key stopped resolving — ${why} ` +
+          "Continuing on the client built with the last key that did; restart " +
+          "the server to pick the configuration up again.",
+      );
+      return client;
+    }
+    // Nothing was ever built, so there is no client to fall back to — the
+    // caller has to hear what is missing.
+    throw e;
   }
+  if (
+    client !== undefined &&
+    clientBuiltWith &&
+    clientBuiltWith.baseURL === baseURL &&
+    clientBuiltWith.key === key &&
+    clientBuiltWith.timeout === timeout
+  ) {
+    return client;
+  }
+  client = new Anthropic({
+    baseURL,
+    authToken: key,
+    apiKey: null,
+    timeout,
+    maxRetries: 2,
+  });
+  clientBuiltWith = { baseURL, key, timeout };
   return client;
 }
 
@@ -940,7 +1009,12 @@ export async function ask(args: AskArgs): Promise<AskResult> {
     );
   }
 
-  const body: Record<string, unknown> = {
+  // #45: the body carries the SDK's own parameter type, so a field the
+  // Messages API would reject — a max_tokens that is not a number, a message
+  // role outside its union — is a compile error here rather than a runtime
+  // error against the live endpoint. The `as never` this replaces switched
+  // the compiler off for the whole request.
+  const body: Anthropic.Messages.MessageCreateParamsNonStreaming = {
     model,
     max_tokens: maxTokens,
     messages: [{ role: "user", content: prompt }],
@@ -982,11 +1056,26 @@ export async function ask(args: AskArgs): Promise<AskResult> {
     body.thinking = { type: "enabled", budget_tokens: budget };
   }
 
-  const res = (await getClient().messages.create(body as never)) as {
+  // #46: the budget is the call's, not one attempt's. The client's per-attempt
+  // `timeout` bounds nothing once the SDK retries — maxRetries 2 behind a
+  // 600,000ms timeout is three ten-minute attempts — so the request also
+  // carries the same number as an AbortSignal, which the SDK honours across
+  // its whole retry loop (an aborted signal fails without retrying). The
+  // SDK's own retry behaviour is kept, not replaced: status classification,
+  // retry-after, backoff and connection-error retries all still apply
+  // underneath the deadline. One residual, documented beside the knob in the
+  // README: the SDK's backoff sleep between attempts is not abort-aware, so
+  // an abort landing inside it overshoots by up to that sleep.
+  const res = (await getClient().messages.create(body, {
+    signal: AbortSignal.timeout(callBudgetMs()),
+  })) as {
+    // The response is read defensively rather than through the SDK's Message:
+    // z.ai's compatibility is its own claim, and a missing content array or
+    // usage object should cost the caller a zero, not a crash.
     model?: string;
-    stop_reason?: string;
+    stop_reason?: string | null;
     content?: Array<{ type: string; text?: string; thinking?: string }>;
-    usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number };
+    usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number | null };
   };
 
   let text = "";
@@ -1005,7 +1094,7 @@ export async function ask(args: AskArgs): Promise<AskResult> {
       output: res.usage?.output_tokens ?? 0,
       cacheRead: res.usage?.cache_read_input_tokens ?? 0,
     },
-    stopReason: res.stop_reason,
+    stopReason: res.stop_reason ?? undefined,
   };
 }
 
@@ -1017,7 +1106,7 @@ export async function listModels(): Promise<string[]> {
   // through the same validated parsing, so a bare fetch cannot hang the server.
   const r = await fetch(modelsUrl(), {
     headers: { authorization: `Bearer ${key}` },
-    signal: AbortSignal.timeout(envLimit("GLM_MCP_TIMEOUT_MS", DEFAULT_TIMEOUT_MS)),
+    signal: AbortSignal.timeout(callBudgetMs()),
   });
   if (!r.ok) throw new Error(`model list failed: HTTP ${r.status}`);
   const d = (await r.json()) as { data?: Array<{ id: string }> };
