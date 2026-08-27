@@ -20,7 +20,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync, realpathSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -171,24 +171,31 @@ test('#40 every file past the cap is named as not read, and what reached is not 
   }
 });
 
-test('#40 a file that reached the model before the cut is not among the drops, even named again', () => {
+test('#40 a repeated argument past the cut is named for its own position, the first is not', () => {
   const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-cap-reached-')));
   try {
     writeFileSync(join(dir, 'small.txt'), 's'.repeat(50));
     writeFileSync(join(dir, 'big.txt'), 'b'.repeat(300));
     writeFileSync(join(dir, 'after.txt'), 'a'.repeat(50));
     // big.txt trips the cap; after.txt falls past it and must be named as
-    // not read, while the second small.txt argument is deduplicated into the
-    // first's delivered content — it reached the model and must not be
-    // reported as a drop.
+    // not read. The second small.txt argument is deduplicated into the
+    // first's delivered content — the FILE reached the model, but nothing
+    // was read on the second POSITION's behalf, and arrival is tracked per
+    // argument (#40): the first occurrence delivered and is not reported as
+    // a drop, the second is named for its own turn, because crediting it
+    // with the first's read was the spelling-keyed credit — the same keying
+    // that made a symlink twin's silence answer whether the link existed.
     const r = ctx(['small.txt', 'big.txt', 'after.txt', 'small.txt'], dir, { GLM_MCP_MAX_FILE_CHARS: '200' });
     assert.ok(r.notes.some((n) => /truncat/i.test(n) && n.includes('big.txt')),
       `big.txt must be where the cut is reported — ${JSON.stringify(r.notes)}`);
     assert.ok(r.notes.some((n) => n.includes('after.txt') && /not read|cap/i.test(n)
       && !/no matches/i.test(n)),
       `after.txt fell past the cap and must be named as not read — ${JSON.stringify(r.notes)}`);
-    assert.ok(!r.notes.some((n) => n.includes('small.txt')),
-      `a file whose content reached the model must not be named as dropped — ${JSON.stringify(r.notes)}`);
+    const small = r.notes.filter((n) => n.includes('small.txt'));
+    assert.equal(small.length, 1,
+      `the repeated argument must be answered exactly once, for the occurrence that got nothing — ${JSON.stringify(r.notes)}`);
+    assert.match(small[0], /char cap reached, not read/,
+      `the second small.txt was never read because the cap cut before its turn — ${JSON.stringify(small[0])}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -482,6 +489,151 @@ test('#40 a pattern before the cut does not tell absent from unreadable', (t) =>
   assert.deepEqual(present.notes, absent.notes,
     `a pattern before the cut tells a caller whether an unreadable file exists — ${JSON.stringify({
       present: present.notes, absent: absent.notes })}`);
+});
+
+// symlinkSync can be denied by platform policy (Windows without the
+// privilege); the linked-twin probes below cannot run there. Probe once and
+// skip loudly rather than pass falsely, the same stance as deniesRead.
+const canSymlink = (() => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-link-0-')));
+  try {
+    symlinkSync('nowhere', join(dir, 'canary'));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+})();
+
+test('#40/#26 a deduplicated branch twin past the cap does not tell absent from linked', (t) => {
+  // The shape a review of this round caught. 'a[.]md' is a pattern matching
+  // the already-read a.md when it is absent, and a literal when it exists —
+  // and when it is a SYMLINK to a.md, the literal de-duplicates against
+  // a.md's resolved identity, so the argument was answered through the FILE
+  // and stayed silent. Absent, the same argument was named by position.
+  // Which of those answered was decided by whether the link exists: an
+  // oracle in the note count, with the text identical in both worlds.
+  // Crediting the argument through its own SPELLING closes it — the same
+  // test the pattern route already answers.
+  if (!canSymlink) {
+    t.skip('symlinkSync was denied — the linked-twin oracle cannot be exercised here');
+    return;
+  }
+  const probe = (linked) => {
+    const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-twin-cut-')));
+    try {
+      writeFileSync(join(dir, 'a.md'), 'A'.repeat(10));
+      writeFileSync(join(dir, 'big.txt'), 'B'.repeat(200));
+      if (linked) symlinkSync('a.md', join(dir, 'a[.]md'));
+      return ctx(['a.md', 'big.txt', 'a[.]md'], dir, { GLM_MCP_MAX_FILE_CHARS: '100' });
+    } finally {
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* absent */ }
+    }
+  };
+  const absent = probe(false);
+  const linked = probe(true);
+  assert.ok(absent.notes.some((n) => /truncat/i.test(n)),
+    `the fixture must actually cut the reads — ${JSON.stringify(absent.notes)}`);
+  assert.equal(absent.text, linked.text,
+    `the two worlds delivered different text — ${JSON.stringify({ absent: absent.text, linked: linked.text })}`);
+  assert.deepEqual(absent.notes, linked.notes,
+    `the note count tells a caller whether a symlink 'a[.]md' exists — ${JSON.stringify({
+      absent: absent.notes, linked: linked.notes })}`);
+  for (const r of [absent, linked]) {
+    assert.ok(r.notes.some((n) => n.includes('a[.]md')),
+      `the twin argument delivered nothing of its own and must be named — ${JSON.stringify(r.notes)}`);
+  }
+});
+
+test('#40/#26 a deduplicated branch twin before any cap does not tell absent from linked', (t) => {
+  // The same oracle without the cap: 'a[.]md' linked to an already-read a.md
+  // de-duplicates into it and was silent through the file-keyed credit,
+  // while the absent twin — a pattern whose only match that same literal
+  // already claimed — was named for delivering nothing of its own.
+  if (!canSymlink) {
+    t.skip('symlinkSync was denied — the linked-twin oracle cannot be exercised here');
+    return;
+  }
+  const probe = (linked) => {
+    const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-twin-')));
+    try {
+      writeFileSync(join(dir, 'a.md'), 'A'.repeat(10));
+      if (linked) symlinkSync('a.md', join(dir, 'a[.]md'));
+      return ctx(['a.md', 'a[.]md'], dir);
+    } finally {
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* absent */ }
+    }
+  };
+  const absent = probe(false);
+  const linked = probe(true);
+  assert.equal(absent.text, linked.text,
+    `the two worlds delivered different text — ${JSON.stringify({ absent: absent.text, linked: linked.text })}`);
+  assert.deepEqual(absent.notes, linked.notes,
+    `a linked twin beside its own target tells a caller the link exists — ${JSON.stringify({
+      absent: absent.notes, linked: linked.notes })}`);
+  for (const r of [absent, linked]) {
+    assert.ok(r.notes.some((n) => n.includes('a[.]md')),
+      `the twin argument delivered nothing of its own and must be named — ${JSON.stringify(r.notes)}`);
+  }
+});
+
+test('#40/#26 a repeated branch twin past the cap does not tell absent from linked', (t) => {
+  // The repeated spelling is where the two routes had to agree and did not:
+  // absent, the second 'a[.]md' is a pattern and the position rule named it;
+  // linked, it is a literal de-duplicated into the first's read and the
+  // file-keyed credit kept it silent. One spelling, two answers, chosen by
+  // whether the link exists. Both occurrences are now answered on position
+  // alone: the second delivered nothing of its own in either world, so it is
+  // named in either world, cap or no cap.
+  if (!canSymlink) {
+    t.skip('symlinkSync was denied — the linked-twin oracle cannot be exercised here');
+    return;
+  }
+  const probe = (linked) => {
+    const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-twin-rep-')));
+    try {
+      writeFileSync(join(dir, 'a.md'), 'A'.repeat(10));
+      writeFileSync(join(dir, 'big.txt'), 'B'.repeat(200));
+      if (linked) symlinkSync('a.md', join(dir, 'a[.]md'));
+      return ctx(['a[.]md', 'big.txt', 'a[.]md'], dir, { GLM_MCP_MAX_FILE_CHARS: '100' });
+    } finally {
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* absent */ }
+    }
+  };
+  const absent = probe(false);
+  const linked = probe(true);
+  assert.ok(absent.notes.some((n) => /truncat/i.test(n)),
+    `the fixture must actually cut the reads — ${JSON.stringify(absent.notes)}`);
+  assert.deepEqual(absent.notes, linked.notes,
+    `a repeated twin past the cap answers once per world — ${JSON.stringify({
+      absent: absent.notes, linked: linked.notes })}`);
+});
+
+test('#40 a repeated pattern is answered once per occurrence, on position', () => {
+  // Re-pinned by the position rule. The round before keyed a repeated
+  // spelling's credit by the SPELLING, so the second occurrence rode its
+  // twin's delivered matches silently — which left both routes agreeing,
+  // but agreeing on an answer computed from what was READ rather than from
+  // the argument list: the note count then varied with which files existed
+  // and were readable, #26's question. Arrival is now a fact about a
+  // POSITION: the second occurrence had nothing read on its own behalf, so
+  // it is named, in the merged wording, beside the content its twin
+  // delivered — why an argument yields nothing (already read through an
+  // earlier spelling, absent, unreadable) is not the caller's to learn.
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-repeat-')));
+  try {
+    mkdirSync(join(dir, 'src'));
+    writeFileSync(join(dir, 'src', 'one.ts'), 'ONE');
+    writeFileSync(join(dir, 'src', 'two.ts'), 'TWO');
+    const r = ctx(['src/*.ts', 'src/*.ts'], dir);
+    assert.ok(r.text.includes('ONE') && r.text.includes('TWO'),
+      `the pattern's files must still be delivered once — ${JSON.stringify(r.text)}`);
+    assert.deepEqual(r.notes, ['skipped (no matches): src/*.ts'],
+      `the second occurrence had nothing read on its own behalf and must be named for its own position — ${JSON.stringify(r.notes)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // --------------------------------- #41: a severed answer says so

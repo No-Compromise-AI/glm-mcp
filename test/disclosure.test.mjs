@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -594,6 +594,91 @@ process.stdout.write(JSON.stringify({ text: r.text, notes: r.notes }));`;
     assert.deepEqual(present.notes, absent.notes,
       `${JSON.stringify(paths)} under the cap tells a caller whether the file exists — ${JSON.stringify({
         present: present.notes, absent: absent.notes })}`);
+  }
+});
+
+test('a de-duplicating symlink twin and an absent twin answer the same', (t) => {
+  // The shape the fifth round closed and the sixth had to generalise:
+  // ['a.md', 'big.txt', 'a[.]md'] with big.txt exhausting the cap. Nothing
+  // is read on the third argument's behalf in EITHER world — linked, it
+  // de-duplicates into a.md's already-read identity; absent, its only match
+  // is a file the first argument claimed. Crediting the linked twin because
+  // its resolved key was already spoken for made the note COUNT the answer
+  // to "does this file exist?": one note said the link was there, two said
+  // it was not, and not a word of the notes differed for any read done on
+  // the third argument's behalf. Arrival is a fact about the POSITION, so
+  // the two worlds must answer identically.
+  const check = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-twin-symlink-0-')));
+  let canSymlink = true;
+  try {
+    symlinkSync(join(check, 'nowhere'), join(check, 'probe'));
+  } catch {
+    canSymlink = false;
+  } finally {
+    rmSync(check, { recursive: true, force: true });
+  }
+  if (!canSymlink) {
+    t.skip('symlinkSync was denied — the linked-twin oracle cannot be exercised here');
+    return;
+  }
+  // GLM_MCP_MAX_FILE_CHARS is read at module load, so each probe runs in a
+  // child that carries the cap from birth — the same harness as the cap test.
+  const CHILD = `
+import { buildFileContext } from ${JSON.stringify(pathToFileURL(new URL('../dist/glm.js', import.meta.url).pathname).href)};
+const r = buildFileContext(${JSON.stringify(['a.md', 'big.txt', 'a[.]md'])}, process.argv[1]);
+process.stdout.write(JSON.stringify({ text: r.text, notes: r.notes }));`;
+  const twin = (asSymlink) => {
+    const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-twin-symlink-')));
+    try {
+      writeFileSync(join(dir, 'a.md'), 'm'.repeat(300));
+      writeFileSync(join(dir, 'big.txt'), 'b'.repeat(900));
+      if (asSymlink) symlinkSync(join(dir, 'a.md'), join(dir, 'a[.]md'));
+      const childEnv = { ...process.env };
+      for (const k of Object.keys(childEnv)) if (/^(GLM_MCP_|ZAI_)/.test(k)) delete childEnv[k];
+      childEnv.GLM_MCP_ROOTS = dir;
+      childEnv.GLM_MCP_MAX_FILE_CHARS = '700';
+      return JSON.parse(execFileSync(
+        process.execPath,
+        ['--input-type=module', '-e', CHILD, dir],
+        { encoding: 'utf8', env: childEnv, timeout: 30_000, maxBuffer: 16 * 1024 * 1024 },
+      ));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const linked = twin(true);
+  const absent = twin(false);
+  assert.ok(linked.notes.some((n) => /truncated/i.test(n)),
+    `the fixture must actually cut the reads — ${JSON.stringify(linked.notes)}`);
+  assert.deepEqual(linked.notes, absent.notes,
+    `the third argument is answered differently for being a symlink to a.md than for being absent, so the note count reveals the file exists — ${JSON.stringify({
+      linked: linked.notes, absent: absent.notes })}`);
+  // And the shared answer names the caller's own spelling for that position.
+  assert.ok(linked.notes.some((n) => n.includes('a[.]md')),
+    `the third argument's answer must still name the spelling the caller sent — ${JSON.stringify(linked.notes)}`);
+});
+
+test('a repeated identical argument is answered once per argument, not once per file', () => {
+  // The same rule at its simplest: a.md readable, sent twice. The first
+  // position delivers it; the second is de-duplicated into the first's read
+  // and has nothing of its own. Crediting the second occurrence because the
+  // FILE was spoken for was the file-keyed credit — the note count then
+  // answered existence wherever the spelling could name a file two ways, and
+  // the repeated spelling is the literal route's version of the symlink twin.
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-repeat-literal-')));
+  try {
+    writeFileSync(join(dir, 'a.md'), 'A-BODY');
+    isolated({ GLM_MCP_ROOTS: dir }, () => {
+      const r = buildFileContext(['a.md', 'a.md'], dir);
+      assert.ok(r.text.includes('A-BODY'),
+        `the first occurrence must still deliver the file — ${JSON.stringify(r)}`);
+      assert.equal(r.text.split('--- a.md ---').length - 1, 1,
+        `a file named twice is still read once — ${JSON.stringify(r.text)}`);
+      assert.deepEqual(r.notes, ['skipped (no matches): a.md'],
+        `the second occurrence had nothing read on its own behalf and must be named for its own position — ${JSON.stringify(r.notes)}`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

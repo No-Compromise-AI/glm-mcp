@@ -503,30 +503,26 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // argument, so the notes the reads push are filed under it too.
   const files: Array<{ p: string; via: string; resolved: string; arg: number }> = [];
   const included = new Set<string>();
-  // The files this result already speaks for, by resolved identity: one
-  // delivered its content, was truncated, or was refused in a note naming
-  // it. A file that yielded nothing readable is deliberately not here — that
-  // absence is what tells the answer at the end which arguments contributed
-  // nothing at all, and it is why a refusal marks its file: refused is not
-  // absent, and filing a refused entry under "no matches" would claim it was.
-  const spokenFor = new Set<string>();
-  // The spellings the result speaks for through an entry OF THEIR OWN, keyed
-  // by the caller's own spelling (`via`): one of this spelling's matches was
-  // delivered, truncated, or refused in a note naming it. This — not
-  // `spokenFor` — is what credits a pattern with having arrived (#40).
-  // `spokenFor` is keyed by the FILE, so testing a pattern's matches against
-  // it credits the pattern with a file an EARLIER argument read, truncated or
-  // blew the cap on, and a later overlapping pattern then arrived in the
-  // notes' silence while delivering nothing of its own. De-duplication skips
-  // the files entry for a match an earlier argument claimed, so a pattern
-  // that only re-named files some other argument had spoken for never lands
-  // here and is answered as not having arrived — which, for it, is the
-  // truth. Keyed by spelling rather than by argument because the literal
-  // route answers a repeated spelling through the one file it names: a
-  // pattern repeated in the argument list has arrived the same way when its
-  // earlier twin was read, and `no matches` beside content that came from
-  // this very spelling would not be the truth.
-  const spokenVia = new Set<string>();
+  // The ARGUMENT POSITIONS this result already speaks for: the position's
+  // own entry — the one its spelling created, never one an earlier argument
+  // claimed first — delivered content, was truncated, or was refused in a
+  // note naming it. This, and only this, is what "the argument arrived"
+  // means (#40): arrival is a fact about a POSITION, not about a key. Keying
+  // it by the resolved file credited a later argument with an earlier one's
+  // read, and keying it by the spelling credited a repeat with its twin's —
+  // and either way the note COUNT came to answer "does this file exist?"
+  // (#26): a symlink twin de-duplicating against an earlier argument was
+  // answered with a silence an absent twin answered with a note, though
+  // nothing was read on the third argument's behalf in either world. The
+  // position is the caller's own fact, computable from the argument list
+  // alone, so every arrangement of one spelling — repeated, aliased,
+  // overlapping, cut off by the cap — is answered exactly as the arrangement
+  // that matched nothing at all. An argument that yielded nothing readable
+  // is deliberately not here: that absence is what tells the answer at the
+  // end which arguments contributed nothing, and it is why a refusal marks
+  // its argument — refused is not absent, and filing a refused entry under
+  // "no matches" would claim it was.
+  const spokenArgs = new Set<number>();
   // One answer owed to each argument, written when the reads have settled
   // (#26). The literal route used to say its note at once and the pattern
   // route only after the reads; the answer is owed to the ARGUMENT either
@@ -536,10 +532,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // still got nothing it could not equally have got from the file not
   // existing, and that is the answer it receives. First appearance is the
   // arguments' own order, so the answers already read in it.
-  const pendings: Array<
-    | { arg: number; via: string; kind: "literal"; key: string }
-    | { arg: number; via: string; kind: "pattern" }
-  > = [];
+  const pendings: Array<{ arg: number; via: string }> = [];
   for (const [arg, p] of paths.entries()) {
     argAt = arg;
     // The credential rule runs before any existence check (decision 3), so
@@ -562,11 +555,12 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       if (!included.has(resolved)) {
         if (roots && !insideRoots(resolved, roots)) {
           notes.push({ arg, msg: `refused: ${p} resolves outside the allowed roots` });
-          // The refusal speaks for the file, so an entry naming the same
-          // identity later is neither re-refused nor filed under "no
-          // matches": refused is not absent, and this note already says it.
+          // The refusal speaks for this argument, which gets no pending of
+          // its own; an entry naming the same identity later is neither
+          // re-refused nor folded into this note, but answered for its own
+          // position below — refused is not absent, and a later argument
+          // naming the same file still got nothing of its own.
           included.add(resolved);
-          spokenFor.add(resolved);
           continue;
         }
         included.add(resolved);
@@ -574,7 +568,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       }
       // Registered whether this argument created the file entry or was
       // de-duplicated into an earlier one — see pendings.
-      pendings.push({ arg, via: p, kind: "literal", key: resolved });
+      pendings.push({ arg, via: p });
       continue;
     }
     // Limits are notes, never throws — and that goes for hostile input this
@@ -602,7 +596,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       // settled, because whether it arrived is known only then. A pending per
       // argument that sent the spelling — the walk above is per argument too,
       // but de-duplication decides what is read, not what the caller is told.
-      pendings.push({ arg, via: p, kind: "pattern" });
+      pendings.push({ arg, via: p });
       for (const m of matches) {
         const key = keyOf(m);
         if (included.has(key)) continue;
@@ -637,8 +631,9 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         arg,
         msg: `refused (credential path): ${p}${via === p ? "" : ` (matched by ${via})`}`,
       });
-      spokenFor.add(resolved);
-      spokenVia.add(via);
+      // The refusal is this argument's one note: it speaks for the position,
+      // so the answer below stays silent about it.
+      spokenArgs.add(arg);
       continue;
     }
     if (roots && !insideRoots(resolved, roots)) {
@@ -646,8 +641,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         arg,
         msg: `refused: ${p}${via === p ? "" : ` (matched by ${via})`} resolves outside the allowed roots`,
       });
-      spokenFor.add(resolved);
-      spokenVia.add(via);
+      spokenArgs.add(arg);
       continue;
     }
     const abs = resolve(cwd, p);
@@ -668,8 +662,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     const matchedBy = via === p ? "" : ` (matched by ${via})`;
     if (!st.isFile()) {
       notes.push({ arg, msg: `refused (not a regular file): ${p}${matchedBy}` });
-      spokenFor.add(resolved);
-      spokenVia.add(via);
+      spokenArgs.add(arg);
       continue;
     }
     if (st.size > maxFileBytes) {
@@ -678,8 +671,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         msg: `refused (too large): ${p}${matchedBy} is ${st.size} bytes, over the ` +
           `GLM_MCP_MAX_FILE_BYTES limit of ${maxFileBytes}`,
       });
-      spokenFor.add(resolved);
-      spokenVia.add(via);
+      spokenArgs.add(arg);
       continue;
     }
     let raw: Buffer;
@@ -697,17 +689,17 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     // the prompt, none of its bytes count against the budget.
     if (isBinary(raw)) {
       notes.push({ arg, msg: `skipped (binary file): ${p}${matchedBy}` });
-      // The note speaks for the file, so the argument's answer below does not
-      // add `no matches` beside it — skipped is not absent.
-      spokenFor.add(resolved);
-      spokenVia.add(via);
+      // The note speaks for the argument, so its answer below does not add
+      // `no matches` beside it — skipped is not absent.
+      spokenArgs.add(arg);
       continue;
     }
     const body = raw.toString("utf8");
     // Content will be delivered — in full or truncated — so the result
-    // speaks for this file either way, and for the spelling that named it.
-    spokenFor.add(resolved);
-    spokenVia.add(via);
+    // speaks for this argument either way: THIS entry was read on its
+    // behalf, and an entry read on an argument's behalf is the one thing
+    // that credits the argument with having arrived.
+    spokenArgs.add(arg);
     // #19: the header and the separator count toward the cap with the body, so
     // 300 empty files cannot produce a five-figure prompt under a
     // multimillion-char "cap" with no note. `total` is the assembled length so
@@ -739,8 +731,9 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       // already knows. The truncated match's partial body still stands in the
       // text under its own (truncated) header, so the model loses nothing;
       // the note keeps to the caller's side of the boundary. This one note is
-      // also the pattern's answer: the pendings loop below stays silent about
-      // a pattern it cut inside of, so the argument is said exactly once.
+      // also that argument's whole answer: the entry was read on its behalf,
+      // so the pendings loop below stays silent about it and the argument is
+      // said exactly once.
       notes.push({
         arg,
         msg: `truncated at ${MAX_FILE_CHARS} total chars starting with: ${via}`,
@@ -758,31 +751,26 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   }
 
   // The reads have settled, so every argument can be answered now, in the
-  // arguments' own order (#26). The question is the same for a literal and a
-  // pattern alike: did anything arrive ON THIS ARGUMENT'S BEHALF? For a
-  // literal that is `spokenFor` — the one file it names was delivered,
-  // truncated, or refused in a note naming it. For a pattern it is
-  // `spokenVia`: a match of the pattern's OWN must have been spoken for,
-  // because a match spoken for by an earlier argument says nothing about
-  // whether this one delivered anything — the overlap was already read, and
-  // crediting it was how a later overlapping pattern arrived in the notes'
-  // silence while delivering nothing of its own (#40). Nothing spoken for —
-  // not delivered, not truncated, not refused in a note naming it — and the
-  // argument is told `no matches`, the one wording, because the caller must
-  // not be able to tell the reasons apart: the branch its entry took was
-  // chosen by whether the file exists, so a difference between the reasons
-  // is a difference about the machine. A pattern some of whose matches WERE
-  // read on its behalf says nothing — `no matches` beside content that came
-  // from this very pattern would not be the truth, and the note would still
-  // disclose that another of its matches existed and could not be read.
-  // That includes the pattern the cap cut inside of: the truncation note
-  // above has already named the argument, and to say more here — which
-  // matches survived the cut, which never reached the model — could only be
-  // decided by whether those files exist, which is #26's oracle again. And
-  // a pattern whose walk was stopped — by a limit, or by a boundary
-  // refusal — is excused entirely: refused is not the same as absent, that
-  // note already speaks for it, and "no matches" beside it would claim it
-  // was simply wrong.
+  // arguments' own order (#26). The question is one question for a literal
+  // and a pattern alike, and it is about the POSITION: did anything arrive
+  // ON THIS ARGUMENT'S BEHALF — was the entry this argument's own spelling
+  // created delivered, truncated, or refused in a note naming it? Nothing
+  // was, and the argument is named, whatever the reason: it matched nothing,
+  // its match was unreadable, its file had already been read through another
+  // spelling, or the cap cut before its turn. The reasons differ only in
+  // ways that depend on what exists on disk, which is precisely what must
+  // not be inferable (#26) — the branch an entry takes is chosen by whether
+  // the file exists, so both the silence and the note of any finer test
+  // would vary with the machine's answer. Five arrangements of one spelling
+  // (repeated, overlapping, a metacharacter twin, a symlink twin, the cap
+  // landing on someone else's file) each closed one case and revealed the
+  // next because arrival was inferred from what was READ rather than tracked
+  // per argument; per position it needs no lookup of what else happened, so
+  // there is no next arrangement to reveal. The one exception is a pattern
+  // whose walk was stopped — by a limit, or by a boundary refusal: refused
+  // is not the same as absent, that note already speaks for it, and "no
+  // matches" beside it would claim it was simply wrong.
+  //
   // The answer an unfulfilled argument receives (#40). Before the cap cuts
   // the reads it is `no matches`, the merged wording #26 settled on, because
   // whether the file was absent or unreadable must not be tellable. From the
@@ -800,50 +788,25 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       : skipNote(pending.via);
 
   for (const pending of pendings) {
-    if (pending.kind === "literal") {
-      if (!spokenFor.has(pending.key)) {
-        notes.push({ arg: pending.arg, msg: answerNote(pending) });
-      }
-      continue;
-    }
+    // A pattern whose walk a limit or a boundary refusal cut short is excused
+    // entirely — see the comment above answerNote.
     if (limitedPatterns.has(pending.via) || refusedPatterns.has(pending.via)) continue;
-    // #40, and the shape a review of the first cut of this fix caught: a
-    // pattern positioned strictly PAST the cut is answered on position
-    // alone, never on what its walk found. The found set is the machine's
-    // answer — it grows only when files exist — so both a silence and a
-    // note computed from it vary with what is on disk. The silence was the
-    // bug: a pattern whose de-duplicated first match was delivered for an
-    // earlier argument said nothing while its other matches fell past the
-    // cap unread, and the caller could not tell which argument to curate.
-    // A note computed from the found set is the same coin returned: with
-    // ['a.md', 'big.txt', '*.md'], naming the pattern only when a match
-    // beyond a.md exists tells the caller exactly that — #26's oracle
-    // wearing the cap's hat. The branch twin is the leak at its narrowest:
-    // 'a[.]md' is a literal when a file by that name exists and a pattern
-    // matching a.md when it does not, so which route answers was already
-    // chosen by existence. The argument's TURN, unlike its match list, is
-    // the caller's own fact: the cap arrived before the argument was read,
-    // and that is all the note claims — how much of the pattern overlapped
-    // earlier arguments is computable from arguments the caller itself
-    // supplied. The pattern the cap cut INSIDE of is deliberately not here
-    // (arg === capCutAt): the file it was reading is spoken for, so the
-    // spokenVia test below stays silent and the truncation note above
-    // remains that argument's one note (#26).
-    if (capCutAt >= 0 && pending.arg > capCutAt) {
-      notes.push({ arg: pending.arg, msg: answerNote(pending) });
-      continue;
-    }
-    // #40: a pattern is credited with arriving only when a file was read on
-    // its behalf — one of ITS OWN matches delivered, truncated, or refused
-    // in a note naming it. A match in `spokenFor` proves nothing here: the
-    // file may have been spoken for by an EARLIER argument, which is the
-    // overlap this exists to stop crediting, and the branch twin of that
-    // credit was an oracle — 'a[.]md' beside an already-read a.md answered
-    // as a literal when the file existed and as a silent pattern when it
-    // did not. A match the walk merely enumerated proves less still:
-    // enumeration finds files that exist, so anything computed from the
-    // found set answers existence, #26's question, not arrival.
-    if (!spokenVia.has(pending.via)) notes.push({ arg: pending.arg, msg: answerNote(pending) });
+    // The one test, on the caller's own fact: did a file arrive on THIS
+    // position's behalf? Not "was its file spoken for" — an earlier argument
+    // may have read, truncated or blown the cap on that very file, and the
+    // third argument of ['a.md', 'big.txt', 'a[.]md'] with big.txt exhausting
+    // the cap was the shape that proved it: a symlink twin de-duplicating
+    // into a.md was answered with a silence an absent twin answered with a
+    // note, and the count of notes said which world it was. Not "was its
+    // spelling spoken for" either — a repeated spelling rides an earlier
+    // argument's credit the same way. The entry set is not consulted at all:
+    // which entries exist is decided by what matches on disk, so both a
+    // silence and a note computed from it would vary with existence. The
+    // position is settled the moment the caller writes the list, which is
+    // why this is the last arrangement: every spelling of "nothing was read
+    // for me" — matched nothing, unreadable, already read through another
+    // spelling, never reached past the cap — answers here identically.
+    if (!spokenArgs.has(pending.arg)) notes.push({ arg: pending.arg, msg: answerNote(pending) });
   }
 
   // The separators were budgeted per chunk above, so joining is the identity:
