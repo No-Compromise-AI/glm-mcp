@@ -53,7 +53,17 @@ server.registerTool(
           "Reasoning depth. Higher is slower. GLM-5.3 always reasons, so 'none' is raised to 'low' for it.",
         ),
       system: z.string().optional().describe("Optional system prompt."),
-      max_tokens: z.number().int().positive().optional().describe("Max output tokens. Default 8192."),
+      max_tokens: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Max output tokens — a hard cap. The request never exceeds it; the thinking " +
+            "budget scales down to fit beneath it, leaving room for the answer. A cap too " +
+            "small to reason under (below 4097) is refused on models that always reason " +
+            "(GLM-5.3) rather than silently raised. Default 8192.",
+        ),
     },
   },
   async ({ prompt, files, cwd, model, reasoning, system, max_tokens }) => {

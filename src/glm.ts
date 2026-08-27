@@ -4,10 +4,39 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { expandGlob, isGlobPattern, patternAnchors } from "./glob.js";
 import { confineRoots, deniedCredentials, insideRoots, realpathish } from "./confine.js";
-import { envLimit, walkBudget, DEFAULT_MAX_FILE_BYTES } from "./limits.js";
+import {
+  envLimit,
+  walkBudget,
+  DEFAULT_MAX_FILE_BYTES,
+  DEFAULT_MAX_FILE_CHARS,
+  DEFAULT_TIMEOUT_MS,
+} from "./limits.js";
 
 export const DEFAULT_MODEL = "glm-5.3";
-export const BASE_URL = process.env.ZAI_BASE_URL ?? "https://api.z.ai/api/anthropic";
+
+const DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic";
+// A different host AND a different path prefix from the Anthropic-compatible
+// base, so it is configured by its own variable rather than derived (#22):
+// any derivation would be guessing at the operator's gateway layout.
+const DEFAULT_MODELS_URL = "https://api.z.ai/api/paas/v4/models";
+
+/**
+ * The endpoints, resolved when a call is made rather than when the module
+ * loads. BASE_URL and MODELS_URL below are the values as of startup, exported
+ * for anything that wants to display them; the requests themselves re-read
+ * the environment so a caller that pins a variable after import — a test, an
+ * operator's launcher — still sends the key where they said (#22).
+ */
+export function baseUrl(): string {
+  return process.env.ZAI_BASE_URL ?? DEFAULT_BASE_URL;
+}
+
+export function modelsUrl(): string {
+  return process.env.ZAI_MODELS_URL ?? DEFAULT_MODELS_URL;
+}
+
+export const BASE_URL = baseUrl();
+export const MODELS_URL = modelsUrl();
 
 /** Models that reject any request lacking a thinking block (z.ai error 1210). */
 const THINKING_REQUIRED = new Set(["glm-5.3"]);
@@ -19,6 +48,13 @@ const BUDGET: Record<Exclude<Reasoning, "none">, number> = {
   high: 8192,
   max: 24576,
 };
+
+/**
+ * Tokens of the output cap reserved for the answer itself. The API requires
+ * max_tokens > thinking.budget_tokens, so a request that reasons needs at least
+ * this much room beneath the cap or there is nothing left to answer with (#20).
+ */
+const ANSWER_ROOM = 4096;
 
 /**
  * Resolve the z.ai key without ever hardcoding it:
@@ -59,17 +95,21 @@ let client: Anthropic | undefined;
 export function getClient(): Anthropic {
   if (!client) {
     client = new Anthropic({
-      baseURL: BASE_URL,
+      baseURL: baseUrl(),
       authToken: resolveApiKey(),
       apiKey: null,
-      timeout: Number(process.env.GLM_MCP_TIMEOUT_MS ?? 600_000),
+      // envLimit (#24): Number("abc") is NaN, and NaN as a timeout is not a
+      // wrong limit but an absent one — every comparison against it is false.
+      timeout: envLimit("GLM_MCP_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
       maxRetries: 2,
     });
   }
   return client;
 }
 
-const MAX_FILE_CHARS = Number(process.env.GLM_MCP_MAX_FILE_CHARS ?? 800_000);
+// Resolved once per process, so the cap is pinned by the environment the server
+// started with — like the client's, this is a knob of the process, not of a call.
+const MAX_FILE_CHARS = envLimit("GLM_MCP_MAX_FILE_CHARS", DEFAULT_MAX_FILE_CHARS);
 
 /**
  * The first `maxUnits` UTF-16 units of `s`, cut where it cannot split a
@@ -364,9 +404,23 @@ export async function ask(args: AskArgs): Promise<AskResult> {
   if (system) body.system = system;
 
   if (reasoning !== "none") {
-    const budget = BUDGET[reasoning];
-    // The API requires headroom for the answer on top of the thinking budget.
-    body.max_tokens = Math.max(args.maxTokens, budget + 4096);
+    // #20: max_tokens is documented as an output cap, so it is one. The
+    // thinking budget scales DOWN to fit beneath it — never up, and never the
+    // cap raised to fit the budget, which is how a requested cap of 1 used to
+    // leave as a billable 28,672. What cannot fit is refused below, before a
+    // request exists to send.
+    const budget = Math.min(BUDGET[reasoning], args.maxTokens - ANSWER_ROOM);
+    if (budget <= 0) {
+      throw new Error(
+        `max_tokens ${args.maxTokens} leaves no room to reason: the thinking budget ` +
+          `must fit beneath the cap with at least ${ANSWER_ROOM} tokens for the answer, ` +
+          `so max_tokens must be at least ${ANSWER_ROOM + 1}` +
+          (THINKING_REQUIRED.has(model)
+            ? `. ${model} always reasons and cannot run with reasoning off — raise ` +
+              `max_tokens, or switch to a model that permits it (e.g. glm-4.6).`
+            : ` or reasoning must be "none".`),
+      );
+    }
     body.thinking = { type: "enabled", budget_tokens: budget };
   }
 
@@ -397,24 +451,48 @@ export async function ask(args: AskArgs): Promise<AskResult> {
 
 export async function listModels(): Promise<string[]> {
   const key = resolveApiKey();
-  const r = await fetch("https://api.z.ai/api/paas/v4/models", {
+  // modelsUrl() (#22): the endpoint the operator configured, not a hardcoded
+  // api.z.ai — an operator who scoped egress did not scope it just for the chat
+  // client to ship the bearer around it. The timeout is the client's own knob,
+  // through the same validated parsing, so a bare fetch cannot hang the server.
+  const r = await fetch(modelsUrl(), {
     headers: { authorization: `Bearer ${key}` },
+    signal: AbortSignal.timeout(envLimit("GLM_MCP_TIMEOUT_MS", DEFAULT_TIMEOUT_MS)),
   });
   if (!r.ok) throw new Error(`model list failed: HTTP ${r.status}`);
   const d = (await r.json()) as { data?: Array<{ id: string }> };
   return (d.data ?? []).map((m) => m.id);
 }
 
+/**
+ * The error's z.ai code, from wherever the error actually carries it (#25).
+ * Digits alone are not evidence: `msg.includes("1113")` read a request id or a
+ * token count as "no balance" and sent someone to top up a fine account. The
+ * parsed body wins when the error has one — the SDK attaches it, and z.ai
+ * nests the code inside its error object — and a message only counts where it
+ * labels the digits as a code (`"code":"1113"`, `Error code: 1113`), which is
+ * where the SDK puts them when it stringifies a body with no message field.
+ */
+function zaiCode(e: unknown): string | undefined {
+  const body = (e as { error?: { code?: unknown; error?: { code?: unknown } } } | null)?.error;
+  const fromBody = body?.error?.code ?? body?.code;
+  if (typeof fromBody === "number" || typeof fromBody === "string") return String(fromBody);
+  const msg = e instanceof Error ? e.message : String(e);
+  const labelled = /\bcode\b["']?\s*[:=]?\s*["']?(\d+)(?!\d)/i.exec(msg);
+  return labelled?.[1];
+}
+
 /** Turn z.ai's coded errors into something actionable instead of a raw stack. */
 export function explainError(e: unknown): string {
   const msg = e instanceof Error ? e.message : String(e);
-  if (msg.includes("1113")) {
+  const code = zaiCode(e);
+  if (code === "1113") {
     return `z.ai reports no balance or resource package on this key.\n\n${msg}`;
   }
-  if (msg.includes("1210")) {
+  if (code === "1210") {
     return `This model always reasons and cannot run with reasoning disabled. Use reasoning "low", "high", or "max".\n\n${msg}`;
   }
-  if (msg.includes("3007")) {
+  if (code === "3007") {
     return `That credential is the ZCode Start Plan token, which is captcha-locked to the ZCode app. Use an api.z.ai API key instead.\n\n${msg}`;
   }
   return msg;

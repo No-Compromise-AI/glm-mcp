@@ -13,6 +13,8 @@ export function envLimit(name: string, def: number): number {
 }
 
 export const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024;
+export const DEFAULT_MAX_FILE_CHARS = 800_000;
+export const DEFAULT_TIMEOUT_MS = 600_000;
 export const DEFAULT_MAX_DEPTH = 24;
 export const DEFAULT_MAX_ENTRIES = 200_000;
 export const DEFAULT_GLOB_TIMEOUT_MS = 10_000;
