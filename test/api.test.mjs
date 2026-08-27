@@ -267,7 +267,10 @@ out.ms = Date.now() - t;`, {}, 15_000);
   assert.equal(r.resolved, undefined, 'a request to a server that never answers must not resolve');
   assert.match(String(r.error), /timeout|abort/i,
     `the refusal must be the timeout, not something else — got ${JSON.stringify(r.error)}`);
-  assert.ok(r.ms < 5_000, `listModels waited ${r.ms}ms — the timeout must cut it off`);
+    // The request must actually have been made: a failure before it left the
+  // process would satisfy the other assertions without exercising a timeout.
+  assert.ok(r.seen.length >= 1, `the timeout case never reached the server: ${JSON.stringify(r.error ?? r)}`);
+assert.ok(r.ms < 5_000, `listModels waited ${r.ms}ms — the timeout must cut it off`);
 });
 
 // ------------------------------------------ #20: max_tokens is a cap

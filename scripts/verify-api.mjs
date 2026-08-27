@@ -139,6 +139,19 @@ out.results = ${JSON.stringify(jobs)}.map((j) => {
   const REASONING = /always reasons|reasoning disabled/i;
   const CREDENTIAL = /captcha|ZCode Start Plan/i;
 
+  // A code is a whole token. `(?!\d)` stops "11130" but not "1113abc", and a
+  // 400 whose body carries a vendor-suffixed code is not error 1113.
+  const suffixed = explain([
+    { message: '400 {"error":{"code":"1113abc"}}' },
+    { message: '400 {"error":{"code":"1113_retry"}}' },
+    { message: '400 {"error":{"code":"1210x"}}' },
+  ]).results;
+  for (const [i, text] of suffixed.entries()) {
+    if (BALANCE.test(text) || REASONING.test(text) || CREDENTIAL.test(text)) {
+      fail(`#25: a code with a suffix is a different code; case ${i} was translated anyway:\n  ${text.split('\n')[0]}`);
+    }
+  }
+
   const incidental = explain([
     { message: 'Request rejected: prompt is 12103 tokens over the model limit (request id req-5f1113ac)' },
     { message: 'upstream timeout after 1210 ms (trace 9f3007bd)' },
@@ -198,6 +211,11 @@ const t = Date.now();
 try { await glm.listModels(); out.resolved = true; } catch (e) { out.error = String(e.message).slice(0, 80); }
 out.ms = Date.now() - t;`, {}, 15_000);
   if (hung.resolved) fail('#22: a request to a server that never answers must not resolve');
+  // The request has to have been made: a failure before it left the process
+  // would satisfy every assertion below without exercising a timeout at all.
+  if (!(hung.seen?.length >= 1)) {
+    fail(`#22: the timeout case never reached the server, so it proves nothing about timeouts — ${JSON.stringify(hung.error ?? hung)}`);
+  }
   if (!(hung.ms < 10_000)) fail(`#22: listModels waited ${hung.ms}ms with no timeout — it must give up`);
 
   // ------------------------------------------ #20 max_tokens is a cap
@@ -238,6 +256,48 @@ try {
   if (!r.threw) fail('#20: a cap too small for a model that always reasons must be refused, not silently raised');
   if (!/max_tokens|cap|reasoning/i.test(r.threw)) {
     fail(`#20: the refusal must say what is wrong and what to change — got ${JSON.stringify(r.threw)}`);
+  }
+
+  // Every cap must land on one of two honest outcomes: a request that satisfies
+  // the API's own constraints, or a refusal before anything is sent. Sweeping
+  // the boundary is what catches the band where a budget is scaled to fit the
+  // cap but falls under the minimum the API accepts — a payload that is invalid
+  // on arrival is not a cap being honoured, it is a 400 with extra steps.
+  const MIN_BUDGET = 1024;   // Messages API minimum for thinking.budget_tokens
+  const sweep = child(`
+process.env.ZAI_BASE_URL = origin;
+out.cases = [];
+for (const cap of ${JSON.stringify([1, 100, 1024, 2000, 4096, 4097, 4200, 5000, 5119, 5120, 5200, 8192, 30000])}) {
+  const before = seen.length;
+  try {
+    await glm.ask({ prompt: 'hi', model: 'glm-5.3', reasoning: 'max', maxTokens: cap });
+    out.cases.push({ cap, sent: seen[before] ? seen[before].body : null });
+  } catch (e) {
+    out.cases.push({ cap, refused: String(e.message).slice(0, 90), reached: seen.length > before });
+  }
+}`);
+  for (const c of sweep.cases ?? []) {
+    if (c.refused !== undefined) {
+      if (c.reached) fail(`#20: cap ${c.cap} was refused only after reaching the API — refuse before sending`);
+      continue;
+    }
+    if (!c.sent) fail(`#20: cap ${c.cap} neither sent a request nor refused`);
+    if (c.sent.max_tokens > c.cap) fail(`#20: cap ${c.cap} was sent as max_tokens ${c.sent.max_tokens}`);
+    if (c.sent.thinking) {
+      const b = c.sent.thinking.budget_tokens;
+      if (b < MIN_BUDGET) {
+        fail(`#20: cap ${c.cap} sent budget_tokens ${b}, under the API minimum of ${MIN_BUDGET} — a request that is invalid on arrival is not a cap being honoured; refuse instead`);
+      }
+      if (b >= c.sent.max_tokens) {
+        fail(`#20: cap ${c.cap} sent budget_tokens ${b} with max_tokens ${c.sent.max_tokens} — the budget must leave room for an answer`);
+      }
+    }
+  }
+  if (!(sweep.cases ?? []).some((c) => c.refused !== undefined)) {
+    fail('#20: no cap in the sweep was refused — the smallest ones cannot possibly be satisfiable');
+  }
+  if (!(sweep.cases ?? []).some((c) => c.sent)) {
+    fail('#20: no cap in the sweep produced a request — the largest ones must work');
   }
 
   // Reasoning off, on a model that permits it: nothing is inflated.
