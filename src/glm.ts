@@ -329,7 +329,10 @@ function callBudgetMs(): number {
  * already resolved is proof one exists: the call is then served from the last
  * good client rather than failed, and the reason goes to stderr (#26) — the
  * operator's channel; stdout is the MCP protocol. The key itself is never
- * logged.
+ * logged. The warning that lands there points at the repair, never at a
+ * restart: this function re-resolves on every call, so the call after the
+ * source is repaired — or rotated — is the one that picks it up, while a
+ * restart while it is still broken would leave nothing cached to serve with.
  */
 let client: Anthropic | undefined;
 let clientBuiltWith: { baseURL: string; key: string; timeout: number } | undefined;
@@ -343,10 +346,18 @@ export function getClient(): Anthropic {
   } catch (e) {
     if (client !== undefined) {
       const why = e instanceof Error ? e.message : String(e);
+      // The warning points at the repair, never at a restart. A restart was
+      // the pickup path of the singleton this function replaced; against the
+      // re-read it is wrong in both directions — the next call resolves the
+      // source again, so a repaired or rotated key is picked up with nothing
+      // but another call, and while the source stays broken a restart is the
+      // one move that makes things worse, because the restarted process has
+      // no client cached to serve with.
       console.error(
         `glm-mcp: the z.ai key stopped resolving — ${why} ` +
-          "Continuing on the client built with the last key that did; restart " +
-          "the server to pick the configuration up again.",
+          "Continuing on the client built with the last key that did. Repair " +
+          "the credential source; the next call resolves it again and picks " +
+          "up a repaired or rotated key by itself.",
       );
       return client;
     }

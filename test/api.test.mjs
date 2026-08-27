@@ -11,6 +11,10 @@
 //   #20  max_tokens is a cap: never exceeded, the thinking budget scaled down
 //        to fit beneath it, and a cap too small to reason on a model that
 //        always reasons refused before anything is sent.
+//   #42  getClient() re-reads the configuration per call; a credential that
+//        stops resolving mid-life serves the call from the last good client
+//        with the reason on stderr — a warning that must send the operator to
+//        the repair, never to a restart the per-call re-read made pointless.
 //
 // #20 and #22 are captured against a real local HTTP server rather than a mock
 // of our own code — that is how #20 was reproduced. #20's server lives in this
@@ -27,7 +31,7 @@ import { promisify } from 'node:util';
 import { createServer } from 'node:http';
 
 const execFileAsync = promisify(execFile);
-import { mkdtempSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -135,18 +139,23 @@ process.exit(0);
     else childEnv[k] = String(v);
   }
   let out;
+  let stderr = '';
   try {
     const r = await execFileAsync(process.execPath, ['--input-type=module', '-e', src],
       { encoding: 'utf8', env: childEnv, timeout: timeoutMs,
         maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     out = r.stdout;
+    stderr = r.stderr;
   } catch (e) {
     if (e.killed) {
       assert.fail(`the case did not return within ${timeoutMs}ms — a hang is not a result`);
     }
     assert.fail(`child failed\n${e.stderr || e.message}`);
   }
-  return JSON.parse(out);
+  // stderr stays a PIPE here: the promisified execFile silently drops numeric
+  // stdio fds (execFileSync does not), and the #42 case below reads a
+  // SUCCEEDING child's warning from this field.
+  return { ...JSON.parse(out), stderr };
 }
 
 // ------------------------------------------- #24: env numerics are validated
@@ -342,6 +351,66 @@ out.ms = Date.now() - t;`, {}, 15_000);
   // process would satisfy the other assertions without exercising a timeout.
   assert.ok(r.seen.length >= 1, `the timeout case never reached the server: ${JSON.stringify(r.error ?? r)}`);
 assert.ok(r.ms < 5_000, `listModels waited ${r.ms}ms — the timeout must cut it off`);
+});
+
+// ------------------------------------------ #42: the fallback warning
+
+test('#42 the fallback warning points at the repair, not at a restart', async () => {
+  // Re-reading the configuration per call (#42) means resolution can start
+  // failing mid-life, and the call is then served from the last good client
+  // with the reason on stderr. WHAT that warning says is load-bearing: it
+  // used to end "restart the server to pick the configuration up again" —
+  // advice from the singleton world #42 removed, wrong in both directions
+  // now. The next call re-resolves, so a repaired or rotated key is picked
+  // up with no restart anywhere; and while the source stays broken a restart
+  // is the one move that makes things worse, because the restarted process
+  // has no client cached to serve with. The warning has to send the operator
+  // to the repair and say the next call retries — this test drives one child
+  // through healthy, broken, and repaired-rotated, with no restart between
+  // them, so the pickup it asserts on is the very pickup the warning
+  // describes.
+  const home = mkdtempSync(join(tmpdir(), 'glm-fallback-'));
+  mkdirSync(join(home, '.config', 'zai'), { recursive: true });
+  const keyFile = join(home, '.config', 'zai', 'api-key');
+  try {
+    const r = await child(`
+process.env.ZAI_BASE_URL = origin;
+const { writeFileSync, unlinkSync } = await import('node:fs');
+const keyFile = ${JSON.stringify(keyFile)};
+writeFileSync(keyFile, 'KEY-ONE');
+await glm.ask({ prompt: 'one', model: 'glm-5.3', reasoning: 'low' });
+unlinkSync(keyFile);
+const second = await glm.ask({ prompt: 'two', model: 'glm-5.3', reasoning: 'low' });
+writeFileSync(keyFile, 'KEY-TWO');
+const third = await glm.ask({ prompt: 'three', model: 'glm-5.3', reasoning: 'low' });
+out.second = second.text; out.third = third.text;
+out.bearers = seen.map((s) => (s.auth ?? '').replace(/^Bearer\\s+/i, ''));`,
+      { HOME: home, USERPROFILE: home, ZAI_API_KEY: undefined });
+
+    // The premise the warning's advice rests on: the broken-source call was
+    // served, and the third request carried the rotated key with no restart
+    // in this child. If this ever stops holding, "the next call picks it up"
+    // is no longer true and the warning has to change again.
+    assert.equal(r.threw, undefined,
+      `the broken-source call must be served from the last good client — ${JSON.stringify(r.threw)}`);
+    assert.equal(r.second, 'ok');
+    assert.equal(r.third, 'ok');
+    assert.deepEqual(r.bearers, ['KEY-ONE', 'KEY-ONE', 'KEY-TWO'],
+      'no restart happened here, so the third request carrying KEY-TWO is the pickup the warning must describe');
+    // The finding itself. The warning is on stderr (rule 7 of the budget
+    // gate pins its existence) and it directs the operator at the repair and
+    // the next call's retry — never at a restart.
+    assert.match(r.stderr ?? '', /stopped resolving/i,
+      'the operator must hear on stderr that the key stopped resolving');
+    assert.doesNotMatch(r.stderr ?? '', /restart/i,
+      'the warning must not send the operator to a restart: the next call re-resolves and picks the repair up, and a restart while the source is broken leaves nothing cached to serve with');
+    assert.match(r.stderr ?? '', /repair/i,
+      'the warning must direct the operator at the repair');
+    assert.match(r.stderr ?? '', /next call/i,
+      'the warning must say the next call retries resolution');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 // ------------------------------------------ #20: max_tokens is a cap
