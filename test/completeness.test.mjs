@@ -318,6 +318,99 @@ test('#40 naming the drops does not tell absent from unreadable after the cut', 
       present: present.notes, absent: absent.notes })}`);
 });
 
+test('#40 a pattern after the cut is named even when an earlier argument delivered one of its matches', () => {
+  // The shape a review of this round caught: a literal alone trips the cap
+  // and the pattern's first match is that same literal, de-duplicated. The
+  // contribution scan counted the delivered match as the pattern's own and
+  // silenced the argument — second.md and third.md then fell past the cap
+  // without a word, the literal case fixed while this shape stayed open.
+  // The answer past the cut is POSITION, the caller's own argument order:
+  // whether the pattern's other matches were all claimed by earlier
+  // arguments is a fact about what exists on disk, so a silence computed
+  // from it could only be decided per world (see the test below).
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-cap-glob-lit-')));
+  try {
+    writeFileSync(join(dir, 'first.md'), 'f'.repeat(900));
+    writeFileSync(join(dir, 'second.md'), 's'.repeat(100));
+    writeFileSync(join(dir, 'third.md'), 't'.repeat(100));
+    const r = ctx(['first.md', '*.md'], dir, { GLM_MCP_MAX_FILE_CHARS: '500' });
+    assert.ok(r.text.includes('--- first.md (truncated) ---'),
+      `the fixture must trip the cap inside the literal — ${JSON.stringify(r.notes)}`);
+    assert.ok(r.notes.some((n) => /truncat/i.test(n) && n.includes('first.md')),
+      `the cut is inside first.md, so the truncation note names it — ${JSON.stringify(r.notes)}`);
+    const argNote = r.notes.find((x) => x.includes('*.md'));
+    assert.ok(argNote && /not read|cap/i.test(argNote) && !/no matches/i.test(argNote),
+      `'*.md' sits past the cut and its turn never came; no note names the argument, so the caller cannot tell it from a pattern that matched nothing — ${JSON.stringify(r.notes)}`);
+    // The matches the cap never reached are not the caller's arguments, and
+    // their names exist only because the files do — #26's oracle.
+    for (const n of ['second.md', 'third.md']) {
+      assert.ok(!r.notes.some((x) => x.includes(n)),
+        `${n} is a match of the pattern, not an argument — naming it tells the caller which files exist: ${JSON.stringify(r.notes)}`);
+    }
+    assert.equal(r.notes.length, 2,
+      `one note per argument, the literal's truncation and the pattern's cap drop — ${JSON.stringify(r.notes)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#40 a pattern after the cut does not tell absent from unreadable', (t) => {
+  // The constraint #26 fixed, for the argument position this round added to
+  // the cap's answer. A pattern past the cut must be answered identically
+  // whether a would-be match is absent or present-but-unreadable — and so
+  // must its literal branch twin, because whether 'a[.]md' is handled as a
+  // literal or as a pattern is itself decided by whether the file exists.
+  // The old contribution scan failed both halves: the twin was named only
+  // when the file existed, and any per-match silence would have named the
+  // pattern only when an extra match did.
+  const check = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-cap-glob-oracle2-')));
+  writeFileSync(join(check, 'canary'), 'X');
+  const denied = deniesRead(join(check, 'canary'));
+  rmSync(check, { recursive: true, force: true });
+  if (!denied) {
+    t.skip('chmod 000 did not deny the read (running as root?) — the post-cut pattern oracle cannot be exercised here');
+    return;
+  }
+  const probe = (shape, present) => {
+    const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-cap-glob-oracle3-')));
+    try {
+      if (shape === 'pattern') {
+        writeFileSync(join(dir, 'first.md'), 'f'.repeat(900));
+        writeFileSync(join(dir, 'second.md'), 's'.repeat(100));
+        if (present) {
+          const f = join(dir, 'zz-secret.md');
+          writeFileSync(f, 'S'.repeat(100));
+          chmodSync(f, 0o000);
+        }
+        return ctx(['first.md', '*.md'], dir, { GLM_MCP_MAX_FILE_CHARS: '500' });
+      }
+      writeFileSync(join(dir, 'a.md'), 'A'.repeat(10));
+      writeFileSync(join(dir, 'big.txt'), 'B'.repeat(200));
+      if (present) {
+        const f = join(dir, 'a[.]md');
+        writeFileSync(f, 'S'.repeat(10));
+        chmodSync(f, 0o000);
+      }
+      return ctx(['a.md', 'big.txt', 'a[.]md'], dir, { GLM_MCP_MAX_FILE_CHARS: '100' });
+    } finally {
+      for (const n of ['zz-secret.md', 'a[.]md']) {
+        try { chmodSync(join(dir, n), 0o600); } catch { /* absent */ }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  for (const shape of ['pattern', 'twin']) {
+    const present = probe(shape, true);
+    const absent = probe(shape, false);
+    assert.ok(present.notes.some((n) => /truncat/i.test(n)),
+      `the fixture must actually cut the reads — ${JSON.stringify(present.notes)}`);
+    assert.ok(!present.text.includes('S'), 'the unreadable body leaked');
+    assert.deepEqual(present.notes, absent.notes,
+      `the cap plus a post-cut pattern (${shape}) tells a caller whether an unreadable file exists — ${JSON.stringify({
+        present: present.notes, absent: absent.notes })}`);
+  }
+});
+
 // --------------------------------- #41: a severed answer says so
 
 // The stand-in for z.ai, answering with a chosen stop_reason: the shape ask()

@@ -759,7 +759,14 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // pattern some of whose matches WERE read says nothing — `no matches`
   // beside content that came from this very pattern would not be the truth,
   // and the note would still disclose that another of its matches existed
-  // and could not be read. That includes the pattern the cap cut inside of:
+  // and could not be read. This question is asked of the arguments the reads
+  // reached, and of the pattern the cap cut inside of: a pattern PAST the
+  // cut is never asked it, because how much of such a pattern arrived is a
+  // fact about which files exist — a silence earned by "every match was
+  // claimed by an earlier argument" holds only in the world where no
+  // further match is sitting there unread — so the position branch in the
+  // loop below answers those on the caller's own argument order instead.
+  // That includes the pattern the cap cut inside of:
   // the truncation note above has already named the argument, and to say
   // more here — which matches survived the cut, which never reached the
   // model — could only be decided by whether those files exist, which is
@@ -791,6 +798,32 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       continue;
     }
     if (limitedPatterns.has(pending.via) || refusedPatterns.has(pending.via)) continue;
+    // #40, and the shape a review of the first cut of this fix caught: a
+    // pattern positioned strictly PAST the cut is answered on position
+    // alone, never on what its walk found. The found set is the machine's
+    // answer — it grows only when files exist — so both a silence and a
+    // note computed from it vary with what is on disk. The silence was the
+    // bug: a pattern whose de-duplicated first match was delivered for an
+    // earlier argument said nothing while its other matches fell past the
+    // cap unread, and the caller could not tell which argument to curate.
+    // A note computed from the found set is the same coin returned: with
+    // ['a.md', 'big.txt', '*.md'], naming the pattern only when a match
+    // beyond a.md exists tells the caller exactly that — #26's oracle
+    // wearing the cap's hat. The branch twin is the leak at its narrowest:
+    // 'a[.]md' is a literal when a file by that name exists and a pattern
+    // matching a.md when it does not, so which route answers was already
+    // chosen by existence. The argument's TURN, unlike its match list, is
+    // the caller's own fact: the cap arrived before the argument was read,
+    // and that is all the note claims — how much of the pattern overlapped
+    // earlier arguments is computable from arguments the caller itself
+    // supplied. The pattern the cap cut INSIDE of is deliberately not here
+    // (arg === capCutAt): the file it was reading is spoken for, so the
+    // scan below stays silent and the truncation note above remains that
+    // argument's one note (#26).
+    if (capCutAt >= 0 && pending.arg > capCutAt) {
+      notes.push({ arg: pending.arg, msg: answerNote(pending) });
+      continue;
+    }
     let contributed = false;
     for (const key of pending.found) {
       if (spokenFor.has(key)) {
