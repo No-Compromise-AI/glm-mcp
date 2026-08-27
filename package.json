@@ -35,7 +35,8 @@
     "verify:disclosure": "node scripts/verify-disclosure.mjs",
     "verify:supplychain": "node scripts/verify-supplychain.mjs",
     "verify:completeness": "node scripts/verify-completeness.mjs",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "verify:host-routing": "node scripts/verify-host-routing.mjs"
   },
   "keywords": [
     "mcp",
