@@ -17,6 +17,17 @@
 # Outcomes append to $GLM_TASK_LEDGER (default ~/.claude-glm/outcomes.jsonl).
 set -uo pipefail
 
+# Resolve this script's own directory, following symlinks, so the sibling tools
+# are found wherever the family is installed. These are invoked through symlinks
+# in ~/.local/bin, so dirname "$0" alone would resolve to the symlink's home.
+__self="${BASH_SOURCE[0]}"
+while [[ -L "$__self" ]]; do
+  __dir="$(cd -P "$(dirname -- "$__self")" && pwd)"
+  __self="$(readlink -- "$__self")"
+  [[ "$__self" != /* ]] && __self="$__dir/$__self"
+done
+HERE="$(cd -P "$(dirname -- "$__self")" && pwd)"
+
 DIR="$PWD"; VERIFY=""; TOOLS_OVERRIDE=""; REVIEWER="${GLM_REVIEWER:-codex}"; FIXES=1
 ISOLATE=0; BRANCH=""
 while getopts "C:v:t:r:x:Wb:h" opt; do
@@ -123,7 +134,7 @@ for line in sys.stdin:
 run_agent() { # $1 = prompt, $2 = log path
   # The notes file lives outside the repo, so its directory must be an allowed
   # working directory or every escalation write is silently denied.
-  /Users/jerry/z.ai/claude-glm -p "$1" \
+  "$HERE/claude-glm" -p "$1" \
     --permission-mode acceptEdits --allowedTools "${TOOLS[@]}" \
     --add-dir "$(dirname "$NOTES")" \
     --output-format stream-json --verbose 2>&1 | tee "$2" | trace
@@ -168,7 +179,7 @@ do_verify
 
 REVIEW_VERDICT="skipped"; ROUNDS=0
 if [[ "$REVIEWER" != "none" && -n "$BASE" ]]; then
-  /Users/jerry/z.ai/glm-review -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>/dev/null
+  "$HERE/glm-review" -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>/dev/null
   rc=$?
   case $rc in 0) REVIEW_VERDICT="pass" ;; 1) REVIEW_VERDICT="changes_required" ;;
              3) REVIEW_VERDICT="no_capacity" ;; *) REVIEW_VERDICT="error" ;; esac
@@ -204,7 +215,7 @@ Follow this protocol in order:
 
 Report at the end: which findings you reproduced and fixed, and which you refuted and why." "$FIXLOG"
     do_verify
-    /Users/jerry/z.ai/glm-review -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>/dev/null
+    "$HERE/glm-review" -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>/dev/null
     rc=$?
     case $rc in 0) REVIEW_VERDICT="pass" ;; 1) REVIEW_VERDICT="changes_required" ;; *) REVIEW_VERDICT="error" ;; esac
     echo "glm-task: review=$REVIEW_VERDICT (after round $ROUNDS)" >&2

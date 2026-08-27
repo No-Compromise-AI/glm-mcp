@@ -7,6 +7,17 @@
 #
 # Find the session id in the run's ledger entry or from `glm-notes`.
 set -uo pipefail
+
+# Resolve this script's own directory, following symlinks, so the sibling tools
+# are found wherever the family is installed. These are invoked through symlinks
+# in ~/.local/bin, so dirname "$0" alone would resolve to the symlink's home.
+__self="${BASH_SOURCE[0]}"
+while [[ -L "$__self" ]]; do
+  __dir="$(cd -P "$(dirname -- "$__self")" && pwd)"
+  __self="$(readlink -- "$__self")"
+  [[ "$__self" != /* ]] && __self="$__dir/$__self"
+done
+HERE="$(cd -P "$(dirname -- "$__self")" && pwd)"
 DIR="$PWD"
 while getopts "C:h" opt; do
   case "$opt" in
@@ -28,7 +39,7 @@ cd "$DIR" || exit 1
 echo "glm-answer: resuming $SID in $DIR" >&2
 echo "glm-answer: log=$LOG" >&2
 
-/Users/jerry/z.ai/claude-glm --resume "$SID" -p "The human answered your question:
+"$HERE/claude-glm" --resume "$SID" -p "The human answered your question:
 
 $ANSWER
 

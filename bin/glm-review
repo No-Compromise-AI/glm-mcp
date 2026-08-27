@@ -10,6 +10,17 @@
 # reviewers from different vendors beat one expensive one.
 set -uo pipefail
 
+# Resolve this script's own directory, following symlinks, so the sibling tools
+# are found wherever the family is installed. These are invoked through symlinks
+# in ~/.local/bin, so dirname "$0" alone would resolve to the symlink's home.
+__self="${BASH_SOURCE[0]}"
+while [[ -L "$__self" ]]; do
+  __dir="$(cd -P "$(dirname -- "$__self")" && pwd)"
+  __self="$(readlink -- "$__self")"
+  [[ "$__self" != /* ]] && __self="$__dir/$__self"
+done
+HERE="$(cd -P "$(dirname -- "$__self")" && pwd)"
+
 DIR="$PWD"; BASE=""; SPEC=""; HEADREF="HEAD"; REVIEWERS="${GLM_REVIEWER:-codex}"
 while getopts "C:b:s:r:H:h" opt; do
   case "$opt" in
@@ -77,7 +88,7 @@ run_one() { # $1 = reviewer name -> stdout is its raw output
   case "$1" in
     codex)  codex exec --sandbox read-only "$PROMPT" 2>&1 < /dev/null ;;
     claude) claude -p "$PROMPT" --allowedTools Read Grep Glob "Bash(git:*)" "Bash(node:*)" 2>&1 < /dev/null ;;
-    glm)    /Users/jerry/z.ai/claude-glm -p "$PROMPT" --allowedTools Read Grep Glob "Bash(git:*)" "Bash(node:*)" 2>&1 < /dev/null ;;
+    glm)    "$HERE/claude-glm" -p "$PROMPT" --allowedTools Read Grep Glob "Bash(git:*)" "Bash(node:*)" 2>&1 < /dev/null ;;
     agy)    agy -p "$PROMPT" --add-dir "$DIR" --model "${GLM_AGY_MODEL:-claude-opus-4-6-thinking}" 2>&1 < /dev/null ;;
     *) echo "unknown reviewer: $1" >&2; return 2 ;;
   esac
