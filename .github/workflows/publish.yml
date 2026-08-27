@@ -49,6 +49,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      # The tarball's digest travels as a job output, not as a second artifact:
+      # a digest stored beside the thing it protects is not a check. The publish
+      # job re-computes it and refuses to stage anything that differs.
+      digest: ${{ steps.digest.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -64,6 +69,9 @@ jobs:
             exit 1
           fi
       - run: npm pack
+      - name: Record the tarball's digest
+        id: digest
+        run: echo "digest=$(sha256sum ./*.tgz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tarball
@@ -83,10 +91,28 @@ jobs:
         with:
           node-version: '24'      # trusted publishing needs >= 22.14
           registry-url: 'https://registry.npmjs.org'
-      - run: npm install -g npm@latest   # trusted publishing needs npm >= 11.5.1
+      # Pinned to an exact version: this job holds id-token: write, and an
+      # unpinned install would execute whatever `latest` resolves to that day
+      # beside a publishing credential. 12.0.2 is what @latest resolved to when
+      # this was pinned. The floor is 12, not 11.5.1: trusted publishing needs
+      # >= 11.5.1, but `npm stage` below only exists from npm 12 — do not lower
+      # this below a 12.x.
+      - run: npm install -g npm@12.0.2
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: tarball
+      - name: The tarball must be the one the build job packed
+        # Inline coreutils only: this job never checks out or executes repository
+        # code, so the check cannot live in a script from this repo. It must run
+        # before staging — a check after the upload guards nothing.
+        env:
+          EXPECTED_DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          ACTUAL_DIGEST="$(sha256sum ./*.tgz | cut -d' ' -f1)"
+          if [ "$EXPECTED_DIGEST" != "$ACTUAL_DIGEST" ]; then
+            echo "sha256 mismatch: build packed '$EXPECTED_DIGEST', downloaded '$ACTUAL_DIGEST'" >&2
+            exit 1
+          fi
       - name: Stage the prebuilt tarball
         # --ignore-scripts: even the packaged artifact gets no lifecycle execution here.
         run: npm stage publish ./*.tgz --ignore-scripts
