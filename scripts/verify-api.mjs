@@ -145,6 +145,7 @@ out.results = ${JSON.stringify(jobs)}.map((j) => {
     { message: '400 {"error":{"code":"1113abc"}}' },
     { message: '400 {"error":{"code":"1113_retry"}}' },
     { message: '400 {"error":{"code":"1210x"}}' },
+    { message: 'rate limited at 1113.0 requests per second' },
   ]).results;
   for (const [i, text] of suffixed.entries()) {
     if (BALANCE.test(text) || REASONING.test(text) || CREDENTIAL.test(text)) {
@@ -174,6 +175,17 @@ out.results = ${JSON.stringify(jobs)}.map((j) => {
   if (!BALANCE.test(genuine[0])) fail(`#25: a structured code 1113 must still explain the balance problem — got ${JSON.stringify(genuine[0])}`);
   if (!REASONING.test(genuine[1])) fail(`#25: a structured code 1210 must still explain the reasoning requirement — got ${JSON.stringify(genuine[1])}`);
   if (!CREDENTIAL.test(genuine[2])) fail(`#25: a structured code 3007 must still explain the credential type — got ${JSON.stringify(genuine[2])}`);
+
+  // A period that ends a sentence is punctuation, not part of the number. The
+  // digits before it are still the whole code.
+  const prose = explain([
+    { message: 'Upstream refused. Error code: 1113.' },
+    { message: 'Error code: 1210; retry with reasoning enabled' },
+    { message: 'Error code: 3007!' },
+  ]).results;
+  if (!BALANCE.test(prose[0])) fail(`#25: a code ending a sentence is still the code — got ${JSON.stringify(prose[0])}`);
+  if (!REASONING.test(prose[1])) fail(`#25: a semicolon-delimited code must translate — got ${JSON.stringify(prose[1])}`);
+  if (!CREDENTIAL.test(prose[2])) fail(`#25: punctuation after a code must not hide it — got ${JSON.stringify(prose[2])}`);
 
   // An error nobody has a translation for passes through, as it always has.
   const unknown = explain([{ message: 'something entirely unexpected' }]).results[0];
@@ -264,6 +276,10 @@ try {
   // cap but falls under the minimum the API accepts — a payload that is invalid
   // on arrival is not a cap being honoured, it is a 400 with extra steps.
   const MIN_BUDGET = 1024;   // Messages API minimum for thinking.budget_tokens
+  // The headroom the file has always reserved for the answer. Honouring a cap
+  // by leaving one token for the reply is not honouring it; a reasoning model
+  // that cannot finish a sentence has produced nothing the caller can use.
+  const ANSWER_ROOM = 4096;
   const sweep = child(`
 process.env.ZAI_BASE_URL = origin;
 out.cases = [];
@@ -288,9 +304,21 @@ for (const cap of ${JSON.stringify([1, 100, 1024, 2000, 4096, 4097, 4200, 5000, 
       if (b < MIN_BUDGET) {
         fail(`#20: cap ${c.cap} sent budget_tokens ${b}, under the API minimum of ${MIN_BUDGET} — a request that is invalid on arrival is not a cap being honoured; refuse instead`);
       }
-      if (b >= c.sent.max_tokens) {
-        fail(`#20: cap ${c.cap} sent budget_tokens ${b} with max_tokens ${c.sent.max_tokens} — the budget must leave room for an answer`);
+      if (c.sent.max_tokens - b < ANSWER_ROOM) {
+        fail(`#20: cap ${c.cap} sent budget_tokens ${b} with max_tokens ${c.sent.max_tokens}, leaving ${c.sent.max_tokens - b} for the answer — below the ${ANSWER_ROOM} this file reserves. Refuse instead of answering in a token.`);
       }
+    }
+  }
+  // The threshold follows from the two constants rather than being asserted as
+  // a number: below the minimum budget plus the answer room, no honest request
+  // exists, so the call must be refused.
+  for (const c of sweep.cases ?? []) {
+    const viable = c.cap >= MIN_BUDGET + ANSWER_ROOM;
+    if (!viable && c.sent && c.sent.thinking) {
+      fail(`#20: cap ${c.cap} cannot fit ${MIN_BUDGET} of reasoning plus ${ANSWER_ROOM} of answer, yet a request was sent`);
+    }
+    if (viable && c.refused !== undefined) {
+      fail(`#20: cap ${c.cap} can fit ${MIN_BUDGET} + ${ANSWER_ROOM} and must not be refused — ${c.refused}`);
     }
   }
   if (!(sweep.cases ?? []).some((c) => c.refused !== undefined)) {
