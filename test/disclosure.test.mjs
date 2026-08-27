@@ -276,12 +276,10 @@ test('a skip note for a glob match names the pattern, not the match the machine 
       // it — the oracle #26 closes, routed through a wildcard.
       assert.ok(!JSON.stringify(viaPattern.notes).includes('sudoers'),
         `the note names the machine-expanded filename — ${JSON.stringify(viaPattern.notes)}`);
-      // The pattern route has its own wording — the one a matchless pattern
-      // gets, so the wildcard cannot be used to tell absent from unreadable;
-      // the test after this one pins that within-route contract. The routes
-      // MAY read differently from each other: a caller knows whether it sent
-      // a literal or a pattern, so what neither may reveal is which of the
-      // two REASONS applied, only what was asked for.
+      // The pattern route answers in the wording a matchless pattern gets —
+      // the same wording the literal route gets, so neither kind of spelling
+      // can be used to tell absent from unreadable; the sweep test after the
+      // next one generalises that to every argument shape.
       assert.ok(viaPattern.notes.some((n) => /^skipped \(no matches\): sudoer\?$/.test(n)),
         `an unreadable match must answer exactly as a matchless pattern does — ${JSON.stringify(viaPattern.notes)}`);
     });
@@ -426,6 +424,76 @@ test('a deduplicated or repeated pattern still gets its own note, once', (t) => 
   } finally {
     cleanup();
   }
+});
+
+test('the same argument list answers the same whether the named file exists', (t) => {
+  // The property itself, of which every test above asserts one instance: for
+  // the SAME argument list, the notes must be identical — wording, count and
+  // order alike — whether the file it names is absent or present and
+  // unreadable. Which branch handles an entry is decided by whether the file
+  // exists (namesSomething), so any difference left between the branches is
+  // an answer about the machine: `probe[.]txt` handled as a literal once said
+  // "could not be read" and as a pattern "no matches", and a pattern beside
+  // its literal twin answered in a different ORDER, because the literal's
+  // note was written during the reads and the pattern's only after them.
+  // Fixing one spelling at a time twice left the next one open; this sweep
+  // holds across all of them at once.
+  const check = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-sweep-0-')));
+  writeFileSync(join(check, 'canary'), 'X');
+  const denied = deniesRead(join(check, 'canary'));
+  rmSync(check, { recursive: true, force: true });
+  if (!denied) {
+    t.skip('chmod 000 did not deny the read (running as root?) — the existence oracle cannot be exercised here');
+    return;
+  }
+  const probe = (present, paths) => {
+    const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-sweep-')));
+    try {
+      if (present) {
+        for (const name of ['probe[.]txt', 'probe.txt']) {
+          const f = join(dir, name);
+          writeFileSync(f, 'S');
+          chmodSync(f, 0o000);
+        }
+      }
+      // A readable file beside the probe, so the call is not otherwise empty
+      // and a skipped entry has a neighbour to not take down.
+      writeFileSync(join(dir, 'decoy.txt'), 'DECOY');
+      let r;
+      isolated({ GLM_MCP_ROOTS: dir }, () => {
+        r = buildFileContext(paths, dir);
+      });
+      return r;
+    } finally {
+      for (const name of ['probe[.]txt', 'probe.txt']) {
+        try { chmodSync(join(dir, name), 0o600); } catch { /* absent */ }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  for (const paths of [
+    ['probe.txt'],
+    ['probe[.]txt'],                          // a name that is itself metacharacters
+    ['probe[.]txt', 'probe.txt'],             // the pattern and its literal twin, both orders
+    ['probe.txt', 'probe[.]txt'],
+    ['decoy.txt', 'probe[.]txt'],
+    ['probe*.txt'],
+    ['probe*.txt', 'probe.txt'],              // a match the pattern claims before the literal names it
+  ]) {
+    const present = probe(true, paths);
+    const absent = probe(false, paths);
+    assert.ok(!present.text.includes('S'),
+      `the unreadable body leaked for ${JSON.stringify(paths)} — ${JSON.stringify(present)}`);
+    assert.deepEqual(present.notes, absent.notes,
+      `${JSON.stringify(paths)} tells a caller whether the file exists — ${JSON.stringify({
+        present: present.notes, absent: absent.notes })}`);
+  }
+  // The answer still names what the caller itself sent: that is its argument
+  // coming back, and dropping it is how a caller stops knowing which of its
+  // entries got nothing.
+  const named = probe(false, ['probe[.]txt']);
+  assert.ok(named.notes.some((n) => n.includes('probe[.]txt')),
+    `the note must still name the spelling the caller sent — ${JSON.stringify(named.notes)}`);
 });
 
 test('an uncompilable pattern is refused in this project\'s words, not V8\'s', () => {  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-pattern-')));
