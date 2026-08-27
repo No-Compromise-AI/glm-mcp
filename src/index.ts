@@ -43,10 +43,11 @@ server.registerTool(
       "before the first character of the answer, and the thinking budget spans " +
       "2,048 at 'low' against 24,576 at 'max' — a twelve-fold spread. Route " +
       "mechanical work (extract, summarise, reformat, classify) to glm-5.3-flash or " +
-      "glm-4.6 with reasoning 'none' or 'low'; keep GLM-5.3 at 'high' or 'max' for " +
-      "design review, cross-checking reasoning, and hunting a subtle bug. glm-4.6 " +
-      "and glm-4.7 accept reasoning 'none'; GLM-5.3 cannot, so its shallowest " +
-      "setting is 'low'.",
+      "glm-4.6 at 'low'; glm-4.6 alone can go further, to 'none' — glm-5.3-flash " +
+      "cannot run with reasoning off, so its 'none' is raised to 'low'. Keep " +
+      "GLM-5.3 at 'high' or 'max' for design review, cross-checking reasoning, and " +
+      "hunting a subtle bug. glm-4.6 and glm-4.7 accept reasoning 'none'; GLM-5.3 " +
+      "and glm-5.3-flash cannot, so 'low' is their shallowest setting.",
     inputSchema: {
       prompt: z.string().describe("The question or instruction to send to GLM."),
       files: z
@@ -84,8 +85,10 @@ server.registerTool(
             "generated before the first character of the answer, and the budget runs " +
             "2,048 at 'low', 8,192 at 'high', 24,576 at 'max'. Use 'none' or 'low' for " +
             "mechanical work — extract, summarise, reformat; use 'high' or 'max' to " +
-            "review a design, cross-check reasoning, or hunt a subtle bug. GLM-5.3 always " +
-            "reasons, so 'none' is raised to 'low' for it.",
+            "review a design, cross-check reasoning, or hunt a subtle bug. GLM-5.3 and " +
+            "glm-5.3-flash always reason: GLM-5.3 rejects 'none' outright, while " +
+            "glm-5.3-flash accepts it and silently reasons anyway, so 'none' is " +
+            "raised to 'low' for both.",
         ),
       system: z.string().optional().describe("Optional system prompt."),
       max_tokens: z
@@ -99,7 +102,8 @@ server.registerTool(
             `but never below the API minimum of ${MIN_BUDGET_TOKENS}. A cap below ` +
             `${MIN_BUDGET_TOKENS + ANSWER_ROOM} — the API's budget minimum plus the room ` +
             "the answer needs — cannot hold both and is refused rather than silently " +
-            "raised; on GLM-5.3, which always reasons, the only fix is a higher cap. " +
+            "raised; on GLM-5.3 and glm-5.3-flash, which always reason, the only " +
+            "fix is a higher cap. " +
             "A cap over the model's published ceiling is likewise refused before " +
             // DEFAULT_MODEL is an OUTPUT_LIMITS key, so its ceiling is defined.
             `anything is sent (${outputLimits(DEFAULT_MODEL).max!.toLocaleString("en-US")} for GLM-5.3). ` +
