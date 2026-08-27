@@ -108,19 +108,26 @@ for (const [value, expected, what] of [
 // is ever truncated and the whole file is sent.
 const fixture = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-api-')));
 try {
-  writeFileSync(join(fixture, 'big.txt'), 'x'.repeat(900_000));
+  // Larger than any plausible default, so the cap always bites here, and
+  // still under the 5 MB per-file byte cap.
+  writeFileSync(join(fixture, 'big.txt'), 'x'.repeat(4_000_000));
   const ctxBody = `
 process.env.GLM_MCP_ROOTS = ${JSON.stringify(fixture)};
 const c = glm.buildFileContext(['big.txt'], ${JSON.stringify(fixture)});
 out.len = c.text.length; out.notes = c.notes;`;
 
+  // The property is "an unusable value is the same as no value", stated
+  // against the default's BEHAVIOUR rather than its number — #35 moves that
+  // number, and a gate that hardcodes it would have to be edited every time
+  // the default is resized, which is how a gate quietly stops checking.
+  const baseline = child(ctxBody);
+  if (!(baseline.notes ?? []).some((n) => /truncat/i.test(n))) {
+    fail(`#24: the fixture must exceed the default so the cap is observable here — notes=${JSON.stringify(baseline.notes)}`);
+  }
   for (const [value, what] of [['abc', 'unparsable'], ['', 'empty'], ['-1', 'negative']]) {
     const r = child(ctxBody, { GLM_MCP_MAX_FILE_CHARS: value });
-    if (r.len > 800_100) {
-      fail(`#24: GLM_MCP_MAX_FILE_CHARS ${what} (${JSON.stringify(value)}) removed the cap — ${r.len} chars came through`);
-    }
-    if (!(r.notes ?? []).some((n) => /truncat/i.test(n))) {
-      fail(`#24: GLM_MCP_MAX_FILE_CHARS ${what} must fall back to the default AND still say it truncated — notes=${JSON.stringify(r.notes)}`);
+    if (r.len !== baseline.len || JSON.stringify(r.notes) !== JSON.stringify(baseline.notes)) {
+      fail(`#24: GLM_MCP_MAX_FILE_CHARS ${what} (${JSON.stringify(value)}) did not fall back to the default:\n  with it:  ${r.len} chars, ${JSON.stringify(r.notes)}\n  without:  ${baseline.len} chars, ${JSON.stringify(baseline.notes)}`);
     }
   }
   const honoured = child(ctxBody, { GLM_MCP_MAX_FILE_CHARS: '2000' });

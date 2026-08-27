@@ -96,7 +96,7 @@ Two things it is genuinely good at:
 | `model` | string | `glm-5.3` | any id from `glm_models` |
 | `reasoning` | `none`\|`low`\|`high`\|`max` | `low` | higher is slower |
 | `system` | string | — | optional system prompt |
-| `max_tokens` | number | 8192 | hard ceiling on output; see Reasoning |
+| `max_tokens` | number | the model's own default (65,536 for GLM-5.3) | hard ceiling on output; see Reasoning |
 
 ### `glm_models`
 
@@ -203,13 +203,29 @@ variable that set it — nothing is ever silently truncated or silently dropped.
 
 | Limit | Variable | Default |
 | --- | --- | --- |
-| Total context characters, headers and separators included | `GLM_MCP_MAX_FILE_CHARS` | 800,000 |
+| Total context characters, headers and separators included | `GLM_MCP_MAX_FILE_CHARS` | derived, ~2.9M |
+| Assumed context window the budget is derived from | `GLM_MCP_CONTEXT_TOKENS` | 1,048,576 |
 | Per-file size, checked before the file is read | `GLM_MCP_MAX_FILE_BYTES` | 5 MB |
 | Glob walk depth | `GLM_MCP_MAX_DEPTH` | 24 |
 | Directory entries examined per call | `GLM_MCP_MAX_ENTRIES` | 200,000 |
 | Wall-clock budget for glob expansion | `GLM_MCP_GLOB_TIMEOUT_MS` | 10,000 |
 | Total `{a,b}` brace expansions | `GLM_MCP_MAX_BRACE_EXPANSIONS` | 1,024 |
 | Request timeout | `GLM_MCP_TIMEOUT_MS` | 600,000 |
+
+The character budget is **derived**, not chosen: the assumed context window,
+less the model's default output and a prompt reserve, at 3 characters per token.
+That ratio targets **English and code deliberately** — this is what the project
+is built for. Denser scripts pack more tokens per character (Chinese runs nearer
+one token per character), so a CJK-heavy caller should lower
+`GLM_MCP_MAX_FILE_CHARS`; overshooting surfaces as a context-length error from
+z.ai rather than a silent truncation. z.ai publishes output limits but not
+context length, so `GLM_MCP_CONTEXT_TOKENS` is an assumption you can correct.
+
+Output ceilings come from z.ai's published table and are **per model** — 131,072
+for the GLM-5 and 4.6/4.7 families, 98,304 for GLM-4.5, 32,768 for the vision
+models. Asking for more than a model allows is refused locally, naming the
+ceiling, rather than discovered as an API error. A model this table does not
+know is not capped here: z.ai's own limits govern it.
 
 - Only regular files are read. A FIFO, device or socket is refused rather than
   blocking the server on a read that may never return.
