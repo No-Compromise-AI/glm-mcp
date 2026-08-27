@@ -249,11 +249,15 @@ try {
 
   // A cap smaller than the requested budget: the cap wins, and the budget is
   // scaled to fit beneath it. It must never be raised to meet the budget.
-  r = ask({ prompt: 'hi', model: 'glm-5.3', reasoning: 'max', maxTokens: 5_000 });
+  // 6,000 rather than 5,000: the sweep below refuses anything under
+  // MIN_BUDGET + ANSWER_ROOM, so a 5,000 cap has no honest request to capture
+  // and asking for one here contradicted that. 6,000 still exercises the
+  // scaling — the requested 24,576 comes down to 1,904.
+  r = ask({ prompt: 'hi', model: 'glm-5.3', reasoning: 'max', maxTokens: 6_000 });
   sent = r.seen?.[0]?.body;
   if (!sent) fail(`#20: no request was captured for the small-cap case — ${JSON.stringify(r.threw ?? r)}`);
-  if (sent.max_tokens > 5_000) {
-    fail(`#20: a requested cap of 5000 was sent as ${sent.max_tokens} — the cap is a ceiling, not a floor`);
+  if (sent.max_tokens > 6_000) {
+    fail(`#20: a requested cap of 6000 was sent as ${sent.max_tokens} — the cap is a ceiling, not a floor`);
   }
   if (sent.thinking && sent.thinking.budget_tokens >= sent.max_tokens) {
     fail(`#20: the thinking budget (${sent.thinking.budget_tokens}) must leave room under max_tokens (${sent.max_tokens})`);

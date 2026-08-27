@@ -259,6 +259,40 @@ test('#25 a code is a whole token, not the prefix of one', () => {
   assert.match(explainError(new Error('Error code: 1113 - {"error":{}}')), BALANCE);
 });
 
+test('#25 punctuation that ends a sentence does not take the code with it', () => {
+  // The trailing boundary rejected every `.`, including the one closing the
+  // sentence, so `Error code: 1113.` passed through untranslated — and the
+  // digits it was hiding were the whole code. A `.` belongs to the code only
+  // where a digit follows it (`1113.0`); followed by anything else, or by
+  // nothing, it is punctuation ending a sentence, and the digits before it are
+  // still the code. Other closing marks never conflicted with a code value and
+  // must keep closing.
+  const closing = [
+    ['Upstream refused. Error code: 1113.', BALANCE],
+    ['Error code: 1113. Retry after topping up.', BALANCE],
+    ['Error code: 1210; retry with reasoning enabled', REASONING],
+    ['Error code: 3007!', CREDENTIAL],
+  ];
+  for (const [message, re] of closing) {
+    assert.match(explainError(new Error(message)), re,
+      `${JSON.stringify(message)} — a period that ends the sentence is not part of the code`);
+  }
+  // The same `.` still continues a number, so the digits are not the whole
+  // code there — and the boundary must not widen past it.
+  for (const message of [
+    'Error code: 1113.0 is the requests-per-second limit',
+    '400 {"error":{"code":"1113.0"}}',
+    'Error code: 1113abc',
+    'Error code: 11130',
+  ]) {
+    const explained = explainError(new Error(message));
+    for (const [label, re] of [['balance', BALANCE], ['reasoning', REASONING], ['credential', CREDENTIAL]]) {
+      assert.ok(!re.test(explained),
+        `${JSON.stringify(message)} carries a longer token than the bare code, so it is not a ${label} problem`);
+    }
+  }
+});
+
 test('#25 an error nobody has a translation for passes through unchanged', () => {
   assert.equal(explainError(new Error('something entirely unexpected')),
     'something entirely unexpected');
@@ -323,10 +357,14 @@ test('#20 a generous cap bounds the request and keeps the asked-for budget', asy
 });
 
 test('#20 a cap smaller than the budget scales the budget down, never the cap up', async () => {
-  const r = await ask({ prompt: 'hi', model: 'glm-5.3', reasoning: 'max', maxTokens: 5_000 });
+  // 6000 rather than 5000: under the answer-room contract a cap below
+  // MIN_BUDGET_TOKENS + ANSWER_ROOM (1024 + 4096) is refused outright, and the
+  // refusal is the sweep test's subject. This one is about scaling, so the cap
+  // must be one the request can still honestly fit beneath.
+  const r = await ask({ prompt: 'hi', model: 'glm-5.3', reasoning: 'max', maxTokens: 6_000 });
   const sent = upstreamSeen[0]?.body;
   assert.ok(sent, `a request must have been captured — ${JSON.stringify(r.threw ?? upstreamSeen)}`);
-  assert.equal(sent.max_tokens, 5_000,
+  assert.equal(sent.max_tokens, 6_000,
     `the cap is a ceiling, not a floor — it was sent as ${sent.max_tokens}`);
   assert.ok(sent.thinking && sent.thinking.budget_tokens < sent.max_tokens,
     `the thinking budget (${sent.thinking?.budget_tokens}) must leave room under max_tokens (${sent.max_tokens})`);
@@ -405,4 +443,57 @@ for (const cap of ${JSON.stringify(caps)}) {
   }
   assert.ok(refusedCount > 0, 'the smallest caps cannot hold any thinking budget — at least one must be refused');
   assert.ok(sentCount > 0, 'the largest caps must produce requests');
+});
+
+test('#20 a cap without room for the API budget minimum and the answer is refused, not answered in a token', async () => {
+  // Flooring the budget at MIN_BUDGET_TOKENS silently spent the answer's
+  // room: a cap of 1025 sent budget_tokens 1024 and left one token for the
+  // reply, and a cap of 5000 still left only 3976. A request whose answer
+  // cannot happen is not a cap being honoured. The threshold is the two
+  // constants added — never asserted as a number — and the sweep crosses it on
+  // both sides: every cap under it refused before anything is sent, every cap
+  // at or above it leaving ANSWER_ROOM above a budget the API accepts.
+  const caps = [1, 100, 1024, 1025, 2000, 4096, 4097, 5000, 5119, 5120, 5121, 8192];
+  const r = await child(`
+process.env.ZAI_BASE_URL = origin;
+out.cases = [];
+for (const cap of ${JSON.stringify(caps)}) {
+  const before = seen.length;
+  try {
+    await glm.ask({ prompt: 'hi', model: 'glm-5.3', reasoning: 'max', maxTokens: cap });
+    out.cases.push({ cap, sent: seen[before] ? seen[before].body : null });
+  } catch (e) {
+    out.cases.push({ cap, refused: String(e && e.message ? e.message : e), reached: seen.length > before });
+  }
+}`);
+  // Pinned here rather than imported, the way the sweep above pins its own:
+  // the test then fails on the behaviour, not on a missing export, and the
+  // threshold stays a derivation of the two constants rather than a number.
+  const MIN_BUDGET = 1024;  // the Messages API minimum for thinking.budget_tokens
+  const ANSWER_ROOM = 4096; // the headroom src/glm.ts reserves for the answer
+  const threshold = MIN_BUDGET + ANSWER_ROOM;
+  let below = 0;
+  let atOrAbove = 0;
+  for (const c of r.cases ?? []) {
+    if (c.cap < threshold) {
+      below++;
+      assert.ok(c.refused !== undefined,
+        `cap ${c.cap} is below ${MIN_BUDGET} + ${ANSWER_ROOM} and must be refused — got ${JSON.stringify(c.sent)}`);
+      assert.ok(!c.reached,
+        `cap ${c.cap} was refused only after reaching the API — a refusal must come before a request exists`);
+      assert.match(c.refused, new RegExp(`at least ${threshold}`),
+        `cap ${c.cap}: the refusal must name the least workable cap, ${threshold} — got ${JSON.stringify(c.refused)}`);
+      continue;
+    }
+    atOrAbove++;
+    assert.ok(c.sent?.thinking,
+      `cap ${c.cap} is at or above ${threshold} and must be sent, not refused — ${JSON.stringify(c.refused ?? r.threw)}`);
+    const b = c.sent.thinking.budget_tokens;
+    assert.ok(b >= MIN_BUDGET,
+      `cap ${c.cap} sent budget_tokens ${b}, under the API minimum of ${MIN_BUDGET}`);
+    assert.ok(c.sent.max_tokens - b >= ANSWER_ROOM,
+      `cap ${c.cap} sent budget_tokens ${b} under max_tokens ${c.sent.max_tokens}, leaving ${c.sent.max_tokens - b} for the answer — the room is not the cap's to spend`);
+  }
+  assert.ok(below > 0 && atOrAbove > 0,
+    'the sweep must cross the threshold in both directions to prove anything');
 });

@@ -50,14 +50,15 @@ const BUDGET: Record<Exclude<Reasoning, "none">, number> = {
 };
 
 /**
- * Tokens of the output cap set aside for the answer where the cap can afford
- * it. The API requires max_tokens > thinking.budget_tokens, so a reasoning
- * request prefers this much room beneath the cap (#20); where the cap cannot
- * afford it, the budget bottoms out at {@link MIN_BUDGET_TOKENS} instead and
- * the answer takes whatever is left — a small cap was the caller's choice, and
- * it buys less reasoning first.
+ * Tokens of the output cap set aside for the answer. The API requires
+ * max_tokens > thinking.budget_tokens, so a reasoning request keeps this much
+ * room beneath the cap (#20) — and the room is not what a small cap spends
+ * first: a cap that cannot hold both {@link MIN_BUDGET_TOKENS} of thinking and
+ * this much answer is refused before anything is sent, because one token of
+ * answer is not an answer, and a reasoning model that cannot finish a sentence
+ * has produced nothing the caller can use.
  */
-const ANSWER_ROOM = 4096;
+export const ANSWER_ROOM = 4096;
 
 /**
  * The least thinking budget the Messages API accepts. Scaling down to fit a
@@ -418,28 +419,27 @@ export async function ask(args: AskArgs): Promise<AskResult> {
     // #20: max_tokens is documented as an output cap, so it is one. The
     // thinking budget scales DOWN to fit beneath it — never up, and never the
     // cap raised to fit the budget, which is how a requested cap of 1 used to
-    // leave as a billable 28,672. The scaling stops at the API's own floor: a
-    // budget pushed under MIN_BUDGET_TOKENS is not a smaller request but an
-    // invalid one, rejected on arrival. A cap that cannot hold even the floor,
-    // with the headroom the API's budget_tokens < max_tokens rule insists on,
-    // is refused here — before a request exists to send, naming the least cap
-    // that would work.
-    const budget = Math.max(
-      MIN_BUDGET_TOKENS,
-      Math.min(BUDGET[reasoning], args.maxTokens - ANSWER_ROOM),
-    );
-    if (budget >= args.maxTokens) {
+    // leave as a billable 28,672. Scaling honours the cap only while both of
+    // the request's own needs can hold beneath it: the budget may not go under
+    // the API's floor of MIN_BUDGET_TOKENS, and ANSWER_ROOM must stay above
+    // the budget for the answer. The budget flooring at the minimum is not a
+    // way out — it buys the answer's room and leaves a reply that cannot
+    // happen — so a cap under the two added is refused here, before a request
+    // exists to send, naming the least cap that would work.
+    if (args.maxTokens < MIN_BUDGET_TOKENS + ANSWER_ROOM) {
       throw new Error(
-        `max_tokens ${args.maxTokens} cannot hold a thinking budget: the budget ` +
-          `cannot be scaled below the API minimum of ${MIN_BUDGET_TOKENS} and must ` +
-          `stay beneath max_tokens, so max_tokens must be at least ` +
-          `${MIN_BUDGET_TOKENS + 1}` +
+        `max_tokens ${args.maxTokens} cannot hold both a thinking budget and an ` +
+          `answer: the budget cannot be scaled below the API minimum of ` +
+          `${MIN_BUDGET_TOKENS}, and ${ANSWER_ROOM} of the cap must remain above ` +
+          `it for the answer, so max_tokens must be at least ` +
+          `${MIN_BUDGET_TOKENS + ANSWER_ROOM}` +
           (THINKING_REQUIRED.has(model)
             ? `. ${model} always reasons and cannot run with reasoning off — raise ` +
               `max_tokens, or switch to a model that permits it (e.g. glm-4.6).`
             : ` or reasoning must be "none".`),
       );
     }
+    const budget = Math.min(BUDGET[reasoning], args.maxTokens - ANSWER_ROOM);
     body.thinking = { type: "enabled", budget_tokens: budget };
   }
 
@@ -501,9 +501,14 @@ function zaiCode(e: unknown): string | undefined {
   // code's value: they may not touch, on either side, a character a code value
   // can carry — a letter in any script, a digit, `_`, `-` or `.`. `1113abc`,
   // `1113-retry`, `1113.0` and `1113é` are all different codes from `1113`,
-  // exactly as `11130` is, and none of them may be read as the bare code.
+  // exactly as `11130` is, and none of them may be read as the bare code. The
+  // one value character that also closes a sentence is `.`, so it counts as
+  // part of the code only where it continues the number — a digit follows it
+  // (`1113.0`). Followed by anything else, or by nothing, it is punctuation
+  // ending a sentence, and the digits before it are still the whole code; on
+  // the leading side a `.` before the digits always continues a number.
   const labelled =
-    /\bcode\b["']?\s*[:=]?\s*["']?(?<![\p{L}\p{N}_.-])(\d+)(?![\p{L}\p{N}_.-])/iu.exec(msg);
+    /\bcode\b["']?\s*[:=]?\s*["']?(?<![\p{L}\p{N}_.-])(\d+)(?![\p{L}\p{N}_-]|\.\p{N})/iu.exec(msg);
   return labelled?.[1];
 }
 
