@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { readFileSync, existsSync, lstatSync, realpathSync, statSync } from "node:fs";
+import { readFileSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { expandGlob, isGlobPattern, patternAnchors } from "./glob.js";
@@ -139,6 +139,20 @@ export const MIN_BUDGET_TOKENS = 1024;
 export const MIN_ANSWER_TOKENS = 1024;
 
 /**
+ * Whether a failed credential read means the credential is not configured
+ * there (#26). ENOENT — nothing at the path — and ENOTDIR — a component of it
+ * is a file, so nothing can ever be — are the only errnos that say absent.
+ * Any other failure, EACCES on the file itself or on an ancestor directory
+ * that stops the traversal, means a key may well be configured where the
+ * server cannot reach it: a different problem with a different fix, and one
+ * the operator has to hear about rather than have filed under "no key found".
+ */
+const isAbsent = (e: unknown): boolean => {
+  const code = (e as NodeJS.ErrnoException | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+};
+
+/**
  * Resolve the z.ai key without ever hardcoding it:
  *   ZAI_API_KEY  ->  ~/.config/zai/api-key  ->  (opt-in) the key ZCode already stores.
  *
@@ -146,26 +160,34 @@ export const MIN_ANSWER_TOKENS = 1024;
  * GLM_MCP_ALLOW_ZCODE_KEY=1 is set. Reading a credential a user configured for a
  * different tool should be their explicit choice, not a convenience they discover.
  *
- * A file that exists but cannot be read fails in words that name no path (#26):
- * the message crosses the trust boundary to the caller, and this machine's
- * directory layout is not the caller's business — the path and the underlying
- * error go to stderr for the operator.
+ * The reads are attempted, not guarded with existsSync() first: existsSync
+ * answers false when an ANCESTOR directory is unsearchable as surely as when
+ * the file is missing, so a configured key the server cannot reach was
+ * reported as absent and the caller was sent to create a credential it
+ * already has while the operator got nothing (#26). The errno makes the
+ * distinction instead — see {@link isAbsent}. A source that fails for any
+ * reason but absence fails in words that name no path: the message crosses
+ * the trust boundary to the caller, and this machine's directory layout is
+ * not the caller's business — the path and the underlying error go to stderr
+ * for the operator.
  */
 export function resolveApiKey(): string {
   const fromEnv = process.env.ZAI_API_KEY?.trim();
   if (fromEnv) return fromEnv;
 
   const keyFile = join(homedir(), ".config", "zai", "api-key");
-  if (existsSync(keyFile)) {
-    let raw: string;
-    try {
-      raw = readFileSync(keyFile, "utf8");
-    } catch (e) {
+  try {
+    const k = readFileSync(keyFile, "utf8").trim();
+    if (k) return k;
+  } catch (e) {
+    if (!isAbsent(e)) {
       // #26: the thrown message is what the caller reads, and V8's errno errors
       // carry the file's absolute path — the account's home directory and
-      // username with it. The caller hears only that the file could not be
-      // read; the path and the underlying error go to stderr, the operator's
-      // channel — stdout is the MCP protocol and stays clean either way.
+      // username with it. The caller hears only that the key could not be
+      // read, which covers a file that denies the read and a directory that
+      // denies the way to it alike; the path and the underlying error go to
+      // stderr, the operator's channel — stdout is the MCP protocol and stays
+      // clean either way.
       const why = e instanceof Error ? e.message : String(e);
       console.error(`glm-mcp: could not read the key file ${keyFile}: ${why}`);
       throw new Error(
@@ -173,22 +195,41 @@ export function resolveApiKey(): string {
           "server's account is allowed to read it, or set ZAI_API_KEY instead.",
       );
     }
-    const k = raw.trim();
-    if (k) return k;
   }
 
   const zcode = join(homedir(), ".zcode", "v2", "config.json");
-  if (process.env.GLM_MCP_ALLOW_ZCODE_KEY === "1" && existsSync(zcode)) {
+  if (process.env.GLM_MCP_ALLOW_ZCODE_KEY === "1") {
+    let raw: string | undefined;
     try {
-      const cfg = JSON.parse(readFileSync(zcode, "utf8"));
-      const k = cfg?.provider?.["builtin:zai-coding-plan"]?.options?.apiKey;
-      if (typeof k === "string" && k.trim()) return k.trim();
+      raw = readFileSync(zcode, "utf8");
     } catch (e) {
-      // Unreadable is not unusable-silently: the caller still gets the plain
-      // guidance below, but the operator who opted in (#21) loses the reason
-      // unless it lands on stderr — the same split as the key file above.
-      const why = e instanceof Error ? e.message : String(e);
-      console.error(`glm-mcp: could not read the ZCode config ${zcode}: ${why}`);
+      if (!isAbsent(e)) {
+        // The opted-in fallback gets the same split as the key file (#21,
+        // #26): a config the server cannot reach holds a key the operator
+        // chose to use, so it is reported as unreadable rather than filed
+        // under "no key found" — and never with its path in the caller's
+        // message, only on stderr.
+        const why = e instanceof Error ? e.message : String(e);
+        console.error(`glm-mcp: could not read the ZCode config ${zcode}: ${why}`);
+        throw new Error(
+          "The ZCode config could not be read, so the key it holds could not " +
+            "be used. Check that this server's account is allowed to read it, " +
+            "or set ZAI_API_KEY instead.",
+        );
+      }
+    }
+    if (raw !== undefined) {
+      try {
+        const cfg = JSON.parse(raw);
+        const k = cfg?.provider?.["builtin:zai-coding-plan"]?.options?.apiKey;
+        if (typeof k === "string" && k.trim()) return k.trim();
+      } catch (e) {
+        // A config that will not parse holds no usable key, so the plain
+        // guidance below still applies — but the operator who opted in (#21)
+        // loses the reason unless it lands on stderr, the same split as above.
+        const why = e instanceof Error ? e.message : String(e);
+        console.error(`glm-mcp: could not parse the ZCode config ${zcode}: ${why}`);
+      }
     }
   }
 
@@ -290,18 +331,17 @@ function takeUnits(s: string, maxUnits: number): string {
 }
 
 /**
- * The note for a file nothing was read from, whether because it does not exist
- * or because it exists and cannot be read (#26). The caller got nothing either
- * way, and telling the two apart — as `not found` and `unreadable` once did —
- * is an existence-and-permission oracle for anything inside the roots: probe a
- * spelling, learn whether it names something and whether the server's account
- * can read it. One wording, spelling out only what the caller itself sent —
- * which for a glob entry is the PATTERN it sent, never the match the machine
- * found by expanding it (`via`, not `p`): with literals already uniform, the
- * expanded name was the one remaining way to confirm both that a hidden file
- * exists and that it cannot be read. The refusal notes below are the deliberate
- * opposite — they name the expanded match, pinned by the confinement gate,
- * because a boundary the caller cannot see is what those notes have to explain.
+ * The note for a literal nothing was read from, whether because it does not
+ * exist or because it exists and cannot be read (#26). The caller got nothing
+ * either way, and telling the two apart — as `not found` and `unreadable`
+ * once did — is an existence-and-permission oracle for anything inside the
+ * roots: probe a spelling, learn whether it names something and whether the
+ * server's account can read it. One wording, spelling out only what the
+ * caller itself sent. The refusal notes in buildFileContext are the
+ * deliberate opposite — they name the expanded match, pinned by the
+ * confinement gate, because a boundary the caller cannot see is what those
+ * notes have to explain. Glob entries get their own wording there, borrowed
+ * from the note a matchless pattern already gets.
  */
 const skipNote = (p: string): string => `skipped (could not be read): ${p}`;
 
@@ -362,6 +402,10 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // time for a pattern it has already recorded, and a single slot would go
   // stale the moment a later pattern tripped a limit of its own.
   const limitedPatterns = new Set<string>();
+  // The patterns whose walk a confinement refusal cut short, the other half of
+  // "stopped" — a "no matches" note would misdescribe those exactly as it
+  // misdescribes a limited one, wherever about them it is filed.
+  const refusedPatterns = new Set<string>();
   const budget = walkBudget((msg) => {
     limitedPatterns.add(budget.pattern);
     notes.push(msg);
@@ -450,6 +494,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
       let refusedMatch = false;
       const matches = expandGlob(p, cwd, roots ?? undefined, (refused) => {
         refusedMatch = true;
+        refusedPatterns.add(p);
         notes.push(
           `refused: ${refused} (matched by ${p}) resolves outside the allowed roots`,
         );
@@ -484,6 +529,33 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     }
   }
 
+  // Nothing was read from this entry (#26). The literal route says so in one
+  // wording that already covers both reasons a file yields nothing; the
+  // pattern route borrows the wording a matchless pattern gets, because a
+  // pattern spelled to match exactly one name — `secret[.]txt` — is the
+  // literal probe one indirection away, and a match that cannot be read
+  // answering differently from a pattern that matched nothing would keep the
+  // oracle open through the wildcard. The two routes may read differently
+  // from each other — a caller knows which one it addressed — but within
+  // either, absent and unreadable are the same answer. So the wording is
+  // "no matches" rather than a new one: it is what a genuinely empty pattern
+  // already says, asserted as such wherever an empty pattern is. The note
+  // names the PATTERN (`via`), never the match the machine found, and says it
+  // once per pattern however many of its matches yielded nothing — except
+  // beside a note saying this pattern's walk was stopped, where "no matches"
+  // would claim it was simply wrong, the same contradiction the
+  // expansion-time note is guarded against.
+  const saidNoMatches = new Set<string>();
+  const readNothing = (p: string, via: string): void => {
+    if (via === p) {
+      notes.push(skipNote(via));
+      return;
+    }
+    if (saidNoMatches.has(via) || limitedPatterns.has(via) || refusedPatterns.has(via)) return;
+    saidNoMatches.add(via);
+    notes.push(`skipped (no matches): ${via}`);
+  };
+
   for (const { p, via, resolved } of files) {
     // Re-checked at read time because a glob match may be a symlink whose
     // target leaves the roots only once resolved; the anchor could not see it.
@@ -504,7 +576,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     try {
       st = statSync(abs);
     } catch {
-      notes.push(skipNote(via));
+      readNothing(p, via);
       continue;
     }
     // Regular files only (#15): a FIFO blocks the read forever, a device like
@@ -527,7 +599,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     try {
       body = readFileSync(abs, "utf8");
     } catch {
-      notes.push(skipNote(via));
+      readNothing(p, via);
       continue;
     }
     // #19: the header and the separator count toward the cap with the body, so

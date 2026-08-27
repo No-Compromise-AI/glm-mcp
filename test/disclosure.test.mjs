@@ -104,7 +104,7 @@ test('a key file that cannot be read is reported without its path', (t) => {
   }
 });
 
-test('an unreadable ZCode config falls through, and says why only to the operator', (t) => {
+test('an unreachable ZCode config is reported as such, not as no key at all', (t) => {
   const home = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-zcode-')));
   const zcode = join(home, '.zcode', 'v2', 'config.json');
   mkdirSync(join(home, '.zcode', 'v2'), { recursive: true });
@@ -125,18 +125,77 @@ test('an unreadable ZCode config falls through, and says why only to the operato
     isolated({ HOME: home, USERPROFILE: home, GLM_MCP_ALLOW_ZCODE_KEY: '1' }, () => {
       said = toStderr(() => {
         assert.throws(resolveApiKey, (e) => {
-          // A fallback the operator opted into (#21) that cannot be read is a
-          // reason to fall through to the guidance, not a new failure mode —
-          // and never a route for the config's path to reach the caller.
+          // The operator opted in (#21), so this config holds a key they chose
+          // to use: a permission failure means it cannot be reached, not that
+          // no key is configured. Filing it under "no key found" would send
+          // the caller to create a credential it already has — and the config's
+          // path must never ride the message out to it.
+          assert.ok(e instanceof Error);
+          assert.ok(!/no .*key found/i.test(e.message),
+            `an opted-in key the server cannot reach is reported as absent: ${e.message}`);
           assert.ok(!e.message.includes(home),
             `the caller is shown the server's home directory: ${e.message}`);
-          assert.match(e.message, /No z\.ai API key/);
+          assert.match(e.message, /ZCode/, 'the message must still say what could not be used');
           return true;
         });
       });
     });
     assert.ok(said.some((line) => line.includes(zcode)),
       'why the opted-in key was not used belongs on stderr, or the operator never learns');
+    assert.ok(said.some((line) => /EACCES|EPERM|permission denied/i.test(line)),
+      'the underlying error belongs on stderr too');
+  } finally {
+    cleanup();
+  }
+});
+
+test('a key that exists but cannot be reached is not reported as absent', (t) => {
+  const home = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-reach-')));
+  const config = join(home, '.config');
+  const keyFile = join(config, 'zai', 'api-key');
+  mkdirSync(join(config, 'zai'), { recursive: true });
+  writeFileSync(keyFile, 'SECRET-KEY-VALUE');
+  const cleanup = () => {
+    try { chmodSync(config, 0o700); } catch { /* best effort */ }
+    rmSync(home, { recursive: true, force: true });
+  };
+  // chmod 000 on the ANCESTOR denies the traversal to everything inside it —
+  // and existsSync() answers false for the key file just as if it were not
+  // there, which is how a configured key came to be reported as absent.
+  chmodSync(config, 0o000);
+  let denied = true;
+  try {
+    readFileSync(keyFile, 'utf8');
+    denied = false;
+  } catch { /* the fixture denies the traversal as intended */ }
+  if (!denied) {
+    cleanup();
+    t.skip('chmod 000 on the directory did not deny the traversal (running as root?) — the unreachable-key case cannot be exercised here');
+    return;
+  }
+  let said;
+  try {
+    isolated({ HOME: home, USERPROFILE: home }, () => {
+      said = toStderr(() => {
+        assert.throws(resolveApiKey, (e) => {
+          assert.ok(e instanceof Error);
+          // The key IS configured; it simply cannot be reached. Told "no key
+          // found", the caller goes to create a credential it already has.
+          assert.ok(!/no .*key found/i.test(e.message),
+            `a configured key the server cannot reach is reported as absent: ${e.message}`);
+          assert.ok(!e.message.includes(home),
+            `the caller is shown the server's home directory: ${e.message}`);
+          assert.ok(!/EACCES|EPERM|permission denied/i.test(e.message),
+            `the caller is shown the OS's wording for the failure: ${e.message}`);
+          assert.match(e.message, /key/i, 'the message must still say what went wrong');
+          return true;
+        });
+      });
+    });
+    assert.ok(said.some((line) => line.includes(keyFile)),
+      'the path belongs on stderr, or the operator never learns which file could not be reached');
+    assert.ok(said.some((line) => /EACCES|EPERM|permission denied/i.test(line)),
+      'the underlying error belongs on stderr too');
   } finally {
     cleanup();
   }
@@ -217,14 +276,50 @@ test('a skip note for a glob match names the pattern, not the match the machine 
       // it — the oracle #26 closes, routed through a wildcard.
       assert.ok(!JSON.stringify(viaPattern.notes).includes('sudoers'),
         `the note names the machine-expanded filename — ${JSON.stringify(viaPattern.notes)}`);
-      // The same-note contract, now on the pattern route: probing the file by
-      // pattern and by literal spelling must agree once each note is cut down
-      // to the spelling its own caller sent.
-      const viaLiteral = buildFileContext(['sudoers'], dir);
-      const shape = (notes, name) => notes.map((n) => n.split(name).join('<CALLER-PATH>'));
-      assert.deepEqual(shape(viaPattern.notes, 'sudoer?'), shape(viaLiteral.notes, 'sudoers'),
-        `the pattern route and the literal route told the same probe apart — ${JSON.stringify({
-          viaPattern: viaPattern.notes, viaLiteral: viaLiteral.notes })}`);
+      // The pattern route has its own wording — the one a matchless pattern
+      // gets, so the wildcard cannot be used to tell absent from unreadable;
+      // the test after this one pins that within-route contract. The routes
+      // MAY read differently from each other: a caller knows whether it sent
+      // a literal or a pattern, so what neither may reveal is which of the
+      // two REASONS applied, only what was asked for.
+      assert.ok(viaPattern.notes.some((n) => /^skipped \(no matches\): sudoer\?$/.test(n)),
+        `an unreadable match must answer exactly as a matchless pattern does — ${JSON.stringify(viaPattern.notes)}`);
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test('a glob spelled to match one name tells a missing file from an unreadable one no longer', (t) => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-disclosure-glob-oracle-')));
+  const locked = join(dir, 'locked.txt');
+  writeFileSync(locked, 'LOCKED-BODY');
+  const cleanup = () => {
+    try { chmodSync(locked, 0o600); } catch { /* best effort */ }
+    rmSync(dir, { recursive: true, force: true });
+  };
+  if (!deniesRead(locked)) {
+    cleanup();
+    t.skip('chmod 000 did not deny the read (running as root?) — the glob oracle cannot be exercised here');
+    return;
+  }
+  try {
+    isolated({ GLM_MCP_ROOTS: dir }, () => {
+      // `[.]` spells the dot out without becoming a wildcard over it, so
+      // `locked[.]txt` matches exactly one name: the literal existence probe,
+      // one indirection away. If a matched-but-unreadable file answers a
+      // pattern differently from a pattern that matched nothing, that oracle
+      // survives the fix that closed it for literals.
+      const absent = buildFileContext(['absent[.]txt'], dir);
+      const unreadable = buildFileContext(['locked[.]txt'], dir);
+      assert.ok(!unreadable.text.includes('LOCKED-BODY'), 'the unreadable match must not be read');
+      const shape = (notes, name) => notes.map((n) => n.split(name).join('<CALLER-PATTERN>'));
+      assert.deepEqual(shape(unreadable.notes, 'locked[.]txt'), shape(absent.notes, 'absent[.]txt'),
+        `within patterns, a missing file and an unreadable one are told apart — ${JSON.stringify({
+          missing: absent.notes, unreadable: unreadable.notes })}`);
+      // The merged note still names what the caller itself sent.
+      assert.ok(absent.notes.some((n) => n.includes('absent[.]txt')),
+        `the note must still name the spelling the caller sent — ${JSON.stringify(absent.notes)}`);
     });
   } finally {
     cleanup();
