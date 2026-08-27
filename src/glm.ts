@@ -6,6 +6,7 @@ import { expandGlob, isGlobPattern, patternAnchors } from "./glob.js";
 import { confineRoots, deniedCredentials, insideRoots, realpathish } from "./confine.js";
 import {
   envLimit,
+  envOverride,
   walkBudget,
   DEFAULT_MAX_FILE_BYTES,
   DEFAULT_TIMEOUT_MS,
@@ -804,8 +805,13 @@ export function buildFileContext(
   // model's own window, or the operator's explicit override. A caller routed
   // to a smaller model has to be able to tell "this model's window is smaller"
   // — the fix is another model — from "this file is too big" — the fix is
-  // fewer files, or a higher cap.
-  const capWhy = cap === deriveMaxFileChars(windowTokens, model)
+  // fewer files, or a higher cap. The answer is read from whether the override
+  // is in force, never inferred from the cap's number: a pin set to exactly a
+  // model's derived budget is indistinguishable from the derivation by value
+  // yet follows the caller to every wider-window model, and naming the window
+  // there would send them model-shopping for relief the cap still denies. An
+  // unparsable pin supplies no cap (#24), so the window names the cut.
+  const capWhy = envOverride("GLM_MCP_MAX_FILE_CHARS") === undefined
     ? `${model}'s ${windowTokens}-token context window`
     : "the GLM_MCP_MAX_FILE_CHARS cap";
 

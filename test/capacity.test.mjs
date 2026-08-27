@@ -196,10 +196,13 @@ const c = glm.buildFileContext(['big.txt'], ${JSON.stringify(FIXTURE)});
 out.len = c.text.length; out.notes = c.notes; out.cap = glm.MAX_FILE_CHARS;`, env);
 
 // The derivation restated from the module's own constants, so the test fails
-// on the derivation changing, not on a mystery number.
-const derived = (windowTokens) => Math.floor(
-  (windowTokens - glm.outputLimits(glm.DEFAULT_MODEL).def - glm.PROMPT_RESERVE_TOKENS)
+// on the derivation changing, not on a mystery number. The default model's
+// window is the #35 case; #59 made it per model, and the reserve it subtracts
+// is the REQUESTED model's own default.
+const derivedFor = (model, windowTokens) => Math.floor(
+  (windowTokens - glm.outputLimits(model).def - glm.PROMPT_RESERVE_TOKENS)
     * glm.CHARS_PER_TOKEN);
+const derived = (windowTokens) => derivedFor(glm.DEFAULT_MODEL, windowTokens);
 
 test('#35 the input budget is derived from the window, not guessed', () => {
   const r = ctx({});
@@ -256,4 +259,39 @@ test('#35 a bigger budget is not permission to go quiet: the derived cap still t
   assert.ok(r.len <= r.cap, `${r.len} chars assembled against a ${r.cap}-char budget`);
   assert.ok((r.notes ?? []).some((n) => /truncated at \d+ total chars/i.test(n)),
     `a 3.2M-char file over the derived budget must be truncated AND noted — ${JSON.stringify(r.notes)}`);
+});
+
+// ------------------------------------------------ #59: which bound the note names
+// A truncation note names the bound that cut it — the model's window, or the
+// operator's cap — because the reader's next move depends on which it was
+// (#59, rule 7). The attribution has to be read from whether an override is in
+// force, never inferred from the cap's NUMBER: a pin set to exactly a model's
+// derived budget is indistinguishable from the derivation by value yet follows
+// the caller to every wider-window model, and a note that names the window
+// there sends the caller model-shopping for relief the cap still denies.
+
+test("#59 a cap pinned to exactly the model's derived budget is still named as the cap", () => {
+  // glm-4.5: a 128,000-token window (z.ai's published figure, stated here
+  // independently per this file's convention) against its own 65,536 default.
+  const glm45 = derivedFor('glm-4.5', 128_000);
+  const cut = (env) => child(`
+process.env.GLM_MCP_ROOTS = ${JSON.stringify(FIXTURE)};
+const c = glm.buildFileContext(['big.txt'], ${JSON.stringify(FIXTURE)}, 'glm-4.5');
+out.len = c.text.length; out.notes = c.notes;`, env)
+    .notes.find((n) => /truncat/i.test(n)) ?? '';
+
+  const pinned = cut({ GLM_MCP_MAX_FILE_CHARS: glm45 });
+  assert.ok(pinned.includes('GLM_MCP_MAX_FILE_CHARS'),
+    `GLM_MCP_MAX_FILE_CHARS=${glm45} is in force — it is exactly glm-4.5's derived budget, and under the same pin glm-4.6's 200K window is cut at it too — so the bound is the cap and the note must say so: ${JSON.stringify(pinned)}`);
+  assert.ok(!pinned.includes('context window'),
+    `the window did not bind this cut; naming it tells the caller to change models, which the cap survives: ${JSON.stringify(pinned)}`);
+
+  // The other branch must survive the fix, not be flattened into always saying
+  // "cap": with no override — and with an unparsable one, which supplies no
+  // cap at all (#24) — it is glm-4.5's own window that binds.
+  for (const env of [{}, { GLM_MCP_MAX_FILE_CHARS: 'abc' }]) {
+    const free = cut(env);
+    assert.ok(/glm-4\.5's 128000-token context window/.test(free),
+      `with ${JSON.stringify(env)} the derivation binds, and the note must name glm-4.5's window: ${JSON.stringify(free)}`);
+  }
 });

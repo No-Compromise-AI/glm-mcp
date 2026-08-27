@@ -4,12 +4,23 @@
 // caller who trips one learns which knob to turn. Silent truncation is the
 // failure mode this project has spent the most effort eliminating.
 
+/**
+ * The value an environment limit supplies, or undefined when it supplies none:
+ * unset, or not a positive integer. The same predicate {@link envLimit} honours,
+ * separate because a limit's reader can also need to know WHICH bound is in
+ * force — a note naming the knob that cut it (#59) asks about the source, and
+ * the source is not recoverable from the number a limit resolves to.
+ */
+export function envOverride(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
 /** An environment limit: the documented default unless the value parses as a positive integer. */
 export function envLimit(name: string, def: number): number {
-  const raw = process.env[name];
-  if (raw === undefined) return def;
-  const n = Number(raw);
-  return Number.isInteger(n) && n > 0 ? n : def;
+  return envOverride(name) ?? def;
 }
 
 export const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024;
