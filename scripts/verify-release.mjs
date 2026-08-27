@@ -124,7 +124,19 @@ for (const [file, yaml] of [['publish.yml', publishYml], ['ci.yml', ciYml]]) {
 // ------------------------------- #27: the release gate is no weaker than CI
 // A tag must not be able to ship something a pull request would have caught.
 const verifySteps = (body) => [...body.matchAll(/run:\s*npm run (verify:[a-z]+)/g)].map((m) => m[1]).sort();
+// Every gate that EXISTS must run in CI. Comparing the release gate to CI
+// only catches the release falling behind CI; when both fall behind the
+// package.json scripts — as they did, by four gates — the comparison passes
+// while nothing is checked. The set of gates is the authority, not either
+// workflow.
+const declared = Object.keys(
+  JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).scripts,
+).filter((k) => k.startsWith('verify:'));
 const ciVerify = verifySteps([...ciJobs.values()].join('\n'));
+const unwired = declared.filter((g) => !ciVerify.includes(g));
+if (unwired.length > 0) {
+  fail(`ci.yml does not run ${unwired.join(', ')} — a gate that is not wired in protects nothing, and adding one without wiring it is exactly how four of them went unnoticed`);
+}
 const relVerify = verifySteps(need(publishJobs, 'test', 'publish.yml'));
 if (ciVerify.length === 0) fail('ci.yml runs no verify steps — this gate cannot be comparing the right thing');
 const missing = ciVerify.filter((s) => !relVerify.includes(s));

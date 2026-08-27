@@ -25,8 +25,12 @@ Register it once, user-scoped, and it is available in **every** project on the m
 per-project setup:
 
 ```bash
-claude mcp add --scope user glm -- npx -y @nocompromiseai/glm-mcp
+claude mcp add --scope user glm -- npx -y @nocompromiseai/glm-mcp@0.2.0
 ```
+
+The version is pinned on purpose: a bare `npx` resolves `latest` at run time, while the package
+itself ships the exact dependency graph it was tested with — pinning is what makes the two the
+same graph. Bump the pin when you upgrade.
 
 Or from a local checkout:
 
@@ -289,6 +293,10 @@ trees — real files, real symlinks, a real FIFO, a real fake `$HOME` — and ru
 processes where a setting has to be in place before the module loads.
 
 ## Releases
+
+`npm-shrinkwrap.json` carries the version too, so a release bump regenerates it
+(`npm shrinkwrap`) alongside `package.json`. `verify:supplychain` fails if the two
+drift, in CI and again at release, so it cannot ship half-done.
 
 Published from CI with [provenance](https://docs.npmjs.com/generating-provenance-statements)
 via npm trusted publishing — there is no long-lived npm token. Every release is staged and

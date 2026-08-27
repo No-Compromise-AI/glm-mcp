@@ -9,7 +9,8 @@
   "main": "dist/index.js",
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "npm-shrinkwrap.json"
   ],
   "engines": {
     "node": ">=20"
@@ -29,6 +30,7 @@
     "verify:api": "node scripts/verify-api.mjs",
     "verify:capacity": "node scripts/verify-capacity.mjs",
     "verify:disclosure": "node scripts/verify-disclosure.mjs",
+    "verify:supplychain": "node scripts/verify-supplychain.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -40,9 +42,9 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.120.0",
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "zod": "^3.25.0"
+    "@anthropic-ai/sdk": "0.120.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "3.25.76"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

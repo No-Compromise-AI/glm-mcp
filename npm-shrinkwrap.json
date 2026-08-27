@@ -9,9 +9,9 @@
       "version": "0.2.0",
       "license": "MIT",
       "dependencies": {
-        "@anthropic-ai/sdk": "^0.120.0",
-        "@modelcontextprotocol/sdk": "^1.30.0",
-        "zod": "^3.25.0"
+        "@anthropic-ai/sdk": "0.120.0",
+        "@modelcontextprotocol/sdk": "1.30.0",
+        "zod": "3.25.76"
       },
       "bin": {
         "glm-mcp": "dist/index.js"
