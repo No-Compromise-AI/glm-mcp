@@ -481,12 +481,14 @@ out.requestsAfter = seen.length - before;`);
 });
 
 test('#42 a difference that is only spelling does not rebuild the client', async () => {
-  // The other half of the split: normalisation STAYS, on the comparison.
-  // Trailing slashes and surrounding whitespace are ways of writing one
-  // endpoint, so they must reuse the cached client — connection reuse is what
-  // the cache exists for — and a value written that way must still produce a
-  // working request, because what is sent is the operator's own spelling. A
-  // different endpoint still rebuilds.
+  // The other half of the split: normalisation STAYS, on the comparison. But
+  // "spelling" means what the SDK cannot tell apart, and its own join folds
+  // exactly ONE trailing slash (it appends the request path without its
+  // leading slash when the base ends in "/") while the URL parse drops
+  // surrounding whitespace — so those reuse the cached client, connection
+  // reuse being what the cache exists for, and a value written that way must
+  // still produce a working request, because what is sent is the operator's
+  // own spelling. A different endpoint still rebuilds.
   const r = await child(`
 process.env.ZAI_BASE_URL = ' ' + origin + '/';
 const res = await glm.ask({ prompt: 'slash', model: 'glm-5.3', reasoning: 'low' });
@@ -494,7 +496,7 @@ out.worked = res.text === 'ok' && seen.length === 1;
 const first = glm.getClient();
 process.env.ZAI_BASE_URL = origin;
 const second = glm.getClient();
-process.env.ZAI_BASE_URL = origin + '///';
+process.env.ZAI_BASE_URL = origin + '/';
 const third = glm.getClient();
 out.spellingsReuse = first === second && second === third;
 process.env.ZAI_BASE_URL = 'http://127.0.0.1:1';
@@ -502,9 +504,41 @@ out.repointRebuilds = glm.getClient() !== third;`);
   assert.equal(r.worked, true,
     `a slashed, space-padded spelling of a real endpoint must still produce a working request — ${JSON.stringify(r.threw ?? r)}`);
   assert.equal(r.spellingsReuse, true,
-    'trailing slashes and padding are spelling, not endpoints — the cached client must be reused');
+    'one trailing slash and padding are spelling the SDK cannot tell apart — the cached client must be reused');
   assert.equal(r.repointRebuilds, true,
     'a different endpoint must still rebuild the client');
+});
+
+test('#42 a re-spelling the SDK sends differently goes where the operator now points', async () => {
+  // A history-dependent routing bug: several trailing slashes, or whitespace
+  // the request path lands inside, are NOT differences in writing — the SDK
+  // joins the base with the path as written, so "/prefix///" requests
+  // /prefix///v1/messages and "/prefix " requests /prefix%20/v1/messages —
+  // yet trim-and-strip-all folded them all into one cache key. After a call
+  // on /prefix, a call configured for /prefix/// kept the client built for
+  // /prefix and the request went where it went LAST time, not where the
+  // operator now pointed it. The assertion is on the request that actually
+  // arrives, not on object identity — identity was exactly what let this
+  // survive the last round's test.
+  for (const [respelling, expectedPath] of [
+    ['/prefix///', '/prefix///v1/messages'],
+    ['/prefix ', '/prefix%20/v1/messages'],
+  ]) {
+    const r = await child(`
+process.env.ZAI_BASE_URL = origin + '/prefix';
+await glm.ask({ prompt: 'one', model: 'glm-5.3', reasoning: 'low' });
+const first = glm.getClient();
+process.env.ZAI_BASE_URL = origin + ${JSON.stringify(respelling)};
+await glm.ask({ prompt: 'two', model: 'glm-5.3', reasoning: 'low' });
+out.rebuilt = glm.getClient() !== first;
+out.paths = seen.map((s) => s.url);`);
+    assert.equal(r.threw, undefined,
+      `the respelled call must succeed — ${JSON.stringify(r.threw ?? r)}`);
+    assert.deepEqual(r.paths, ['/prefix/v1/messages', expectedPath],
+      `ZAI_BASE_URL respelled to ${JSON.stringify(respelling)} must send its request to ${expectedPath} — it went to ${JSON.stringify(r.paths?.[1])}, the spelling the CACHED client was built with`);
+    assert.equal(r.rebuilt, true,
+      `a spelling the SDK sends differently (${JSON.stringify(respelling)}) must rebuild the client`);
+  }
 });
 
 // ------------------------------------------ #20: max_tokens is a cap

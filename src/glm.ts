@@ -123,15 +123,31 @@ const DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic";
 const DEFAULT_MODELS_URL = "https://api.z.ai/api/paas/v4/models";
 
 /**
- * One spelling of an endpoint, for COMPARISON only (#42): whitespace trimmed,
- * trailing slashes dropped. The client cache is keyed on this spelling because
- * a difference that is only a difference in writing would rebuild a client for
- * nothing, while a comparison that missed a real difference is the pin #42
- * exists to remove. It has no other job, and in particular it never decides
- * what is SENT — that is baseUrl()'s to answer below.
+ * One spelling of an endpoint, for COMPARISON only (#42): the href a request
+ * would go to, computed by the SDK's own join. That join appends the request
+ * path without its leading slash when the base ends in "/" and parses the
+ * whole string as one URL otherwise, so what is writing and what is substance
+ * is settled by URL semantics, not by us: ONE trailing slash and surrounding
+ * whitespace are writing only (the parse drops them, both spellings send the
+ * same request, the cached client stays), while several trailing slashes, or
+ * whitespace the path lands inside, are substance — they reach the request
+ * path as written, as empty segments or %20. A key that folded those too
+ * would pin the cached client's spelling over the operator's current one, and
+ * the request would go where it went last time rather than where it is now
+ * told to go. It has no other job, and in particular it never decides what is
+ * SENT — that is baseUrl()'s to answer below.
  */
 function comparableEndpoint(url: string): string {
-  return url.trim().replace(/\/+$/, "");
+  try {
+    // /v1/messages is the path every request through getClient() starts with,
+    // so this is the SDK's join on a path this client really sends.
+    return new URL(url + (url.endsWith("/") ? "" : "/") + "v1/messages").href;
+  } catch {
+    // A spelling no URL can be made of never sends anything anywhere — the
+    // SDK rejects the join before a request exists — so values that can only
+    // ever fail alike may share this loose spelling for free.
+    return url.trim().replace(/\/+$/, "");
+  }
 }
 
 /**
@@ -171,7 +187,11 @@ function comparableEndpoint(url: string): string {
 export function baseUrl(): string {
   const raw = process.env.ZAI_BASE_URL;
   if (raw === undefined) return DEFAULT_BASE_URL;
-  if (comparableEndpoint(raw) === "") {
+  // This question — does the value name anything at all — is the resolver's
+  // own, asked literally rather than borrowed from comparableEndpoint, whose
+  // job is whether two spellings SEND the same place. A set value that is
+  // empty after trimming, only slashes, only whitespace is this class.
+  if (raw.trim().replace(/\/+$/, "") === "") {
     throw new Error(
       `ZAI_BASE_URL is set to ${JSON.stringify(raw)}, which names no endpoint. It is ` +
         `not replaced with the default (${DEFAULT_BASE_URL}): the variable is how egress ` +
