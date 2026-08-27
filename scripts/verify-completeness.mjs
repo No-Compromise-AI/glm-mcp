@@ -127,6 +127,19 @@ try {
     }
   }
 
+  // An overlapping pattern whose only already-seen match makes it look like it
+  // contributed. The cut lands on the LITERAL — which alone exceeds the cap —
+  // so the pattern delivers nothing, but its de-duplicated match was already
+  // spoken for and that was mistaken for having arrived.
+  writeFileSync(join(ROOT, 'huge.md'), 'h'.repeat(5000));
+  r = ctx(['huge.md', '*.md'], ROOT, { GLM_MCP_MAX_FILE_CHARS: 1200 });
+  const got = [...r.text.matchAll(/--- (\S+) ---/g)].map((m) => m[1]);
+  const everyMd = [...MD, 'huge.md'];
+  const short = everyMd.filter((n) => !got.includes(n));
+  if (short.length > 0 && !r.notes.join(' ').includes('*.md')) {
+    fail(`#40: '*.md' delivered none of ${JSON.stringify(short)} and no note names it. One match already spoken for by an earlier argument is not the pattern having arrived.\n  notes=${JSON.stringify(r.notes)}`);
+  }
+
   // ------------------------------- #41 an answer that was cut off says so
   // The body text differs per case on purpose. Reusing "cut off mid-sent" for
   // the end_turn probe made the check match the MODEL'S OWN WORDS rather than
