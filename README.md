@@ -104,7 +104,11 @@ Two things it is genuinely good at:
 
 ### `glm_models`
 
-Lists the model ids available on the configured account.
+Lists the model ids available on the configured account, each with a one-line role.
+The request path is text-only — no image is ever attached — so picking a vision model
+(`glm-4.6v` and siblings) forgoes the modality it was selected for; each vision id's
+role says so. An id this server's model table does not know is listed bare: it stays
+z.ai's to describe, exactly as it stays z.ai's to size.
 
 ## Reasoning
 
