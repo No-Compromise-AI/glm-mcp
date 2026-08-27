@@ -23,9 +23,10 @@
 //   4. glm_models hints every id the table knows, and invents nothing for an
 //      id it does not — the unknown model stays z.ai's to describe, exactly as
 //      it stays z.ai's to size (#36);
-//   5. if the table knows a vision model, the surface says the request path is
-//      text-only — a caller that picks glm-4.6v for an image gets a text-only
-//      request today and no warning (#45);
+//   5. every model the TABLE declares as taking images says, where the choice
+//      is made, that this server sends text only (#45). Declared, not inferred
+//      from the id: glm-5.3-flash is multimodal and its name does not say so;
+//   7. no model that cannot stop reasoning is offered as a 'none' route;
 //   6. SECURITY.md documents the whole file-context flow, not the phrase
 //      "prompt injection" (#45).
 //
@@ -60,20 +61,42 @@ const glmJs = read('dist/glm.js');
 const limitsSrc = tableOf(glmJs, 'OUTPUT_LIMITS')
   ?? fail('could not find the OUTPUT_LIMITS table in dist/glm.js — this gate can no longer read the model table, which is a failure, not a pass');
 
-const KNOWN = [...limitsSrc.matchAll(/\[\s*["']([^"']+)["']\s*,\s*\{\s*def:\s*([\d_]+)\s*,\s*max:\s*([\d_]+)/g)]
-  .map((m) => ({ id: m[1], def: Number(m[2].replaceAll('_', '')), max: Number(m[3].replaceAll('_', '')) }));
+const KNOWN = [...limitsSrc.matchAll(/\[\s*["']([^"']+)["']\s*,\s*(\{[^}]*\})/g)]
+  .map((m) => {
+    const row = m[2];
+    const num = (k) => {
+      const hit = new RegExp(`\\b${k}:\\s*([\\d_]+)`).exec(row);
+      return hit ? Number(hit[1].replaceAll('_', '')) : undefined;
+    };
+    return { id: m[1], def: num('def'), max: num('max'), vision: /\bvision:\s*true\b/.test(row) };
+  });
 if (KNOWN.length < 5) {
   fail(`parsed only ${KNOWN.length} models out of OUTPUT_LIMITS — the table's shape changed and this gate is no longer reading it`);
 }
-
-// A vision model by its id, which is how z.ai names them: a `v` attached to
-// the version. Derived, so a vision model added tomorrow is covered by rule 5
-// without anyone remembering to add it here.
-const isVision = (id) => /\d+(?:\.\d+)?v(?:-|$)/.test(id);
-const VISION = KNOWN.filter((m) => isVision(m.id)).map((m) => m.id);
-if (VISION.length === 0) {
-  fail('no vision model found in OUTPUT_LIMITS — rule 5 has nothing to check, so either the table changed or this gate is misreading it');
+for (const m of KNOWN) {
+  if (m.def === undefined || m.max === undefined) {
+    fail(`could not read def/max for ${m.id} out of OUTPUT_LIMITS — this gate is no longer reading the table it checks against`);
+  }
 }
+
+// Which models take images is a FACT ABOUT THE MODEL, and the table has to
+// carry it. An earlier version of this gate inferred it from a `v` in the id,
+// which is how z.ai names the 4.5/4.6 vision family — and it was wrong:
+// glm-5.3-flash is natively multimodal and has no `v` anywhere in its name, so
+// the one model most likely to be chosen for cheap bulk work was the one model
+// the rule could not see. An id is a name, not evidence. A row that accepts
+// images declares `vision: true`, and a model whose modality nobody recorded is
+// simply not claimed either way.
+const VISION = KNOWN.filter((m) => m.vision).map((m) => m.id);
+if (VISION.length === 0) {
+  fail('no row in OUTPUT_LIMITS declares `vision: true`, so rule 5 has nothing to check. Vision is not inferable from the id — glm-5.3-flash is multimodal and says nothing about it in its name — so the table must declare it rather than this gate guessing.');
+}
+
+const thinkingSrc = /const THINKING_REQUIRED = new Set\(\[([^\]]*)\]\)/.exec(glmJs);
+if (!thinkingSrc) {
+  fail('could not find THINKING_REQUIRED in dist/glm.js — this gate cannot check rule 7 without knowing which models refuse to stop reasoning');
+}
+const ALWAYS_REASONS = [...thinkingSrc[1].matchAll(/["']([^"']+)["']/g)].map((m) => m[1]);
 
 const budgetSrc = glmJs.slice(glmJs.indexOf('const BUDGET ='), glmJs.indexOf('const BUDGET =') + 400);
 const BUDGET = Object.fromEntries(
@@ -144,7 +167,13 @@ for (const level of LEVELS) {
     fail(`#54: the tool accepts reasoning "${level}" and the guidance never mentions it. Every level the schema offers has to tell a caller when to pick it — otherwise the twelve-fold budget difference is a knob with no label.`);
   }
 }
-const sentences = guidance.split(/(?<=[.;:•\n])/);
+// Clause boundaries that do NOT fall inside a version number: splitting on
+// every period cuts "glm-5.3-flash" into "glm-5." and "3-flash", and then no
+// clause ever contains a model id whole — every per-clause rule below silently
+// stops matching and passes. A period counts as a boundary only when a digit
+// does not follow it.
+const CLAUSE = /(?<=[;:•\n])|(?<=\.)(?!\d)/;
+const sentences = guidance.split(CLAUSE);
 const routed = LEVELS.filter((level) =>
   sentences.some((s) =>
     new RegExp(`\\b${level}\\b`, 'i').test(s) &&
@@ -187,6 +216,12 @@ for (const level of LEVELS) {
 }
 
 // ------------------- rule 4: glm_models hints what it knows, invents nothing
+// An id is bounded by the characters an id may not contain — `glm-5.3` sits
+// inside `glm-5.3-flash`, and \b between "3" and "-" is a boundary, so \b
+// would match the shorter id inside the longer one every time.
+const idBoundary = (id) =>
+  new RegExp(`(^|[^a-z0-9.\\-])${id.replace(/[.\-]/g, '\\$&')}([^a-z0-9.\\-]|$)`, 'i');
+
 const lineFor = (id) =>
   modelsText.split('\n').find((l) => new RegExp(`(^|[^a-z0-9.\\-])${id.replace(/[.\-]/g, '\\$&')}([^a-z0-9.\\-]|$)`, 'i').test(l));
 
@@ -220,6 +255,24 @@ for (const id of VISION) {
 const readme = read('README.md');
 if (!/text[- ]only|no image|does not (?:send|support) image/i.test(readme)) {
   fail('#45: the README never says the request path is text-only. OUTPUT_LIMITS caps the vision models correctly, which reads as support for them.');
+}
+
+// ------- rule 7: the reasoning-off route is only offered where it can be taken
+// A model in THINKING_REQUIRED cannot stop reasoning, so routing a caller to it
+// with 'none' promises latency it will not save. The clause may still NAME such
+// a model beside 'none' — saying it cannot is exactly what a caller needs — so
+// the rule is that such a clause must deny, not offer.
+const NEGATED = /\b(cannot|can't|never|not|refus\w*|reject\w*|raise[ds]?|coerce[ds]?|instead|always reasons)\b/i;
+for (const clause of guidance.split(CLAUSE)) {
+  if (!/\bnone\b/i.test(clause)) continue;
+  for (const model of ALWAYS_REASONS) {
+    // An id is bounded by what an id may NOT contain, not by \b: `glm-5.3`
+    // sits inside `glm-5.3-flash` with a word boundary between them, so \b
+    // would report the flagship for a clause that only ever named the flash.
+    if (!idBoundary(model).test(clause)) continue;
+    if (NEGATED.test(clause)) continue;
+    fail(`#54: the guidance offers ${model} with reasoning 'none', and ${model} cannot stop reasoning — it is in THINKING_REQUIRED. Routing a caller there to save thinking latency promises a saving the request cannot deliver, and the failure is silent: the answer comes back reasoned, with nothing to say the setting was ignored.\n  clause: ${JSON.stringify(clause.trim())}`);
+  }
 }
 
 // ------------------------- rule 6: SECURITY.md documents the flow, not a phrase
