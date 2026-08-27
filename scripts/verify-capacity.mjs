@@ -152,11 +152,12 @@ out.len = c.text.length; out.notes = c.notes; out.cap = glm.MAX_FILE_CHARS;`, en
   if (!(dflt.cap >= 2_500_000)) {
     fail(`#35: the default input budget is ${dflt.cap} chars — at ~3 chars/token that is ~${Math.round(dflt.cap / 3 / 1000)}k of a 1,048,576-token window. Size it to the window.`);
   }
-  // Not an equality: #19 made the `--- big.txt ---` header part of the
-  // assembled text, so an untruncated read is the body plus 16 characters.
-  // What matters is that nothing was cut.
-  if (dflt.len < 1_500_000) {
-    fail(`#35: a 1.5M-char file came back as ${dflt.len} under the new default — ${JSON.stringify(dflt.notes)}`);
+  // Exact, but computed rather than written down: #19 made the header part of
+  // the assembled text, so an untruncated read is the body plus its header. A
+  // lower bound would accept a duplicated or padded result as success.
+  const expected = 1_500_000 + '--- big.txt ---\n'.length;
+  if (dflt.len !== expected) {
+    fail(`#35: a 1.5M-char file assembled to ${dflt.len}, expected exactly ${expected} (body plus its header) — ${JSON.stringify(dflt.notes)}`);
   }
   if ((dflt.notes ?? []).some((n) => /truncat/i.test(n))) {
     fail(`#35: 1.5M chars must fit under a budget sized for a million-token window — ${JSON.stringify(dflt.notes)}`);
@@ -221,16 +222,26 @@ out.len = c.text.length; out.notes = c.notes; out.cap = glm.MAX_FILE_CHARS;`, en
         ZAI_BASE_URL: origin,
       },
     }));
-    // No max_tokens: the tool must fall through to the model's own default.
-    const res = await client.callTool({
-      name: 'glm_ask',
-      arguments: { prompt: 'hi', model: 'glm-5.3', reasoning: 'low' },
-    });
-    if (res.isError) fail(`#36: glm_ask failed against the local server — ${res.content?.[0]?.text}`);
-    if (captured.length !== 1) fail(`#36: expected one upstream request from glm_ask, saw ${captured.length}`);
-    const viaTool = captured[0];
-    if (viaTool.max_tokens < 65_536) {
-      fail(`#36: through the MCP tool, glm_ask asked for max_tokens ${viaTool.max_tokens}. The function beneath it defaults correctly, so index.ts is capping callers on its own.`);
+    // Two models with DIFFERENT defaults, both with max_tokens omitted. One
+    // model proves nothing: `?? 65_536` in index.ts would satisfy a glm-5.3
+    // check and then hand glm-4.6v a value above its own 32,768 ceiling, which
+    // the local check would reject — an omitted cap turning into a refusal.
+    for (const [model, expect] of [['glm-5.3', 65_536], ['glm-4.6v', 16_384]]) {
+      const before = captured.length;
+      const res = await client.callTool({
+        name: 'glm_ask',
+        arguments: { prompt: 'hi', model, reasoning: 'low' },
+      });
+      if (res.isError) {
+        fail(`#36: glm_ask with no max_tokens failed for ${model} — an omitted cap must never become a refusal:\n  ${res.content?.[0]?.text}`);
+      }
+      if (captured.length !== before + 1) {
+        fail(`#36: ${model} produced ${captured.length - before} upstream requests, expected 1`);
+      }
+      const viaTool = captured[before];
+      if (viaTool.max_tokens !== expect) {
+        fail(`#36: through the MCP tool, ${model} with no max_tokens asked for ${viaTool.max_tokens}; its own default is ${expect}. The default must come from the model, not from one constant.`);
+      }
     }
   } finally {
     await client.close().catch(() => {});

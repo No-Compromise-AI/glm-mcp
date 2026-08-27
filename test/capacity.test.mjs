@@ -163,6 +163,22 @@ test('#36 an unknown model is not capped against the table', () => {
   assert.equal(r.seen[0].body.max_tokens, 200_000, 'the asked-for cap goes through untouched');
 });
 
+test('#36 an unknown model gets a default that actually works', async () => {
+  // Comparing outputLimits(x).def to DEFAULT_MAX_TOKENS compares the
+  // implementation with itself: set that constant to 1 and the comparison
+  // still holds, while an omitted cap with reasoning is then refused locally
+  // for having no room. Assert what the value has to DO instead.
+  const d = glm.outputLimits('glm-99-unreleased').def;
+  assert.ok(d >= glm.MIN_BUDGET_TOKENS + glm.MIN_ANSWER_TOKENS,
+    `an unknown model's default (${d}) must leave room to reason and answer, or an omitted cap becomes a refusal`);
+  const r = await child(`
+process.env.ZAI_BASE_URL = origin;
+out.result = await glm.ask({ prompt: 'hi', model: 'glm-99-unreleased', reasoning: 'low' });`);
+  assert.equal(r.threw, undefined, `an unknown model with no cap must be sent, not refused — ${r.threw}`);
+  assert.equal(r.seen.length, 1, 'the request should have reached the endpoint');
+  assert.equal(r.seen[0].body.max_tokens, d, "the request must carry the unknown model's default");
+});
+
 // ------------------------------------------------- #35: the derived input budget
 
 // A throwaway tree holding one 3,200,000-char file — over the derived default
