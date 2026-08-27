@@ -123,6 +123,18 @@ const DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic";
 const DEFAULT_MODELS_URL = "https://api.z.ai/api/paas/v4/models";
 
 /**
+ * One spelling of an endpoint, for COMPARISON only (#42): whitespace trimmed,
+ * trailing slashes dropped. The client cache is keyed on this spelling because
+ * a difference that is only a difference in writing would rebuild a client for
+ * nothing, while a comparison that missed a real difference is the pin #42
+ * exists to remove. It has no other job, and in particular it never decides
+ * what is SENT — that is baseUrl()'s to answer below.
+ */
+function comparableEndpoint(url: string): string {
+  return url.trim().replace(/\/+$/, "");
+}
+
+/**
  * The endpoints, resolved when a call is made rather than when the module
  * loads. BASE_URL and MODELS_URL below are the values as of startup, exported
  * for anything that wants to display them; the requests themselves re-read
@@ -132,15 +144,43 @@ const DEFAULT_MODELS_URL = "https://api.z.ai/api/paas/v4/models";
  * and getClient() re-resolves the chat endpoint, key and timeout on every
  * call, rebuilding the client only when one of them actually changed (#42).
  *
- * The base URL is normalised to one spelling — trailing slashes dropped, an
- * empty value read as unset — because it is COMPARED, against the spelling
- * the cached client was built with (#42): a difference that is only a
- * difference in writing would rebuild a client for nothing, and a comparison
- * that misses a real difference is the pin this fix exists to remove.
+ * The chat endpoint a request is SENT to is the operator's own value exactly
+ * as written when they set one, the vendor's default when — and only when —
+ * they did not. #22 made ZAI_BASE_URL the egress-scoping knob, so the two
+ * states are not interchangeable: an operator who scoped where the key goes
+ * did not scope it so that a mistyped value would fall back to the vendor's
+ * own host. A value that is SET but names no endpoint — empty after trimming,
+ * only slashes, only whitespace, which is exactly what
+ * `ZAI_BASE_URL="${HOST}/"` with HOST unset leaves — is refused here, naming
+ * the variable, rather than replaced.
+ *
+ * Refusing rather than sending the value as written for the SDK to reject (the
+ * behaviour before #42) is a deliberate choice with one ground: the SDK does
+ * not reject an empty baseURL, it substitutes api.anthropic.com — a third host
+ * the operator named even less than z.ai's. Only the empty spelling reaches
+ * that, and it is the ordinary one (`"${HOST}"` with HOST unset, no slash), so
+ * the class is refused as a whole rather than half-sent, half-rejected.
+ *
+ * The refusal therefore fires at module scope too, through BASE_URL below: a
+ * server whose egress scope does not resolve does not start. That is the
+ * earliest moment the right person is looking — the MCP host surfaces a
+ * startup failure to the operator who just configured it — and the
+ * alternative is a server that starts, answers glm_models, and fails every
+ * glm_ask with the SDK's bare "Invalid URL", which names nothing.
  */
 export function baseUrl(): string {
-  const url = (process.env.ZAI_BASE_URL ?? "").trim().replace(/\/+$/, "");
-  return url !== "" ? url : DEFAULT_BASE_URL;
+  const raw = process.env.ZAI_BASE_URL;
+  if (raw === undefined) return DEFAULT_BASE_URL;
+  if (comparableEndpoint(raw) === "") {
+    throw new Error(
+      `ZAI_BASE_URL is set to ${JSON.stringify(raw)}, which names no endpoint. It is ` +
+        `not replaced with the default (${DEFAULT_BASE_URL}): the variable is how egress ` +
+        `is scoped, so a value that is set is sent as written or refused, never quietly ` +
+        `swapped for a host the operator did not name. Unset it to use ` +
+        `${DEFAULT_BASE_URL}, or set it to the endpoint requests should go to.`,
+    );
+  }
+  return raw;
 }
 
 export function modelsUrl(): string {
@@ -333,11 +373,21 @@ function callBudgetMs(): number {
  * restart: this function re-resolves on every call, so the call after the
  * source is repaired — or rotated — is the one that picks it up, while a
  * restart while it is still broken would leave nothing cached to serve with.
+ *
+ * The endpoint enters the comparison in ONE spelling — comparableEndpoint —
+ * while the client itself is built with the operator's value as written:
+ * normalising is for comparing (#42), never for deciding what to send.
  */
 let client: Anthropic | undefined;
-let clientBuiltWith: { baseURL: string; key: string; timeout: number } | undefined;
+let clientBuiltWith: { endpoint: string; key: string; timeout: number } | undefined;
 
 export function getClient(): Anthropic {
+  // Resolved OUTSIDE the credential fallback below, on purpose. A key that
+  // stops resolving is a source that failed to re-read, and one that already
+  // resolved is proof one exists; a base URL that throws here is a value the
+  // operator SET that names no endpoint — a repoint, not a flaky read — so
+  // serving the call from the last good client would send the key to an
+  // endpoint they just stopped naming. The refusal stands.
   const baseURL = baseUrl();
   const timeout = callBudgetMs();
   let key: string;
@@ -365,10 +415,11 @@ export function getClient(): Anthropic {
     // caller has to hear what is missing.
     throw e;
   }
+  const endpoint = comparableEndpoint(baseURL);
   if (
     client !== undefined &&
     clientBuiltWith &&
-    clientBuiltWith.baseURL === baseURL &&
+    clientBuiltWith.endpoint === endpoint &&
     clientBuiltWith.key === key &&
     clientBuiltWith.timeout === timeout
   ) {
@@ -381,7 +432,7 @@ export function getClient(): Anthropic {
     timeout,
     maxRetries: 2,
   });
-  clientBuiltWith = { baseURL, key, timeout };
+  clientBuiltWith = { endpoint, key, timeout };
   return client;
 }
 

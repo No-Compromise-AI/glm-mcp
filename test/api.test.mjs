@@ -15,6 +15,11 @@
 //        stops resolving mid-life serves the call from the last good client
 //        with the reason on stderr — a warning that must send the operator to
 //        the repair, never to a restart the per-call re-read made pointless.
+//        And: a base URL the operator SET but that names no endpoint is
+//        refused, never replaced with the default — ZAI_BASE_URL is how
+//        egress is scoped (#22), so a set value is sent as written or
+//        refused, while normalisation stays on the comparison that decides
+//        whether to rebuild the client.
 //
 // #20 and #22 are captured against a real local HTTP server rather than a mock
 // of our own code — that is how #20 was reproduced. #20's server lives in this
@@ -92,11 +97,17 @@ after(async () => {
  * The child is spawned asynchronously because #20's child calls THIS process's
  * server: a synchronous spawn would block the event loop serving it, and the
  * two would wait on each other until the timeout killed them both.
+ *
+ * `lazy` imports the module inside the try instead of at the top. glm.ts
+ * evaluates `baseUrl()` at module scope (`export const BASE_URL = ...`), and a
+ * resolver that REFUSES a set-but-unusable value throws during import — which
+ * a static import turns into a dead child rather than an observable refusal,
+ * and the cases below have to tell those two apart.
  */
-async function child(body, env = {}, timeoutMs = 20_000) {
+async function child(body, env = {}, timeoutMs = 20_000, { lazy = false } = {}) {
   const src = `
 import { createServer } from 'node:http';
-import * as glm from ${JSON.stringify(GLM)};
+${lazy ? '' : `import * as glm from ${JSON.stringify(GLM)};`}
 const respond = ${respond.toString()};
 const seen = [];
 const server = createServer((req, res) => {
@@ -122,6 +133,7 @@ globalThis.fetch = (url, init) => {
 };
 const out = {};
 try {
+${lazy ? `const glm = await import(${JSON.stringify(GLM)});` : ''}
 ${body}
 } catch (e) {
   out.threw = String(e && e.message ? e.message : e);
@@ -411,6 +423,88 @@ out.bearers = seen.map((s) => (s.auth ?? '').replace(/^Bearer\\s+/i, ''));`,
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+// ------------------- #42/#22: a SET base URL is never silently replaced
+
+test('#42 with ZAI_BASE_URL unset the chat endpoint is exactly what it has always been', async () => {
+  const r = await child('out.url = glm.baseUrl();');
+  assert.equal(r.url, 'https://api.z.ai/api/anthropic',
+    `operators who set nothing must get today's URL, got ${JSON.stringify(r.url ?? r.threw)}`);
+});
+
+test('#42 a base URL the operator SET but that names no endpoint is refused, never replaced', async () => {
+  // The class, not the spellings: '/' through '\t' and ''. That last one is
+  // `ZAI_BASE_URL="${HOST}"` with HOST unset — the ordinary way an operator
+  // reaches this class, and the reason the refusal covers it whole: the SDK
+  // does not reject an empty baseURL, it substitutes api.anthropic.com, so
+  // "send what they wrote" has no honest spelling for ''. The refusal must
+  // name the variable and say the default is not substituted, because the
+  // operator's next move depends on knowing no fallback is going to catch
+  // them.
+  for (const value of ['/', '//', '///', ' ', '  /  ', '\t', '']) {
+    const r = await child('out.url = glm.baseUrl();', { ZAI_BASE_URL: value }, 20_000, { lazy: true });
+    assert.ok(r.threw,
+      `ZAI_BASE_URL=${JSON.stringify(value)} must be refused, not resolved — got ${JSON.stringify(r.url ?? r)}`);
+    assert.match(r.threw, /ZAI_BASE_URL/,
+      `ZAI_BASE_URL=${JSON.stringify(value)}: the refusal must name the variable — got ${JSON.stringify(r.threw)}`);
+    assert.match(r.threw, /not replaced with the default/,
+      `ZAI_BASE_URL=${JSON.stringify(value)}: the refusal must say the default is not substituted — got ${JSON.stringify(r.threw)}`);
+  }
+});
+
+test('#42 a repoint to a value that names no endpoint sends nothing — not to the default, not to the old endpoint', async () => {
+  // The regression this round exists for, end to end: before it, "/" and " "
+  // resolved to the default and the bearer went to z.ai. The fetch fence makes
+  // any such attempt visible as its own error, and the call must instead fail
+  // with the refusal. Falling back to the CACHED client would be just as
+  // wrong: the operator changed where egress is allowed to go, and the last
+  // good endpoint is one they just stopped naming — the credential fallback
+  // covers a source that failed to RE-READ, not a repoint, and this pins that
+  // the difference is deliberate.
+  const r = await child(`
+process.env.ZAI_BASE_URL = origin;
+await glm.ask({ prompt: 'one', model: 'glm-5.3', reasoning: 'low' });
+const before = seen.length;
+process.env.ZAI_BASE_URL = '/';
+try {
+  await glm.ask({ prompt: 'two', model: 'glm-5.3', reasoning: 'low' });
+  out.sentAnyway = true;
+} catch (e) { out.refusal = String(e && e.message ? e.message : e); }
+out.requestsAfter = seen.length - before;`);
+  assert.ok(r.refusal,
+    `the repointed call must fail — ${JSON.stringify(r.sentAnyway ?? r.threw)}`);
+  assert.match(r.refusal, /ZAI_BASE_URL/,
+    `the failure must be the refusal, not a fetch-fence trip or anything else — got ${JSON.stringify(r.refusal)}`);
+  assert.equal(r.requestsAfter, 0,
+    'nothing may be sent after the repoint — not to the default, not to the old endpoint');
+});
+
+test('#42 a difference that is only spelling does not rebuild the client', async () => {
+  // The other half of the split: normalisation STAYS, on the comparison.
+  // Trailing slashes and surrounding whitespace are ways of writing one
+  // endpoint, so they must reuse the cached client — connection reuse is what
+  // the cache exists for — and a value written that way must still produce a
+  // working request, because what is sent is the operator's own spelling. A
+  // different endpoint still rebuilds.
+  const r = await child(`
+process.env.ZAI_BASE_URL = ' ' + origin + '/';
+const res = await glm.ask({ prompt: 'slash', model: 'glm-5.3', reasoning: 'low' });
+out.worked = res.text === 'ok' && seen.length === 1;
+const first = glm.getClient();
+process.env.ZAI_BASE_URL = origin;
+const second = glm.getClient();
+process.env.ZAI_BASE_URL = origin + '///';
+const third = glm.getClient();
+out.spellingsReuse = first === second && second === third;
+process.env.ZAI_BASE_URL = 'http://127.0.0.1:1';
+out.repointRebuilds = glm.getClient() !== third;`);
+  assert.equal(r.worked, true,
+    `a slashed, space-padded spelling of a real endpoint must still produce a working request — ${JSON.stringify(r.threw ?? r)}`);
+  assert.equal(r.spellingsReuse, true,
+    'trailing slashes and padding are spelling, not endpoints — the cached client must be reused');
+  assert.equal(r.repointRebuilds, true,
+    'a different endpoint must still rebuild the client');
 });
 
 // ------------------------------------------ #20: max_tokens is a cap
