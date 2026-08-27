@@ -115,3 +115,14 @@ test('an empty key file falls through to the ZCode key', withHome(
     assert.equal(resolveApiKey(), 'sk-zcode');
   },
 ));
+
+test('an opted-in ZCode fallback with no config present still falls through', withHome(
+  {},
+  () => {
+    // The read is attempted, not guarded with existsSync (#26): a missing
+    // config — ENOENT — is genuinely absent, so the guidance is the right
+    // answer, and only a permission failure is reported as unreachable.
+    process.env.GLM_MCP_ALLOW_ZCODE_KEY = '1';
+    assert.throws(resolveApiKey, /No z\.ai API key/);
+  },
+));

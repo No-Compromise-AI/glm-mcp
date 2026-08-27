@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { readFileSync, existsSync, lstatSync, realpathSync, statSync } from "node:fs";
+import { readFileSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { expandGlob, isGlobPattern, patternAnchors } from "./glob.js";
@@ -139,31 +139,97 @@ export const MIN_BUDGET_TOKENS = 1024;
 export const MIN_ANSWER_TOKENS = 1024;
 
 /**
+ * Whether a failed credential read means the credential is not configured
+ * there (#26). ENOENT — nothing at the path — and ENOTDIR — a component of it
+ * is a file, so nothing can ever be — are the only errnos that say absent.
+ * Any other failure, EACCES on the file itself or on an ancestor directory
+ * that stops the traversal, means a key may well be configured where the
+ * server cannot reach it: a different problem with a different fix, and one
+ * the operator has to hear about rather than have filed under "no key found".
+ */
+const isAbsent = (e: unknown): boolean => {
+  const code = (e as NodeJS.ErrnoException | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+};
+
+/**
  * Resolve the z.ai key without ever hardcoding it:
  *   ZAI_API_KEY  ->  ~/.config/zai/api-key  ->  (opt-in) the key ZCode already stores.
  *
  * The ZCode fallback reads another application's config file, so it is off unless
  * GLM_MCP_ALLOW_ZCODE_KEY=1 is set. Reading a credential a user configured for a
  * different tool should be their explicit choice, not a convenience they discover.
+ *
+ * The reads are attempted, not guarded with existsSync() first: existsSync
+ * answers false when an ANCESTOR directory is unsearchable as surely as when
+ * the file is missing, so a configured key the server cannot reach was
+ * reported as absent and the caller was sent to create a credential it
+ * already has while the operator got nothing (#26). The errno makes the
+ * distinction instead — see {@link isAbsent}. A source that fails for any
+ * reason but absence fails in words that name no path: the message crosses
+ * the trust boundary to the caller, and this machine's directory layout is
+ * not the caller's business — the path and the underlying error go to stderr
+ * for the operator.
  */
 export function resolveApiKey(): string {
   const fromEnv = process.env.ZAI_API_KEY?.trim();
   if (fromEnv) return fromEnv;
 
   const keyFile = join(homedir(), ".config", "zai", "api-key");
-  if (existsSync(keyFile)) {
+  try {
     const k = readFileSync(keyFile, "utf8").trim();
     if (k) return k;
+  } catch (e) {
+    if (!isAbsent(e)) {
+      // #26: the thrown message is what the caller reads, and V8's errno errors
+      // carry the file's absolute path — the account's home directory and
+      // username with it. The caller hears only that the key could not be
+      // read, which covers a file that denies the read and a directory that
+      // denies the way to it alike; the path and the underlying error go to
+      // stderr, the operator's channel — stdout is the MCP protocol and stays
+      // clean either way.
+      const why = e instanceof Error ? e.message : String(e);
+      console.error(`glm-mcp: could not read the key file ${keyFile}: ${why}`);
+      throw new Error(
+        "The configured z.ai key file could not be read. Check that this " +
+          "server's account is allowed to read it, or set ZAI_API_KEY instead.",
+      );
+    }
   }
 
   const zcode = join(homedir(), ".zcode", "v2", "config.json");
-  if (process.env.GLM_MCP_ALLOW_ZCODE_KEY === "1" && existsSync(zcode)) {
+  if (process.env.GLM_MCP_ALLOW_ZCODE_KEY === "1") {
+    let raw: string | undefined;
     try {
-      const cfg = JSON.parse(readFileSync(zcode, "utf8"));
-      const k = cfg?.provider?.["builtin:zai-coding-plan"]?.options?.apiKey;
-      if (typeof k === "string" && k.trim()) return k.trim();
-    } catch {
-      /* fall through to the error below */
+      raw = readFileSync(zcode, "utf8");
+    } catch (e) {
+      if (!isAbsent(e)) {
+        // The opted-in fallback gets the same split as the key file (#21,
+        // #26): a config the server cannot reach holds a key the operator
+        // chose to use, so it is reported as unreadable rather than filed
+        // under "no key found" — and never with its path in the caller's
+        // message, only on stderr.
+        const why = e instanceof Error ? e.message : String(e);
+        console.error(`glm-mcp: could not read the ZCode config ${zcode}: ${why}`);
+        throw new Error(
+          "The ZCode config could not be read, so the key it holds could not " +
+            "be used. Check that this server's account is allowed to read it, " +
+            "or set ZAI_API_KEY instead.",
+        );
+      }
+    }
+    if (raw !== undefined) {
+      try {
+        const cfg = JSON.parse(raw);
+        const k = cfg?.provider?.["builtin:zai-coding-plan"]?.options?.apiKey;
+        if (typeof k === "string" && k.trim()) return k.trim();
+      } catch (e) {
+        // A config that will not parse holds no usable key, so the plain
+        // guidance below still applies — but the operator who opted in (#21)
+        // loses the reason unless it lands on stderr, the same split as above.
+        const why = e instanceof Error ? e.message : String(e);
+        console.error(`glm-mcp: could not parse the ZCode config ${zcode}: ${why}`);
+      }
     }
   }
 
@@ -264,6 +330,24 @@ function takeUnits(s: string, maxUnits: number): string {
   return s.slice(0, cut);
 }
 
+/**
+ * The note for an entry that yielded nothing readable, whatever the reason
+ * (#26): a literal that does not exist, a literal the read was refused for,
+ * a pattern that matched nothing, a pattern not one match of which could be
+ * read. Which of those applied is the server's business — `namesSomething`
+ * picks an entry's branch by whether the file EXISTS, so any difference in
+ * what the branches say is an existence-and-permission oracle for anything
+ * inside the roots, and fixing one wording at a time twice left the next
+ * spelling open: a name made of metacharacters, then a pattern and its
+ * literal twin in one call. `no matches` is the wording because it is what a
+ * genuinely empty pattern has always said, and those patterns still say
+ * exactly that. The refusal notes in buildFileContext are the deliberate
+ * opposite — they name the expanded match, pinned by the confinement gate,
+ * because a boundary the caller cannot see is what those notes have to
+ * explain.
+ */
+const skipNote = (p: string): string => `skipped (no matches): ${p}`;
+
 export interface FileContext {
   text: string;
   notes: string[];
@@ -288,7 +372,16 @@ export interface FileContext {
  * silent-failure shape this project has spent the most effort removing.
  */
 export function buildFileContext(paths: string[], cwd: string): FileContext {
-  const notes: string[] = [];
+  // Every note is filed under the argument that produced it, and the notes
+  // leave in the order the arguments arrived (#26). Which branch handles an
+  // entry — literal or pattern — is decided by whether the file exists, so
+  // the order notes surface in is as much an answer as their wording: a
+  // pattern's answer used to be written after the reads and a literal's
+  // during them, which put the same two notes in different orders for the
+  // same argument list. The sort is stable, so notes sharing an argument
+  // keep the order they were pushed in — a limit note ahead of the refusal
+  // it explains, both behind anything earlier.
+  const notes: Array<{ arg: number; msg: string }> = [];
   const chunks: string[] = [];
   let total = 0;
 
@@ -321,9 +414,18 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // time for a pattern it has already recorded, and a single slot would go
   // stale the moment a later pattern tripped a limit of its own.
   const limitedPatterns = new Set<string>();
+  // The patterns whose walk a confinement refusal cut short, the other half of
+  // "stopped" — a "no matches" note would misdescribe those exactly as it
+  // misdescribes a limited one, wherever about them it is filed.
+  const refusedPatterns = new Set<string>();
+  // The argument being worked. The budget's note sink and the mid-walk refusal
+  // callback fire from inside glob.ts's own loops, synchronously within the
+  // iteration they belong to, so this is how they learn which argument to file
+  // their note under.
+  let argAt = -1;
   const budget = walkBudget((msg) => {
     limitedPatterns.add(budget.pattern);
-    notes.push(msg);
+    notes.push({ arg: argAt, msg });
   });
   const maxFileBytes = envLimit("GLM_MCP_MAX_FILE_BYTES", DEFAULT_MAX_FILE_BYTES);
 
@@ -361,10 +463,42 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
   // containment costs one comparison on a value already computed. `via` keeps
   // the caller's own spelling for the entry — an argument it sent — so refusal
   // notes name which of its arguments was dropped, never a resolved path that
-  // would widen what notes already disclose.
-  const files: Array<{ p: string; via: string; resolved: string }> = [];
+  // would widen what notes already disclose. `arg` is the position of that
+  // argument, so the notes the reads push are filed under it too.
+  const files: Array<{ p: string; via: string; resolved: string; arg: number }> = [];
   const included = new Set<string>();
-  for (const p of paths) {
+  // Every pattern of this call and the resolved matches it found — the
+  // de-duplicated ones too, because the note these exist to write asks the
+  // pattern a question (did it contribute anything?) that a match claimed by
+  // an earlier entry still answers. A Map, so a spelling repeated in the
+  // argument list pools one found-set instead of walking twice — but the note
+  // is owed to every argument that sent the spelling, not to the spelling,
+  // because the literal route answers each repetition separately and the count
+  // of answers is itself an answer: merge them and a caller learns whether a
+  // repeated spelling named a file by counting what came back.
+  const patternMatches = new Map<string, { found: Set<string> }>();
+  // The files this result already speaks for, by resolved identity: one
+  // delivered its content, was truncated, or was refused in a note naming
+  // it. A file that yielded nothing readable is deliberately not here — that
+  // absence is what tells the answer at the end which arguments contributed
+  // nothing at all, and it is why a refusal marks its file: refused is not
+  // absent, and filing a refused entry under "no matches" would claim it was.
+  const spokenFor = new Set<string>();
+  // One answer owed to each argument, written when the reads have settled
+  // (#26). The literal route used to say its note at once and the pattern
+  // route only after the reads; the answer is owed to the ARGUMENT either
+  // way, so it is asked once, here, for both. It also survives
+  // de-duplication, because de-duplication decides what is read, not what
+  // the caller is told: an argument folded into an earlier entry's file
+  // still got nothing it could not equally have got from the file not
+  // existing, and that is the answer it receives. First appearance is the
+  // arguments' own order, so the answers already read in it.
+  const pendings: Array<
+    | { arg: number; via: string; kind: "literal"; key: string }
+    | { arg: number; via: string; kind: "pattern"; found: Set<string> }
+  > = [];
+  for (const [arg, p] of paths.entries()) {
+    argAt = arg;
     // The credential rule runs before any existence check (decision 3), so
     // /proc/self/environ is reported as refused, not missing, where it does
     // not exist. A path that exists on disk is then read literally — judged
@@ -378,18 +512,26 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     // of its branches.
     const resolved = keyOf(p);
     if (denied.has(resolved)) {
-      notes.push(`refused (credential path): ${p}`);
+      notes.push({ arg, msg: `refused (credential path): ${p}` });
       continue;
     }
     if (!isGlobPattern(p) || namesSomething(p)) {
-      if (included.has(resolved)) continue;
-      if (roots && !insideRoots(resolved, roots)) {
-        notes.push(`refused: ${p} resolves outside the allowed roots`);
+      if (!included.has(resolved)) {
+        if (roots && !insideRoots(resolved, roots)) {
+          notes.push({ arg, msg: `refused: ${p} resolves outside the allowed roots` });
+          // The refusal speaks for the file, so an entry naming the same
+          // identity later is neither re-refused nor filed under "no
+          // matches": refused is not absent, and this note already says it.
+          included.add(resolved);
+          spokenFor.add(resolved);
+          continue;
+        }
         included.add(resolved);
-        continue;
+        files.push({ p, via: p, resolved, arg });
       }
-      included.add(resolved);
-      files.push({ p, via: p, resolved });
+      // Registered whether this argument created the file entry or was
+      // de-duplicated into an earlier one — see pendings.
+      pendings.push({ arg, via: p, kind: "literal", key: resolved });
       continue;
     }
     // Limits are notes, never throws — and that goes for hostile input this
@@ -399,52 +541,65 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     // nobody predicted; a caller still gets its other files either way.
     try {
       if (roots && patternAnchors(p, cwd, budget).some((a) => !insideRoots(realpathish(a), roots))) {
-        notes.push(`refused: ${p} resolves outside the allowed roots`);
+        notes.push({ arg, msg: `refused: ${p} resolves outside the allowed roots` });
         continue;
       }
       // A directory the walk prunes for leaving the roots is a refusal like any
       // other: expandGlob reports each reported path once, with the spelling a
       // match would carry, so the note names both it and the pattern that
       // reached it.
-      let refusedMatch = false;
       const matches = expandGlob(p, cwd, roots ?? undefined, (refused) => {
-        refusedMatch = true;
-        notes.push(
-          `refused: ${refused} (matched by ${p}) resolves outside the allowed roots`,
-        );
+        refusedPatterns.add(p);
+        notes.push({
+          arg,
+          msg: `refused: ${refused} (matched by ${p}) resolves outside the allowed roots`,
+        });
       }, budget);
-      if (matches.length === 0) {
-        // Refused is not the same as absent: a pattern whose matches were all
-        // stopped at the boundary — or cut short by a limit — must not also be
-        // filed under "no matches", which reads as a pattern that was simply
-        // wrong and contradicts the note beside it. Only a pattern that matched
-        // nothing, refused nothing and was limited by nothing says "no matches"
-        // — and it is THIS pattern's refusal that is asked about, never
-        // whether the call has seen one at all.
-        if (!refusedMatch && !limitedPatterns.has(p)) notes.push(`skipped (no matches): ${p}`);
-        continue;
-      }
+      // Every match is recorded against the pattern, de-duplicated or not;
+      // a pattern that matched nothing is recorded the same way, with no
+      // matches. The answer this feeds is written after the reads, because
+      // whether an argument contributed anything is known only then. A pending
+      // per argument that sent the spelling — see patternMatches above.
+      let rec = patternMatches.get(p);
+      if (!rec) patternMatches.set(p, (rec = { found: new Set<string>() }));
+      pendings.push({ arg, via: p, kind: "pattern", found: rec.found });
       for (const m of matches) {
         const key = keyOf(m);
+        rec.found.add(key);
         if (included.has(key)) continue;
         included.add(key);
-        files.push({ p: m, via: p, resolved: key });
+        files.push({ p: m, via: p, resolved: key, arg });
       }
     } catch (e) {
-      notes.push(`refused: ${p} (expansion failed: ${e instanceof Error ? e.message : String(e)})`);
+      // #28: whatever the engine said — V8's wording describes its regex
+      // compiler, not this project — stays on stderr for the operator, and the
+      // caller is told in plain words that the pattern is unusable, next to the
+      // spelling it sent. The note is a refusal like any other: the caller's
+      // other files are still read.
+      const why = e instanceof Error ? e.message : String(e);
+      console.error(`glm-mcp: expanding ${p} failed: ${why}`);
+      notes.push({ arg, msg: `refused: ${p} (expansion failed: malformed pattern)` });
       continue;
     }
   }
 
-  for (const { p, via, resolved } of files) {
+  for (const { p, via, resolved, arg } of files) {
     // Re-checked at read time because a glob match may be a symlink whose
     // target leaves the roots only once resolved; the anchor could not see it.
     if (denied.has(resolved)) {
-      notes.push(`refused (credential path): ${p}${via === p ? "" : ` (matched by ${via})`}`);
+      notes.push({
+        arg,
+        msg: `refused (credential path): ${p}${via === p ? "" : ` (matched by ${via})`}`,
+      });
+      spokenFor.add(resolved);
       continue;
     }
     if (roots && !insideRoots(resolved, roots)) {
-      notes.push(`refused: ${p}${via === p ? "" : ` (matched by ${via})`} resolves outside the allowed roots`);
+      notes.push({
+        arg,
+        msg: `refused: ${p}${via === p ? "" : ` (matched by ${via})`} resolves outside the allowed roots`,
+      });
+      spokenFor.add(resolved);
       continue;
     }
     const abs = resolve(cwd, p);
@@ -456,8 +611,7 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     try {
       st = statSync(abs);
     } catch {
-      notes.push(`skipped (not found): ${p}`);
-      continue;
+      continue; // nothing was read; the argument's answer below says so
     }
     // Regular files only (#15): a FIFO blocks the read forever, a device like
     // /dev/zero is infinitely long, and neither has a size worth capping. The
@@ -465,23 +619,28 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
     // take them down with it.
     const matchedBy = via === p ? "" : ` (matched by ${via})`;
     if (!st.isFile()) {
-      notes.push(`refused (not a regular file): ${p}${matchedBy}`);
+      notes.push({ arg, msg: `refused (not a regular file): ${p}${matchedBy}` });
+      spokenFor.add(resolved);
       continue;
     }
     if (st.size > maxFileBytes) {
-      notes.push(
-        `refused (too large): ${p}${matchedBy} is ${st.size} bytes, over the ` +
+      notes.push({
+        arg,
+        msg: `refused (too large): ${p}${matchedBy} is ${st.size} bytes, over the ` +
           `GLM_MCP_MAX_FILE_BYTES limit of ${maxFileBytes}`,
-      );
+      });
+      spokenFor.add(resolved);
       continue;
     }
     let body: string;
     try {
       body = readFileSync(abs, "utf8");
     } catch {
-      notes.push(`skipped (unreadable): ${p}`);
-      continue;
+      continue; // nothing was read; the argument's answer below says so
     }
+    // Content will be delivered — in full or truncated — so the result
+    // speaks for this file either way.
+    spokenFor.add(resolved);
     // #19: the header and the separator count toward the cap with the body, so
     // 300 empty files cannot produce a five-figure prompt under a
     // multimillion-char "cap" with no note. `total` is the assembled length so
@@ -500,16 +659,60 @@ export function buildFileContext(paths: string[], cwd: string): FileContext {
         chunks.push(`${sep}${theader}${taken}`);
         total += (sep ? 2 : 0) + theader.length + taken.length;
       }
-      notes.push(`truncated at ${MAX_FILE_CHARS} total chars starting with: ${p}`);
+      notes.push({
+        arg,
+        msg: `truncated at ${MAX_FILE_CHARS} total chars starting with: ${p}`,
+      });
+      // The cap cut the loop here, so the entries after this one were never
+      // attempted — and each is still answered below, exactly as a pattern
+      // after the cut always was. Silencing the literals among them was this
+      // oracle wearing the cap's hat: which branch an entry took is decided
+      // by whether the file exists, so a literal silenced where a pattern
+      // would be noted tells a caller the named file is there.
       break;
     }
     chunks.push(`${sep}${header}${body}`);
     total += overhead + body.length;
   }
 
+  // The reads have settled, so every argument can be answered now, in the
+  // arguments' own order (#26). The question is the same for a literal and a
+  // pattern alike: did anything this argument names appear in the result?
+  // Nothing spoken for — not delivered, not truncated, not refused in a note
+  // naming it — and the argument is told `no matches`, the one wording,
+  // because the caller must not be able to tell the reasons apart: the
+  // branch its entry took was chosen by whether the file exists, so a
+  // difference between the reasons is a difference about the machine. A
+  // pattern some of whose matches WERE read says nothing — `no matches`
+  // beside content that came from this very pattern would not be the truth,
+  // and the note would still disclose that another of its matches existed
+  // and could not be read. And a pattern whose walk was stopped — by a
+  // limit, or by a boundary refusal — is excused entirely: refused is not
+  // the same as absent, that note already speaks for it, and "no matches"
+  // beside it would claim it was simply wrong.
+  for (const pending of pendings) {
+    if (pending.kind === "literal") {
+      if (!spokenFor.has(pending.key)) {
+        notes.push({ arg: pending.arg, msg: skipNote(pending.via) });
+      }
+      continue;
+    }
+    if (limitedPatterns.has(pending.via) || refusedPatterns.has(pending.via)) continue;
+    let contributed = false;
+    for (const key of pending.found) {
+      if (spokenFor.has(key)) {
+        contributed = true;
+        break;
+      }
+    }
+    if (!contributed) notes.push({ arg: pending.arg, msg: skipNote(pending.via) });
+  }
+
   // The separators were budgeted per chunk above, so joining is the identity:
-  // `total` and text.length agree by construction.
-  return { text: chunks.join(""), notes, refusedCall: false };
+  // `total` and text.length agree by construction. Notes leave in argument
+  // order — see the top of this function.
+  notes.sort((a, b) => a.arg - b.arg);
+  return { text: chunks.join(""), notes: notes.map((n) => n.msg), refusedCall: false };
 }
 
 export interface AskArgs {
