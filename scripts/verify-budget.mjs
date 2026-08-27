@@ -224,65 +224,93 @@ out.text = res.text;`,
     }
   }
 
-  // ------ rule 4b: what ZAI_BASE_URL means is decided by URL, not by spelling
-  // Two rounds were lost enumerating spellings here. The first closed "/", "//"
-  // and bare whitespace; the second reopened it with "/ /" and "//\t//", which
-  // are the same thing written differently. So the rule is no longer a list.
+  // ------ rule 4b: the request goes to the host the operator named, or nowhere
+  // Three rounds were spent here, and the first two were spent enumerating
+  // spellings — "/", "//", whitespace; then "/ /", "//\t//". The third found
+  // something else entirely: validating the JOINED request instead of the base
+  // MANUFACTURES a host. `ZAI_BASE_URL="http://"` does not parse on its own,
+  // but "http://" + "v1/messages" does, and the bearer token then goes to a
+  // host called `v1` that the operator never wrote. "http:", "https:/" and
+  // every other partial scheme do the same.
   //
-  // THE PROPERTY: ZAI_BASE_URL is how an operator scopes egress (#22), so the
-  // default endpoint is what an UNSET variable means and nothing else. For any
-  // value the operator SET, exactly two answers are honest — send that endpoint,
-  // or refuse and send nothing — and the question "is this an endpoint?" is
-  // answered by whether a URL can be made of it, never by stripping characters
-  // and looking at what is left. A resolver written against a character class
-  // will always have one more spelling outside it.
+  // THE PROPERTY, and it is about hosts rather than about strings:
   //
-  // The class below is EXHAUSTIVE, not a sample: every string of length 1..4
-  // over {'/', ' ', '\t'} — 120 of them, "/ /" and "//\t//" included by
-  // construction rather than by anyone remembering them.
+  //   ZAI_BASE_URL is how egress is scoped (#22). The default endpoint is what
+  //   an UNSET variable means and nothing else. A value the operator SET is
+  //   either sent to the host THEY NAMED, or refused and sent nowhere — so a
+  //   value this resolver accepts must itself parse as a URL with a non-empty
+  //   host, and the request built from it must go to that same host. Deriving
+  //   a string from the value and asking whether THAT parses is not the same
+  //   question, and answering it is how a host nobody named acquires a token.
+  //
+  // Both generated classes below are principled families rather than lists:
+  // every slash/whitespace string up to length 4, and every prefix of a scheme
+  // — the shapes a half-written endpoint actually takes.
   {
     const unset = child(`out.url = glm.baseUrl();`, { HOME, USERPROFILE: HOME, ZAI_BASE_URL: undefined });
     if (!unset.url) fail(`#42: baseUrl() returned nothing with ZAI_BASE_URL unset — ${JSON.stringify(unset.threw ?? unset)}`);
     const DEFAULT = unset.url;
 
-    const alphabet = ['/', ' ', '\t'];
-    const nonUrls = [];
+    const values = [];
     let round = [''];
     for (let n = 0; n < 4; n++) {
-      round = round.flatMap((p) => alphabet.map((c) => p + c));
-      nonUrls.push(...round);
+      round = round.flatMap((p) => ['/', ' ', '\t'].map((c) => p + c));
+      values.push(...round);
     }
-    // Every one of these is SET and none is a URL — the same test the resolver
-    // itself should be making. If any ever parses, this gate is generating the
-    // wrong class and must say so rather than check the wrong thing.
-    for (const v of nonUrls) {
-      let parsed = true;
-      try { new URL(v); } catch { parsed = false; }
-      if (parsed) fail(`this gate generated ${JSON.stringify(v)} as a non-endpoint and URL parsed it — the class is wrong`);
+    for (const scheme of ['http://', 'https://']) {
+      for (let n = 1; n <= scheme.length; n++) {
+        const prefix = scheme.slice(0, n);
+        values.push(prefix, prefix + ' ', prefix + '/');
+      }
     }
 
-    // One child, every value: 120 spawns would make this gate the slowest thing
-    // in the suite for no extra evidence.
+    // None of these names a host. Asserted here so the gate fails loudly if the
+    // generator ever drifts, rather than checking the wrong class quietly.
+    for (const v of values) {
+      let host = '';
+      try { host = new URL(v).host; } catch { host = ''; }
+      if (host !== '') fail(`this gate generated ${JSON.stringify(v)} as naming no host, and URL gave it ${JSON.stringify(host)} — the class is wrong`);
+    }
+
     const r = child(`
-const values = ${JSON.stringify(nonUrls)};
+const values = ${JSON.stringify(values)};
 out.rows = [];
 for (const v of values) {
   process.env.ZAI_BASE_URL = v;
-  let row = { v };
+  const row = { v };
   try { row.url = glm.baseUrl(); } catch (e) { row.refused = String(e && e.message ? e.message : e); }
   out.rows.push(row);
-}`, { HOME, USERPROFILE: HOME }, 90_000, { lazy: true });
+}`, { HOME, USERPROFILE: HOME }, 120_000, { lazy: true });
 
     if (r.threw) fail(`#42: the endpoint-class case could not run — ${r.threw}`);
-    const defaulted = (r.rows ?? []).filter((row) => row.url === DEFAULT);
+    const rows = r.rows ?? [];
+    if (rows.length !== values.length) fail(`#42: expected ${values.length} results, got ${rows.length}`);
+
+    const defaulted = rows.filter((row) => row.url === DEFAULT);
     if (defaulted.length) {
-      fail(`#42: ${defaulted.length} of ${r.rows.length} set-but-unusable values resolved to the default endpoint ${DEFAULT}, e.g. ${defaulted.slice(0, 4).map((d) => JSON.stringify(d.v)).join(', ')}. ZAI_BASE_URL is how egress is scoped, so a value the operator SET must never be replaced by the vendor's own host — "\${HOST}/" with HOST unset would ship the bearer token to z.ai rather than fail. Decide "is this an endpoint?" by whether a URL can be made of it; a rule written against a character class will always have one more spelling outside it, which is what the last two rounds proved.`);
+      fail(`#42: ${defaulted.length} of ${rows.length} values the operator SET resolved to the default endpoint ${DEFAULT}, e.g. ${defaulted.slice(0, 4).map((d) => JSON.stringify(d.v)).join(', ')}. ZAI_BASE_URL is how egress is scoped, so a value they set must never be replaced by the vendor's own host.`);
     }
-    const accepted = (r.rows ?? []).filter((row) => row.refused === undefined);
-    if (accepted.length) {
-      fail(`#42: ${accepted.length} of ${r.rows.length} values that name no endpoint were accepted rather than refused, e.g. ${accepted.slice(0, 4).map((d) => JSON.stringify(d.v)).join(', ')}. They do not resolve to the default, which is the important half — but they are still returned as an endpoint, so the failure arrives later as the SDK's generic "Invalid URL" with nothing to say which variable caused it. Refuse at resolution, naming ZAI_BASE_URL.`);
+
+    // The heart of it: anything ACCEPTED has to name the host it will reach.
+    const escaped = [];
+    for (const row of rows) {
+      if (row.refused !== undefined) continue;
+      const path = '/v1/messages';
+      let baseHost = null;
+      let sentHost = null;
+      try { baseHost = new URL(row.url).host; } catch { baseHost = null; }
+      try {
+        const joined = row.url + (row.url.endsWith('/') && path.startsWith('/') ? path.slice(1) : path);
+        sentHost = new URL(joined).host;
+      } catch { sentHost = null; }
+      if (!baseHost || baseHost !== sentHost) escaped.push({ ...row, baseHost, sentHost });
     }
-    const silent = (r.rows ?? []).filter((row) => row.refused !== undefined && !/ZAI_BASE_URL/.test(row.refused));
+    if (escaped.length) {
+      const e = escaped[0];
+      fail(`#42: ${escaped.length} of ${rows.length} values were accepted while naming no host of their own, e.g. ZAI_BASE_URL=${JSON.stringify(e.v)} — the base names host ${JSON.stringify(e.baseHost)} and the request would go to ${JSON.stringify(e.sentHost)}. Appending the request path can MANUFACTURE a hostname: "http://" is not a URL, but "http://v1/messages" is, and the bearer token then reaches a host called "v1" that nobody configured. Validate the value the operator set, not a string derived from it, and require that the request reach the host they named.`);
+    }
+
+    const silent = rows.filter((row) => row.refused !== undefined && !/ZAI_BASE_URL/.test(row.refused));
     if (silent.length) {
       fail(`#42: a refusal never names the variable at fault, e.g. ${JSON.stringify(silent[0].refused).slice(0, 160)}. The operator has to know WHICH setting stopped the server.`);
     }
