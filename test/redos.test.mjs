@@ -208,14 +208,27 @@ test('a reversed character class matches nothing, quietly', () => {
   assert.deepEqual(expandGlob('[z-a].ts', note), []);
 });
 
+// Naming the pattern is not enough. "skipped (no matches): [z-a].ts" names it
+// too, and says the wrong thing: a pattern that CANNOT match is a different
+// report from one that merely didn't, and the caller fixes them differently.
+const assertMalformed = (notes, spelling) => {
+  assert.ok(
+    notes.some((n) => n.includes(spelling) && /expansion failed|invalid|malformed|cannot|could not/i.test(n)),
+    `${spelling} must be reported as malformed, not merely as matching nothing — notes=${JSON.stringify(notes)}`,
+  );
+  assert.ok(
+    !notes.some((n) => n.includes(spelling) && /no matches/i.test(n)),
+    `${spelling} must not be filed under "no matches" — notes=${JSON.stringify(notes)}`,
+  );
+};
+
 test('an uncompilable class stays a note, and the files beside it are read', () => {
   const hadRoots = 'GLM_MCP_ROOTS' in process.env;
   const savedRoots = process.env.GLM_MCP_ROOTS;
   process.env.GLM_MCP_ROOTS = note;
   try {
     const ctx = buildFileContext(['[z-a].ts', 'ok.ts'], note);
-    assert.ok(ctx.notes.some((n) => n.includes('[z-a].ts')),
-      `the pattern must be reported by name — notes=${JSON.stringify(ctx.notes)}`);
+    assertMalformed(ctx.notes, '[z-a].ts');
     assert.ok(ctx.text.includes('OK-BODY'), `a good file beside it must still be read — text=${JSON.stringify(ctx.text)}`);
   } finally {
     if (hadRoots) process.env.GLM_MCP_ROOTS = savedRoots;
@@ -236,8 +249,7 @@ test('an uncompilable class inside braces stays a named note, and the good branc
   process.env.GLM_MCP_ROOTS = note;
   try {
     const ctx = buildFileContext(['{[z-a].ts,ok.ts}'], note);
-    assert.ok(ctx.notes.some((n) => n.includes('{[z-a].ts,ok.ts}')),
-      `the pattern must be reported by name, braces included — notes=${JSON.stringify(ctx.notes)}`);
+    assertMalformed(ctx.notes, '{[z-a].ts,ok.ts}');
     assert.ok(ctx.text.includes('OK-BODY'),
       `the good branch must still be read — text=${JSON.stringify(ctx.text)}`);
   } finally {
