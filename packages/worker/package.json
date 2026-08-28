@@ -1,0 +1,25 @@
+{
+  "name": "@nocompromiseai/glm-worker",
+  "version": "0.1.0",
+  "description": "Headless delegation worker for the glm-mcp shell family: runs the vendored Claude Agent SDK against z.ai's GLM models, so delegation needs no host Claude Code CLI installed (#90).",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "glm-worker": "bin/glm-worker.mjs"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/No-Compromise-AI/glm-mcp.git",
+    "directory": "packages/worker"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.250"
+  }
+}

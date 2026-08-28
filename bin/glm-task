@@ -49,7 +49,7 @@ TASK="$*"
 REVIEWER="$(glm_resolve_reviewers "$REVIEWER")"
 AVAIL=""
 for _r in $REVIEWER; do
-  _cmd="$_r"; [[ "$_r" == "glm" ]] && _cmd="$HERE/claude-glm"
+  _cmd="$_r"; [[ "$_r" == "glm" ]] && _cmd="$HERE/glm-worker"
   if command -v "$_cmd" >/dev/null 2>&1 || [[ -x "$_cmd" ]]; then
     AVAIL="${AVAIL:+$AVAIL,}$_r"
   else
@@ -155,7 +155,7 @@ for line in sys.stdin:
 run_agent() { # $1 = prompt, $2 = log path
   # The notes file lives outside the repo, so its directory must be an allowed
   # working directory or every escalation write is silently denied.
-  "$HERE/claude-glm" -p "$1" \
+  "$HERE/glm-worker" -p "$1" \
     --permission-mode acceptEdits --allowedTools "${TOOLS[@]}" \
     --add-dir "$(dirname "$NOTES")" \
     --output-format stream-json --verbose 2>&1 | tee "$2" | trace

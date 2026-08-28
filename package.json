@@ -10,7 +10,8 @@
   "files": [
     "dist",
     "README.md",
-    "npm-shrinkwrap.json"
+    "npm-shrinkwrap.json",
+    "scripts/install-worker.mjs"
   ],
   "engines": {
     "node": ">=20"
@@ -18,6 +19,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepare": "npm run build",
+    "postinstall": "node scripts/install-worker.mjs",
     "start": "node dist/index.js",
     "smoke": "node scripts/smoke.mjs",
     "test": "npm run build && node --test test/glob.test.mjs test/api-key.test.mjs test/confinement.test.mjs test/limits.test.mjs test/emitted.test.mjs test/redos.test.mjs test/api.test.mjs test/capacity.test.mjs test/disclosure.test.mjs test/completeness.test.mjs test/routing.test.mjs test/review.test.mjs test/lines.test.mjs test/thread.test.mjs test/searchroot.test.mjs",

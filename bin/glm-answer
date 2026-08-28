@@ -39,7 +39,7 @@ cd "$DIR" || exit 1
 echo "glm-answer: resuming $SID in $DIR" >&2
 echo "glm-answer: log=$LOG" >&2
 
-"$HERE/claude-glm" --resume "$SID" -p "The human answered your question:
+"$HERE/glm-worker" --resume "$SID" -p "The human answered your question:
 
 $ANSWER
 
