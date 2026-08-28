@@ -44,7 +44,8 @@
     "prepublishOnly": "npm run build",
     "verify:host-routing": "node scripts/verify-host-routing.mjs",
     "verify:review": "node scripts/verify-review.mjs",
-    "verify:docs": "node scripts/verify-docs.mjs"
+    "verify:docs": "node scripts/verify-docs.mjs",
+    "verify:drain": "node scripts/verify-drain.mjs"
   },
   "keywords": [
     "mcp",
