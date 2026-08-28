@@ -193,10 +193,17 @@ backoff_wait() { # $1 backoffs taken  $2 provider-asked secs ("" if none)
     w="$2"
   else
     while [[ $k -lt $1 ]]; do w=$((w * 2)); k=$((k + 1)); done
-    [[ $w -gt 1800 ]] && w=1800
     w=$((w + RANDOM % (w / 4 + 1)))
+    # The ceiling is applied LAST. Capping before the jitter and the extra
+    # second let this return 2251s — a 30-minute limit that gave 37. A cap
+    # that is not the final word is not a cap.
+    [[ $w -gt 1800 ]] && w=1800
   fi
-  echo $((w + 1))
+    w=$((w + 1))
+    # Capped again after the extra second, so the ceiling is genuinely the
+    # last word rather than 1801.
+    [[ $w -gt 1800 ]] && w=1800
+    echo "$w"
 }
 
 # Run one item and report back through a file in $RESDIR. Parses the two lines
@@ -286,7 +293,15 @@ while :; do
       _lowest="${_f##*/res-}"; break
     done
     if [[ -n "$_lowest" ]]; then
-      echo "glm-drain: no result for sequence $NEXTRES and nothing running — skipping to $((10#$_lowest))" >&2
+      # Every sequence stepped over is a worker that died without writing a
+      # result. Its RUNNING slot was never released, and leaving it counted
+      # keeps the drain believing work is in flight forever — it would spin
+      # with an empty queue and never exit. Release one slot per skipped
+      # sequence, which is exactly how many workers went missing.
+      _skipped=$(( 10#$_lowest - NEXTRES ))
+      (( _skipped > 0 )) && RUNNING=$(( RUNNING - _skipped ))
+      (( RUNNING < 0 )) && RUNNING=0
+      echo "glm-drain: no result for sequence $NEXTRES and nothing running — $_skipped worker(s) died without reporting; skipping to $((10#$_lowest))" >&2
       NEXTRES=$((10#$_lowest))
     fi
   fi
@@ -413,6 +428,12 @@ while :; do
       _k_ru=("${_k_ru[@]+"${_k_ru[@]}"}" "${WRU[$i]}")
       _k_rh=("${_k_rh[@]+"${_k_rh[@]}"}" "${WRH[$i]}")
       _k_ready=("${_k_ready[@]+"${_k_ready[@]}"}" "${WREADY[$i]}")
+        # These two are why a parked item can be resumed at all. An earlier
+        # version declared the arrays and assigned them back but never filled
+        # them here, so every waiting item's session and worktree were erased
+        # on the next pass — silently, because nothing reads them until a halt.
+        _k_sess=("${_k_sess[@]+"${_k_sess[@]}"}" "${WSESS[$i]:-}")
+        _k_wt=("${_k_wt[@]+"${_k_wt[@]}"}" "${WWT[$i]:-}")
     fi
   done
   WID=(${_k_id[@]+"${_k_id[@]}"}); WSPEC=(${_k_spec[@]+"${_k_spec[@]}"})
