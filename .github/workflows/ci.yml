@@ -51,3 +51,4 @@ jobs:
       - run: npm run verify:completeness
       - run: npm run verify:host-routing
       - run: npm run verify:review
+      - run: npm run verify:docs
