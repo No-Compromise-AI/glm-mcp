@@ -105,11 +105,8 @@ done
 echo "BRANCH\t$item\t$BRANCH_ARG" >> ${JSON.stringify(log)}
 [ -z "$item" ] && item="$(echo "$*" | grep -oE 'issue[ -]?[0-9]+' | head -1)"
 start=$(perl -MTime::HiRes=time -e 'printf "%.0f", time*1000')
-# `grep -c` prints 0 AND exits 1 on no match, so `|| echo 0` appended a SECOND
-# zero and the counter became "0\n0", corrupting every rule that depends on
-# attempt order. Found by the delegate, in this gate, while it was being
-# blamed for failing it. Take grep's own count; default only if the file is
-# absent entirely.
+# grep -c prints 0 and exits 1 on no match; a trailing || echo 0 appended a
+# second zero and corrupted the attempt counter. Take grep own count.
 n=$(grep -c "^START	$item	" ${JSON.stringify(log)} 2>/dev/null)
 [ -z "$n" ] && n=0
 echo "START	$item	$start	$n" >> ${JSON.stringify(log)}
