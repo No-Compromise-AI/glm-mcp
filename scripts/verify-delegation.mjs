@@ -221,6 +221,25 @@ check(b.status === 6,
   'Propagating only the worker\'s exit status passes rule 2 and misses this entirely.');
 check(b.row?.worker_ok === false, 'rule 5: an errored agent result must record worker_ok=false');
 
+// Rule 5b — an UNCLASSIFIABLE result is not a successful one. A result event
+// that is neither explicitly successful nor explicitly an error tells us the
+// run's outcome is unknown, and "unknown" must not resolve to "shipped".
+// Raised by codex against the first implementation. Its stated reason — that
+// this contradicts a documented fail-closed contract — was wrong; no such
+// contract is written anywhere, and across 76 result events from real runs
+// `subtype` was ALWAYS present ("success" x75, "error_during_execution" x1),
+// so nothing observed can reach this branch. The rule is kept anyway, for its
+// own reason rather than the reviewer's: the entire point of this gate is that
+// a delegation must not report success unless it is known to have succeeded,
+// and a fail-open in the one classifier whose job is to fail closed is worth
+// forbidding even when no producer is known to exercise it. If a future SDK
+// does start omitting the field, this fails loudly on the first run instead of
+// certifying every one of them.
+const unk = delegate({ code: 0, stdout: JSON.stringify({ type: 'result', subtype: null, is_error: false, session_id: 's', num_turns: 1, duration_ms: 1 }) });
+check(unk.status === 6,
+  `rule 5b: a result event that is neither explicitly successful nor explicitly an error must not ` +
+  `read as success; got exit ${unk.status}. Unknown is not the same as fine.`);
+
 // Rule 6 — shape (c): exit ZERO, no result event at all.
 const c = delegate({ code: 0, stdout: JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } }) });
 check(c.status === 6,

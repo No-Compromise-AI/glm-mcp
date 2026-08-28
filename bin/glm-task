@@ -209,7 +209,7 @@ except Exception: pass
 if res is None:
     try: print(open(os.environ["GLM_LOGF"]).read()[-4000:])
     except Exception: pass
-elif res.get("is_error") or res.get("subtype") not in (None, "success"):
+elif res.get("is_error") or res.get("subtype") != "success":
     print(str(res.get("result") or res.get("error") or "")[:4000])
 PYEOF
 )"
@@ -251,7 +251,7 @@ try:
 except Exception: pass
 if res is None:
     print("0\tthe worker exited %s without emitting a result event - it could not start, died, or was killed mid-run" % os.environ["GLM_WRC"])
-elif res.get("is_error") or res.get("subtype") not in (None, "success"):
+elif res.get("is_error") or res.get("subtype") != "success":
     # The verdict travels as ok<TAB>reason, so the reason itself must be
     # tab-free and one line or it would split its own field.
     detail = " ".join(str(res.get("result") or res.get("error") or "").split())[:300]
