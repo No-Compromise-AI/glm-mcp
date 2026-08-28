@@ -68,6 +68,18 @@ The version is pinned on purpose: a bare `npx` resolves `latest` at run time, wh
 itself ships the exact dependency graph it was tested with — pinning is what makes the two the
 same graph. Bump the pin when you upgrade.
 
+One exception, and it matters if you are working **on** this package rather than with it.
+`npx` prefers a local package whose name and version satisfy the request, so inside a checkout
+of this repository whose `package.json` version equals the pin, `npx` runs **your working tree**,
+not the published tarball. That is often what you want while developing — but an unbuilt
+checkout has no `dist/` to run and the server dies at startup with
+`sh: glm-mcp: command not found`. Either build it (`npm install` runs the build), or register the
+absolute path instead, which makes the substitution explicit:
+
+```bash
+claude mcp add --scope user glm -- node /absolute/path/to/glm-mcp/dist/index.js
+```
+
 Or from a local checkout:
 
 ```bash
@@ -139,6 +151,50 @@ Two things it is genuinely good at:
 | `system` | string | — | optional system prompt |
 | `max_tokens` | number | the model's own default (65,536 for GLM-5.3) | hard ceiling on output; see Reasoning |
 
+### `glm_review`
+
+Review a change and get a verdict back. This is the review half of the delegate → review
+loop, which used to live only in a bash script — putting it here is what lets Claude, Codex
+and Antigravity all review to the same standard instead of each hand-rolling a prompt.
+
+| arg | type | default | notes |
+| --- | --- | --- | --- |
+| `diff` | string | — | the unified diff to review, as your tooling produced it |
+| `files` | string[] | — | optional files as extra context, resolved exactly as `glm_ask` resolves them |
+| `spec` | string | — | what the change was *meant* to do; reaches the reviewer verbatim |
+| `cwd` | string | server cwd | what relative `files` resolve against |
+| `model` | string | `glm-5.3` | any id from `glm_models` |
+| `reasoning` | `none`\|`low`\|`high`\|`max` | `high` | higher than `glm_ask`'s default, on purpose |
+| `max_tokens` | number | the model's own default | hard ceiling on output |
+
+At least one of `diff` or `files` is required. Called with neither, the call is refused
+rather than answered — reviewing nothing and reporting a pass is the failure this tool
+exists to prevent.
+
+**The reply always ends with `VERDICT: PASS` or `VERDICT: CHANGES_REQUIRED`**, on its own
+final line, spelled exactly that way. That is the vocabulary `bin/glm-review` greps for, so
+a shell pipeline can consume the result; the two parsers are checked against each other by
+`npm run verify:review` so they cannot drift apart.
+
+**A bare verdict comes back as an error, never as a clean review.** A reply carrying less
+than `GLM_REVIEW_MIN_SUBSTANCE` characters of analysis beside its verdict is refused. This
+is the part most worth knowing about: a reviewer that returns "looks good" is worse than no
+reviewer, because it converts an unexamined change into one with a clean bill of health.
+The floor measures the model's *reply*, never the request — a floor computed from the
+prompt or the diff is satisfied by exactly the long requests that most need checking. A
+reply the output cap severed is refused too, whatever verdict it had already written.
+
+Pass `spec` where you can. Review against intent is what catches silent scope-narrowing —
+an agent quietly implementing less than was asked while every test still passes — and no
+amount of reading the diff finds that on its own.
+
+**This server never runs `git`.** The diff comes from the caller. The trust boundary here is
+built around reading files (see [Path confinement](#path-confinement)), and executing a
+subprocess in a caller-influenced directory is a different and much larger surface.
+
+Use a different model than the one that wrote the code where you can. A model re-reading its
+own work reliably under-reports.
+
 ### `glm_models`
 
 Lists the model ids available on the configured account, each with a one-line role.
@@ -147,6 +203,28 @@ accepts images (`glm-4.6v` and siblings, and `glm-5.3-flash`, which is natively
 multimodal though its name says nothing of it) forgoes the modality it was selected
 for; each such id's role says so. An id this server's model table does not know is
 listed bare: it stays z.ai's to describe, exactly as it stays z.ai's to size.
+
+## The shell tools in `bin/`
+
+This repository holds two things that share a name and almost nothing else, and conflating
+them is the fastest way to be confused by it:
+
+| | what it is | what GLM is |
+| --- | --- | --- |
+| the MCP server — `glm_ask`, `glm_review`, `glm_models` | a server another agent calls mid-task | **a tool** the agent consults, keeping the wheel |
+| `bin/` — `claude-glm`, `glm-task`, `glm-review`, `glm-ship`, and four more | shell around the Claude Code CLI | **the agent**, doing the work in the repository |
+
+`bin/claude-glm` points the Claude Code CLI at z.ai, so GLM drives a session. `bin/glm-task`
+delegates a task to that session, verifies it independently, has a *different vendor's* model
+review the result against the spec, and records the outcome. Reviewer selection follows the
+agent you are sitting in — `GLM_HOST` — so the host driving a delegation is never its own
+reviewer: from Claude that is codex + agy, from Codex claude + agy, from Antigravity codex +
+claude. `-r all` asks all three.
+
+**These are not in the published npm package.** This package's promise is the server; the
+scripts drive a CLI an npm consumer will not have. They are here because they are the other
+half of the same idea, and because ~1,700 lines of working shell deserve a history. Use them
+from a checkout.
 
 ## Reasoning
 
@@ -301,6 +379,7 @@ variable that set it — nothing is ever silently truncated or silently dropped.
 | Wall-clock budget for glob expansion | `GLM_MCP_GLOB_TIMEOUT_MS` | 10,000 |
 | Total `{a,b}` brace expansions | `GLM_MCP_MAX_BRACE_EXPANSIONS` | 1,024 |
 | Request timeout, the whole call — all retries included | `GLM_MCP_TIMEOUT_MS` | 600,000 |
+| Least analysis a `glm_review` verdict may stand on, in characters of the reply beside the verdict line | `GLM_REVIEW_MIN_SUBSTANCE` | 200 |
 
 The character budget is **derived, per model**, not chosen: the context window
 of the model the request will use, less that model's default output and a
