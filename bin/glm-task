@@ -20,9 +20,15 @@
 #   0  verified and reviewed
 #   5  rate limited — the run was NOT attempted; retry later
 #   4  BLOCKED — the agent stopped to ask a question
-#   6  the delegated agent did not complete (could not start, died, reported
-#      failure, was killed, or exited non-zero despite a clean result) — no
-#      change was produced, so verify and review had nothing to judge
+#   6  the delegated agent did not complete — it could not start, died, was
+#      killed, reported failure, or exited non-zero despite a clean result;
+#      OR it finished having committed NOTHING: either it left files
+#      uncommitted in the tree (named in the ledger's worker_reason — they are
+#      still recoverable until the worktree is deleted) or it made no change
+#      at all. glm-ship pushes commits, so either way the branch carries no
+#      change, and a verify that passed counts for nothing: -v runs against
+#      the working tree and is satisfied by uncommitted files. glm-task never
+#      commits on the agent's behalf — it refuses and says so.
 #   1  a change WAS produced and was judged wanting — verify failed, or the
 #      reviewer required changes
 #   2  UNREVIEWED — the review errored; nothing checked the change
@@ -45,7 +51,7 @@ HERE="$(cd -P "$(dirname -- "$__self")" && pwd)"
 . "$HERE/_glm-capacity.sh"
 
 DIR="$PWD"; VERIFY=""; TOOLS_OVERRIDE=""; REVIEWER="${GLM_REVIEWER:-auto}"; FIXES=1
-ISOLATE=0; BRANCH=""
+ISOLATE=0; BRANCH=""; LINKED_NM=0
 while getopts "C:v:t:r:x:Wb:h" opt; do
   case "$opt" in
     C) DIR="$OPTARG" ;; v) VERIFY="$OPTARG" ;; t) TOOLS_OVERRIDE="$OPTARG" ;;
@@ -132,9 +138,12 @@ if [[ $ISOLATE -eq 1 ]]; then
   if ! git -C "$DIR" worktree add -q -b "$BRANCH" "$WORKTREE" HEAD 2>&1; then
     echo "glm-task: could not create worktree $WORKTREE on $BRANCH" >&2; exit 2
   fi
-  # Share installed deps rather than reinstalling per run.
+  # Share installed deps rather than reinstalling per run. LINKED_NM remembers
+  # the symlink is OURS, so the uncommitted-work check below does not report it
+  # as work the agent left behind.
   if [[ -d "$PARENT_DIR/node_modules" && ! -e "$WORKTREE/node_modules" ]]; then
     ln -s "$PARENT_DIR/node_modules" "$WORKTREE/node_modules"
+    LINKED_NM=1
   fi
   echo "glm-task: isolated worktree=$WORKTREE branch=$BRANCH" >&2
   DIR="$WORKTREE"
@@ -305,10 +314,72 @@ trap cleanup_tail EXIT INT TERM
 
 run_agent "$TASK$ESCALATION" "$LOG"
 sleep 1; cleanup_tail
+
+# DID THE DELEGATION LEAVE A CHANGE A BRANCH CAN CARRY? glm-ship pushes
+# COMMITS, so an agent that commits nothing has produced nothing to merge:
+# uncommitted files are discarded with the worktree while every other signal —
+# a green verify above all, since -v runs against the working tree and is
+# perfectly happy with uncommitted work — says the item succeeded (#93).
+# Same property as #91 one step further on: there the agent never ran, here it
+# ran and left no trace that survives the worktree.
+#
+# Measured at the agent's exit, BEFORE do_verify: the files listed must be the
+# agent's work, not artifacts a verify command left behind.
+#
+# Counted only against a base commit: with no git base ($BASE empty) there is
+# nothing to count, and such a run must neither crash nor start failing here.
+# A git that cannot answer fails OPEN — back to "assume a change" — for the
+# same reason: this check must refuse delegations that produced nothing, not
+# delegations whose counting hiccuped.
+#
+# glm-task does NOT commit the work itself, ever. That would invent an author
+# and a commit message and sweep in whatever else the tree happened to hold;
+# the fix for "nothing was committed" is to refuse and say so, leaving the
+# files exactly where the agent left them. The two outcomes are different
+# facts and are worded differently: files left uncommitted are work a human
+# can still recover if the reason NAMES them, which is why they are listed.
+NEW_COMMITS=1; UNCOMMITTED_FILES=""; UNCOMMITTED_COUNT=0; LEFT_UNCOMMITTED=0
+if [[ -n "$BASE" ]]; then
+  NEW_COMMITS="$(git rev-list --count "$BASE..HEAD" 2>/dev/null || echo 1)"
+  [[ "$NEW_COMMITS" =~ ^[0-9]+$ ]] || NEW_COMMITS=1
+  # -W links node_modules into the worktree so runs share installed deps; that
+  # symlink is ours, not the agent's work, and must not be named as work the
+  # agent "left uncommitted". Trailing slash dropped: porcelain marks untracked
+  # directories with one.
+  _names="$(git status --porcelain 2>/dev/null | sed -e 's/^...//' -e 's:/$::')"
+  if [[ "${LINKED_NM:-0}" == "1" ]]; then
+    _names="$(printf '%s\n' "$_names" | grep -vx node_modules)"
+  fi
+  UNCOMMITTED_COUNT="$(printf '%s\n' "$_names" | grep -c .)"
+  UNCOMMITTED_FILES="$(printf '%s\n' "$_names" | head -10 | awk '{printf "%s%s", (NR>1?", ":""), $0}')"
+  # Ten names is enough to recognise the work; beyond that the count says more
+  # than the list would.
+  if [[ "$UNCOMMITTED_COUNT" -gt 10 ]]; then
+    UNCOMMITTED_FILES="$UNCOMMITTED_FILES, and $((UNCOMMITTED_COUNT - 10)) more"
+  fi
+fi
+if [[ "${WORKER_OK:-0}" == "1" && "$NEW_COMMITS" == "0" ]]; then
+  WORKER_OK=0
+  if [[ -n "$UNCOMMITTED_FILES" ]]; then
+    LEFT_UNCOMMITTED=1
+    WORKER_REASON="the agent finished its session but left ${UNCOMMITTED_COUNT} file(s) uncommitted: ${UNCOMMITTED_FILES}. Nothing was committed to the branch, so there is no change to ship — the files are still in the working tree"
+  else
+    WORKER_REASON="the agent finished its session but produced no change at all: no commit since base and the working tree is clean"
+  fi
+fi
+
 do_verify
 
 REVIEW_VERDICT="skipped"; ROUNDS=0
-if [[ "$REVIEWER" != "none" && -n "$BASE" ]]; then
+# Nothing committed means nothing to review. Handing glm-review a diff already
+# known to be empty spends a reviewer call to obtain an empty-diff error, and
+# storing that error as the run's review state is how this defect read as "the
+# reviewer keeps breaking" for two rounds. The verdict says there was nothing
+# to review — not that the reviewer failed.
+if [[ -n "$BASE" && "$NEW_COMMITS" == "0" ]]; then
+  REVIEW_VERDICT="nothing_to_review"
+  echo "glm-task: nothing committed since base — skipping review, there is no diff to judge" >&2
+elif [[ "$REVIEWER" != "none" && -n "$BASE" ]]; then
   "$HERE/glm-review" -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>>"$REVERR"
   rc=$?
   case $rc in 0) REVIEW_VERDICT="pass" ;; 1) REVIEW_VERDICT="changes_required" ;;
@@ -460,16 +531,22 @@ if grep -q '"level":"blocked"' "$NOTES" 2>/dev/null; then
 fi
 
 # The delegated agent did not complete — it could not start, it died, it was
-# killed, or it reported failure itself. Checked BELOW rate limiting (a
-# throttled run says nothing about the change: the item is retried, not marked
-# broken) and BELOW blocked (a question waiting is more specific than this),
-# but ABOVE verify and review: both of those judge a change, and here there is
-# no change to judge. A weak verify command passing over work that was never
-# attempted is exactly why BLOCKED already sits above them (#91). Distinct
-# from exit 1, which means a change WAS produced and was found wanting.
+# killed, it reported failure itself, or (#93) it finished having committed
+# nothing. Checked BELOW rate limiting (a throttled run says nothing about the
+# change: the item is retried, not marked broken) and BELOW blocked (a question
+# waiting is more specific than this), but ABOVE verify and review: verify runs
+# against the working tree, so a green verify over work that was never
+# committed is exactly the case this catches, and review is skipped altogether
+# when there is no committed diff to judge. A weak verify command passing over
+# work that was never attempted is why BLOCKED already sits above them (#91).
+# Distinct from exit 1, which means a change WAS produced and was found wanting.
 if [[ "${WORKER_OK:-0}" != "1" ]]; then
   echo "glm-task: the delegated agent did not complete — ${WORKER_REASON:-no reason recorded}." >&2
-  echo "glm-task: no change was produced, so verify and review had nothing to judge." >&2
+  if [[ "$LEFT_UNCOMMITTED" == "1" ]]; then
+    echo "glm-task: those files are still in $DIR — recover them before the worktree is removed. glm-task will not commit them on the agent's behalf." >&2
+  else
+    echo "glm-task: no change was produced, so verify and review had nothing to judge." >&2
+  fi
   exit 6
 fi
 
