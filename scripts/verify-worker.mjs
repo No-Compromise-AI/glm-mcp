@@ -259,18 +259,84 @@ try {
     }
   }
 
-  // ------- rule 5: glm-mcp's own package does not carry the platform binary
+  // ------- rule 5: glm-mcp's PUBLISHED package does not carry the binary
   // The opposite wrong fix. glm-mcp is a small stdio server; the vendored
   // Claude Code binary is ~199MB and is needed only by delegation, which is not
-  // even published to npm (#89). Asserted against the manifest that ships.
+  // even published to npm (#89).
+  //
+  // Stated over what SHIPS, not over the manifest. The manifest is a proxy, and
+  // the first version of this rule checked only the dependency fields — which
+  // the very first implementation walked straight past: it added a `postinstall`
+  // hook and put the hook's script in the published `files` list. That
+  // implementation turned out to be correct (the hook no-ops when packages/ is
+  // absent, and a consumer install stays at 37MB — measured), but the rule would
+  // have passed a version that was not, because a dependency field is only one
+  // of the ways a package can pull 199MB onto a consumer's disk. An install hook
+  // is another, and it runs on every consumer machine.
+  const HEAVY = '@anthropic-ai/claude-agent-sdk';
   {
     const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8'));
-    const HEAVY = '@anthropic-ai/claude-agent-sdk';
     for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
       const deps = pkg[field] || {};
       const hit = Object.keys(deps).find((d) => d === HEAVY || d.startsWith(HEAVY + '-'));
       if (hit) {
         fail(`#90: package.json lists ${hit} under ${field}, so every consumer of the glm-mcp MCP server now downloads a ~199MB platform binary for a feature they may never invoke — and bin/ is not even published to npm (#89), so most of them cannot invoke it.\n\nThe worker belongs in its own package. optionalDependencies is not the escape hatch it looks like: \`npm install --no-optional\` would then disable delegation silently, which is a worse failure than a clear missing dependency.`);
+      }
+    }
+
+    // 5b — nothing heavy is in the tarball itself.
+    let shipped = [];
+    try {
+      const out = execFileSync('npm', ['pack', '--dry-run', '--json'],
+        { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      shipped = (JSON.parse(out)[0]?.files ?? []).map((f) => f.path);
+    } catch (e) {
+      fail(`#90: could not determine what the package would publish (\`npm pack --dry-run --json\` failed), so this rule cannot tell whether the 199MB binary ships. A rule that cannot answer its own question must not report success.\n  ${e.message}`);
+    }
+    if (shipped.length === 0) fail('#90: `npm pack --dry-run` reported an empty file list — this rule is not looking at the real package.');
+    const heavy = shipped.filter((p) => p.includes('claude-agent-sdk') || p.startsWith('packages/'));
+    if (heavy.length > 0) {
+      fail(`#90: the published tarball would contain ${JSON.stringify(heavy.slice(0, 5))}. The worker and its vendored binary must not ship inside glm-mcp — that is the whole reason it lives in a separate package.`);
+    }
+
+    // 5c — and the install hooks that DO ship are inert on a consumer's machine.
+    // Behavioural, not a code read: the hooks are executed in a directory laid
+    // out the way a published install is (the shipped files, no packages/), and
+    // afterwards nothing heavy may exist there. This is the check that would
+    // have caught an unguarded postinstall, which the manifest scan cannot see.
+    const hooks = ['preinstall', 'install', 'postinstall']
+      .map((h) => [h, pkg.scripts?.[h]]).filter(([, cmd]) => cmd);
+    if (hooks.length > 0) {
+      const SANDBOX = mkdtempSync(join(tmpdir(), 'glm-published-layout-'));
+      try {
+        for (const rel of shipped) {
+          const dest = join(SANDBOX, rel);
+          mkdirSync(dirname(dest), { recursive: true });
+          try { writeFileSync(dest, readFileSync(join(REPO, rel))); } catch { /* not readable, skip */ }
+        }
+        for (const [hook, cmd] of hooks) {
+          let code = 0;
+          try {
+            execFileSync(cmd, { cwd: SANDBOX, shell: true, timeout: 120_000, stdio: 'ignore' });
+          } catch (e) { code = e.status ?? 1; }
+          if (code !== 0) {
+            fail(`#90: the ${hook} hook (\`${cmd}\`) exits ${code} in a directory laid out exactly as a published install — the shipped files, and no packages/ directory. That is every consumer's machine, so every one of their installs fails for the sake of a feature they cannot reach.`);
+          }
+        }
+        const strays = [];
+        const walk = (dir, depth) => {
+          if (depth > 4) return;
+          for (const e of readdirSync(dir, { withFileTypes: true })) {
+            if (e.name.includes('claude-agent-sdk')) { strays.push(e.name); continue; }
+            if (e.isDirectory() && !e.isSymbolicLink()) walk(join(dir, e.name), depth + 1);
+          }
+        };
+        walk(SANDBOX, 0);
+        if (strays.length > 0) {
+          fail(`#90: after running the install hooks in a published layout, ${JSON.stringify(strays.slice(0, 3))} is present. An install hook is pulling the ~199MB binary onto the machine of every consumer of the MCP server. The dependency fields are clean, which is exactly why this rule does not read them: a hook is the other way a package can spend a consumer's disk, and it runs everywhere.`);
+        }
+      } finally {
+        if (SANDBOX.startsWith(tmpdir())) rmSync(SANDBOX, { recursive: true, force: true });
       }
     }
   }
