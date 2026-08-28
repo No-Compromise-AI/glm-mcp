@@ -74,6 +74,13 @@ LEDGER="${GLM_TASK_LEDGER:-$HOME/.claude-glm/outcomes.jsonl}"
 SPECF="${TMPDIR:-/tmp}/glm-spec-$STAMP.txt"
 NOTES="${GLM_NOTES:-${TMPDIR:-/tmp}/glm-notes-$STAMP.jsonl}"
 REVF="${TMPDIR:-/tmp}/glm-review-$STAMP.txt"
+# glm-review explains itself on stderr — which reviewer ran, which timed out,
+# which was out of capacity, why no verdict came back. That was going to
+# /dev/null, so every review=error was recorded with an EMPTY review_text:
+# 9 of 9 in the ledger. The one thing you need when a review fails is the
+# reason it failed (#74). Kept separate from REVF so progress chatter never
+# reaches the findings the verdict is parsed from.
+REVERR="${TMPDIR:-/tmp}/glm-review-$STAMP.err"
 mkdir -p "$(dirname "$LEDGER")"
 printf '%s\n' "$TASK" > "$SPECF"
 
@@ -202,12 +209,17 @@ do_verify
 
 REVIEW_VERDICT="skipped"; ROUNDS=0
 if [[ "$REVIEWER" != "none" && -n "$BASE" ]]; then
-  "$HERE/glm-review" -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>/dev/null
+  "$HERE/glm-review" -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>>"$REVERR"
   rc=$?
   case $rc in 0) REVIEW_VERDICT="pass" ;; 1) REVIEW_VERDICT="changes_required" ;;
              3) REVIEW_VERDICT="no_capacity" ;; *) REVIEW_VERDICT="error" ;; esac
   echo "glm-task: review=$REVIEW_VERDICT" >&2
   sed 's/^/  | /' "$REVF" | head -30 >&2
+  # A review that produced no verdict has nothing in REVF worth printing; its
+  # diagnosis is in stderr, so show that instead of nothing.
+  if [[ "$REVIEW_VERDICT" == "error" || "$REVIEW_VERDICT" == "no_capacity" ]]; then
+    tail -20 "$REVERR" 2>/dev/null | sed 's/^/  ! /' >&2
+  fi
 
   while [[ "$REVIEW_VERDICT" == "changes_required" && $ROUNDS -lt $FIXES ]]; do
     ROUNDS=$((ROUNDS+1))
@@ -238,7 +250,7 @@ Follow this protocol in order:
 
 Report at the end: which findings you reproduced and fixed, and which you refuted and why." "$FIXLOG"
     do_verify
-    "$HERE/glm-review" -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>/dev/null
+    "$HERE/glm-review" -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>>"$REVERR"
     rc=$?
     case $rc in 0) REVIEW_VERDICT="pass" ;; 1) REVIEW_VERDICT="changes_required" ;; *) REVIEW_VERDICT="error" ;; esac
     echo "glm-task: review=$REVIEW_VERDICT (after round $ROUNDS)" >&2
@@ -248,7 +260,7 @@ fi
 GLM_LOG="$LOG" GLM_LEDGER="$LEDGER" GLM_DIR="$DIR" GLM_TASK_TEXT="$TASK" \
 GLM_VERIFY="$VERIFY" GLM_VSTATUS="${VSTATUS:-skipped}" GLM_VRC="${VRC:-}" \
 GLM_REVIEWER="$REVIEWER" GLM_RVERDICT="$REVIEW_VERDICT" GLM_ROUNDS="$ROUNDS" \
-GLM_NOTES_F="$NOTES" GLM_REVF="$REVF" GLM_BASE="$BASE" GLM_BRANCH="${BRANCH:-}" python3 - <<'PY'
+GLM_NOTES_F="$NOTES" GLM_REVF="$REVF" GLM_REVERR="$REVERR" GLM_BASE="$BASE" GLM_BRANCH="${BRANCH:-}" python3 - <<'PY'
 import json, os, datetime
 res={}
 try:
@@ -261,6 +273,15 @@ try:
 except FileNotFoundError: pass
 try: review=open(os.environ["GLM_REVF"]).read()[:4000]
 except Exception: review=""
+# A review that delivered no verdict leaves REVF empty, and an empty
+# review_text is how 9 of 9 errored reviews were recorded as though nothing
+# had happened (#74). The reason lives on glm-review's stderr; keep it, so the
+# record says WHY rather than only that it failed.
+if not review.strip():
+    try:
+        err = open(os.environ["GLM_REVERR"]).read().strip()
+        if err: review = "(no verdict; glm-review reported)\n" + err[-4000:]
+    except Exception: pass
 notes=[]
 try:
     for ln in open(os.environ["GLM_NOTES_F"]):
