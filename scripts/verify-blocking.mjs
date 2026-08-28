@@ -44,6 +44,8 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { createServer } from 'node:http';
+import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -138,6 +140,58 @@ try {
   }
   if (trivialMs > heavyMs * 1.5 + 200) {
     fail(`#44: the trivial call took ${trivialMs}ms against the heavy call's ${heavyMs}ms — far longer than the work it was waiting behind. This gate is measuring something other than the serialisation it thinks it is.`);
+  }
+
+  // ---- rule 4: a number the README states must be the number a run produces
+  // Two review rounds found the same class of defect here — a figure quoted
+  // under conditions that do not produce it. First "400 files (79 MB)" when the
+  // cap admitted 375; then "cut at the 376th file, never read the last 24" for
+  // a cap described as the bytes on disk, when 376/24 is the answer for a
+  // DIFFERENT cap and the bytes-on-disk cap gives 372/28. Patching the second
+  // number invites a third, so the rule is the class: whatever cutoff the
+  // README claims, a run at the cap it names must produce it.
+  //
+  // Everything is derived from the fixture above rather than written down, so
+  // changing the fixture moves the expectation with it instead of stranding it.
+  {
+    // Whitespace-normalised: the claim wraps across a line break in the
+    // README, and a regex that cannot see past a newline would report the
+    // sentence missing rather than checking it.
+    const flat = README.replace(/\s+/g, ' ');
+    const claim = /cut this walk at the (\d+)(?:st|nd|rd|th) file and never read the last (\d+)/i.exec(flat);
+    if (!claim) {
+      fail('#44: the README no longer states, in a form this gate can read, what a cap sized to the bytes on disk cuts. That exact claim is what two review rounds got wrong, so it may not quietly become unreadable — restate it in the same shape, or remove it and remove this rule with it.');
+    }
+    const claimedCutAt = Number(claim[1]);
+    const claimedUnread = Number(claim[2]);
+
+    const FILES = 400;
+    const onDisk = FILES * body.length;
+
+    // Measured at exactly the cap the README names, through the same
+    // buildFileContext the server uses.
+    const probe = execFileSync(process.execPath, ['--input-type=module', '-e', `
+import { buildFileContext } from ${JSON.stringify(pathToFileURL(new URL('../dist/glm.js', import.meta.url).pathname).href)};
+process.env.GLM_MCP_ROOTS = ${JSON.stringify(ROOT)};
+const c = buildFileContext(['src/**/*.ts'], ${JSON.stringify(ROOT)}, 'glm-5.3');
+const headers = c.text.match(/^--- .*? ---$/gm) ?? [];
+const truncated = c.text.match(/^--- .*? \(truncated\) ---$/gm) ?? [];
+process.stdout.write(JSON.stringify({ headers: headers.length, truncated: truncated.length }));
+`], { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024,
+      env: { ...process.env, GLM_MCP_ROOTS: ROOT, GLM_MCP_MAX_FILE_CHARS: String(onDisk) } });
+    const { headers, truncated } = JSON.parse(probe);
+    const complete = headers - truncated;
+    const cutAt = complete + 1;
+    const unread = FILES - complete - truncated;
+
+    // `unread` is unambiguous and strict. The cutoff INDEX is not: "cut at the
+    // Nth file" can honestly mean the last one read or the first one missed,
+    // and a gate that insists on one reading sets an off-by-one trap rather
+    // than checking a fact. Either neighbour is accepted; the count is not.
+    const cutoffPlausible = claimedCutAt === complete || claimedCutAt === complete + 1;
+    if (!cutoffPlausible || unread !== claimedUnread) {
+      fail(`#44: the README says a cap sized to the bytes on disk (${onDisk}) cuts at file ${claimedCutAt} and leaves ${claimedUnread} unread. Measured at exactly that cap: ${complete} files delivered, ${unread} never read — so the cutoff is file ${complete} or ${cutAt} depending on how you count it, and the unread count is ${unread}. A figure quoted under conditions that do not produce it is the defect two review rounds already found here — first as "400 files" under a cap admitting 375, then as 376/24, which is another cap's answer.`);
+    }
   }
 
 } finally {
