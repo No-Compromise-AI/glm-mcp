@@ -15,6 +15,20 @@
 #   -t <tools> override the tool allowlist
 #
 # Outcomes append to $GLM_TASK_LEDGER (default ~/.claude-glm/outcomes.jsonl).
+#
+# Exit codes, checked in this order — the first that applies wins:
+#   0  verified and reviewed
+#   5  rate limited — the run was NOT attempted; retry later
+#   4  BLOCKED — the agent stopped to ask a question
+#   6  the delegated agent did not complete (could not start, died, reported
+#      failure, or was killed) — no change was produced, so verify and review
+#      had nothing to judge
+#   1  a change WAS produced and was judged wanting — verify failed, or the
+#      reviewer required changes
+#   2  UNREVIEWED — the review errored; nothing checked the change
+#   3  every reviewer is out of capacity
+# 1 and 6 are distinct on purpose: a human reading a parked item needs to know
+# whether work happened and fell short, or never happened at all.
 set -uo pipefail
 
 # Resolve this script's own directory, following symlinks, so the sibling tools
@@ -159,6 +173,13 @@ run_agent() { # $1 = prompt, $2 = log path
     --permission-mode acceptEdits --allowedTools "${TOOLS[@]}" \
     --add-dir "$(dirname "$NOTES")" \
     --output-format stream-json --verbose 2>&1 | tee "$2" | trace
+  # The worker's own exit status, read HERE and nowhere else: this function
+  # runs several more commands after the pipeline, and each one overwrites $?
+  # — the trailing if was always 0, so a worker that died took its status
+  # with it and the run was recorded as though nothing had happened (#91).
+  # PIPESTATUS[0], not $?: tee and trace are ours; only element 0 is the
+  # worker speaking.
+  WORKER_RC="${PIPESTATUS[0]}"
   # Throttling is not failure. If z.ai refused on capacity, the run produced no
   # information about the change: a caller must be able to wait and retry rather
   # than burn the item. Read from the log because the pipeline above consumed
@@ -196,6 +217,42 @@ PYEOF
     RATE_LIMITED=1
     RETRY_AFTER="$(glm_retry_after "$ERRTEXT")"
   fi
+  # DID THE AGENT COMPLETE? A caller can see the worker through exactly two
+  # channels — its exit status and its stream-json — and neither alone is
+  # enough. The status alone misses an agent that ran and reported failure
+  # (is_error, exit 0); the result event alone misses a worker that never
+  # emitted one. "Did not complete" is three shapes, and all three land here
+  # (#91):
+  #   (a) non-zero exit, no result    — it could not start, or it died;
+  #   (b) result with is_error, or a subtype other than success;
+  #   (c) zero exit, no result at all — killed, truncated, stopped between events.
+  # Both halves, or a delegation that never ran reports success. Anything this
+  # cannot classify reads as NOT complete: the honest direction to fail in.
+  # Read from the log, like ERRTEXT, because the pipeline consumed stdout.
+  WORKER_OK=0; WORKER_REASON=""
+  WORKER_VERDICT="$(GLM_LOGF="$2" GLM_WRC="$WORKER_RC" python3 - <<'PYEOF'
+import json, os
+res = None
+try:
+    for line in open(os.environ["GLM_LOGF"]):
+        if line.startswith("{") and '"type":"result"' in line:
+            try: res = json.loads(line)
+            except Exception: pass
+except Exception: pass
+if res is None:
+    print("0\tthe worker exited %s without emitting a result event - it could not start, died, or was killed mid-run" % os.environ["GLM_WRC"])
+elif res.get("is_error") or res.get("subtype") not in (None, "success"):
+    # The verdict travels as ok<TAB>reason, so the reason itself must be
+    # tab-free and one line or it would split its own field.
+    detail = " ".join(str(res.get("result") or res.get("error") or "").split())[:300]
+    why = "the worker ran and reported %s" % (res.get("subtype") or "an error")
+    print("0\t%s%s" % (why, ": " + detail if detail else ""))
+else:
+    print("1\t")
+PYEOF
+)"
+  WORKER_OK="${WORKER_VERDICT%%$'\t'*}"
+  WORKER_REASON="${WORKER_VERDICT#*$'\t'}"
 }
 
 do_verify() {
@@ -297,6 +354,7 @@ fi
 
 GLM_LOG="${LASTLOG:-$LOG}" GLM_LEDGER="$LEDGER" GLM_DIR="$DIR" GLM_TASK_TEXT="$TASK" \
 GLM_VERIFY="$VERIFY" GLM_VSTATUS="${VSTATUS:-skipped}" GLM_VRC="${VRC:-}" \
+GLM_WORKER_OK="${WORKER_OK:-}" GLM_WORKER_REASON="${WORKER_REASON:-}" \
 GLM_REVIEWER="$REVIEWER" GLM_RVERDICT="$REVIEW_VERDICT" GLM_ROUNDS="$ROUNDS" \
 GLM_NOTES_F="$NOTES" GLM_REVF="$REVF" GLM_REVERR="$REVERR" GLM_BASE="$BASE" GLM_BRANCH="${BRANCH:-}" python3 - <<'PY'
 import json, os, datetime
@@ -339,6 +397,12 @@ rec={
  "session_id": res.get("session_id"), "num_turns": res.get("num_turns"),
  "duration_ms": res.get("duration_ms"), "agent_error": res.get("is_error"),
  "agent_said": (res.get("result") or "")[:500],
+ # worker_ok/worker_reason: whether the delegated agent COMPLETED, decided from
+ # its exit status and its result event together. A row whose agent fields are
+ # all null is indistinguishable from one nobody wrote, so the row must say it
+ # did not complete — and why — itself (#91).
+ "worker_ok": os.environ.get("GLM_WORKER_OK") == "1",
+ "worker_reason": (os.environ.get("GLM_WORKER_REASON") or "").strip() or None,
  "verify_cmd": os.environ["GLM_VERIFY"] or None,
  "verify": os.environ["GLM_VSTATUS"],
  "verify_rc": int(os.environ["GLM_VRC"]) if os.environ["GLM_VRC"] else None,
@@ -378,6 +442,20 @@ fi
 if grep -q '"level":"blocked"' "$NOTES" 2>/dev/null; then
   echo "glm-task: agent is BLOCKED — the task is NOT complete, whatever verify said." >&2
   exit 4
+fi
+
+# The delegated agent did not complete — it could not start, it died, it was
+# killed, or it reported failure itself. Checked BELOW rate limiting (a
+# throttled run says nothing about the change: the item is retried, not marked
+# broken) and BELOW blocked (a question waiting is more specific than this),
+# but ABOVE verify and review: both of those judge a change, and here there is
+# no change to judge. A weak verify command passing over work that was never
+# attempted is exactly why BLOCKED already sits above them (#91). Distinct
+# from exit 1, which means a change WAS produced and was found wanting.
+if [[ "${WORKER_OK:-0}" != "1" ]]; then
+  echo "glm-task: the delegated agent did not complete — ${WORKER_REASON:-no reason recorded}." >&2
+  echo "glm-task: no change was produced, so verify and review had nothing to judge." >&2
+  exit 6
 fi
 
 # An errored review is NOT a pass — it means nothing was checked. Surface it distinctly
