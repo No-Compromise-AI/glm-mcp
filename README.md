@@ -64,6 +64,11 @@ Note that `GLM_MCP_ROOTS` bounds where a caller may point `cwd`; it does not exe
 directory, which must also be inside a root. When it is not, the call is refused with a message
 naming the offending `cwd` — loudly, rather than quietly matching no files.
 
+Sharing one server between several agents has a cost the roots do not show: file reads are
+synchronous, so a call that reads a tree delays every other call on that server until it
+finishes — measured, a trivial call waited ~170× its own latency beside a 79 MB read. See
+[Limits](#limits) for that, and for what `GLM_MCP_GLOB_TIMEOUT_MS` does and does not bound.
+
 The version is pinned on purpose: a bare `npx` resolves `latest` at run time, while the package
 itself ships the exact dependency graph it was tested with — pinning is what makes the two the
 same graph. Bump the pin when you upgrade.
@@ -481,6 +486,29 @@ z.ai rather than a silent truncation. `GLM_MCP_CONTEXT_TOKENS` overrides the
 window for **every model at once** — a published figure that proves wrong is
 corrected with one variable, not a code change — and `GLM_MCP_MAX_FILE_CHARS`
 overrides the character budget outright, also for every model.
+
+`GLM_MCP_GLOB_TIMEOUT_MS` bounds the **work** a walk does, not the time it can spend blocked
+inside a syscall. The deadline is checked between operations — on the way into each directory,
+and every 64th entry within a scan — so a big walk tests it thousands of times, but never
+*during* an operation: a `readdirSync` that has not returned cannot be interrupted by it. A hung
+FUSE, NFS or SMB mount is exactly that case, and it is the one an operator reading the timeout
+as a wall-clock guarantee would be wrong about: the walk freezes mid-call with most of its
+budget unspent, and nothing fires until the syscall comes back — if it comes back. The timeout
+bounds what a walk does, never what it waits on.
+
+**File reads are synchronous, so a call that reads a tree delays every other call on the same
+server until it finishes.** The walk, the reads and the assembly around them are `readdirSync` /
+`statSync` / `readFileSync`, and they block the event loop; the round trip to z.ai is
+asynchronous. It is specifically the filesystem half that does not interleave: two calls with
+no files, issued together against an upstream deliberately held at 300 ms per call, finished in
+310 ms rather than 600. With files it is the other way round — measured through the real MCP
+surface against an upstream that answers instantly, so every millisecond is the server's own
+doing, a call reading 400 files (79 MB) took 709 ms while a trivial call issued beside it, one
+that reads nothing and answers in 4 ms alone, took 665 ms and finished with the read rather
+than on its own schedule. That is ~170× its own latency, all of it spent waiting on another
+caller's context, and it is the number to weigh before running one shared server for several
+agents: their calls serialise behind each other's file context, and the limits above are all
+that bound how long one read holds the rest.
 
 Output ceilings come from z.ai's published table and are **per model** — 131,072
 for the GLM-5 and 4.6/4.7 families, 98,304 for GLM-4.5, 32,768 for the vision
