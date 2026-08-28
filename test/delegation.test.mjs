@@ -18,6 +18,12 @@
 //     "no change at all" does not pretend files exist. A blocked run that left
 //     work uncommitted keeps exit 4 — the question outranks everything — while
 //     the row still names what was left.
+//   * round 2: the branch that certifies a run is the one named in the run
+//     line — the branch glm-drain hands to glm-ship — so a -W agent that
+//     commits on a side branch or a detached HEAD produced nothing, a git
+//     that cannot answer certifies nothing (fail CLOSED, not open), and the
+//     count is retaken after every fix round, because a fix worker can undo
+//     the commits it was sent to rework.
 //   * the ordering guards: throttling (exit 5) still outranks a delegation that
 //     committed nothing, and glm-task's own node_modules symlink in a -W
 //     worktree is never reported as the agent's uncommitted work.
@@ -52,13 +58,18 @@ const resultLine = (o) => JSON.stringify({
  * `writes` makes the shim do real work in the repo; `commit` makes it commit
  * that work with its own identity. The pair is the whole of #93: an agent that
  * edits and forgets to commit leaves a branch with nothing on it, and glm-ship
- * pushes commits. `reviewer` installs a glm-review shim that records the fact
- * it was asked — plus a `codex` stub on PATH, so the reviewer resolves as
- * installed on a machine where no vendor CLI is (CI included).
+ * pushes commits. `worker` replaces the work fragment with a whole script body
+ * (for agents that misbehave in ways writes/commit cannot express — committing
+ * on a side branch, breaking git, behaving differently across fix rounds).
+ * `reviewer` installs a glm-review shim that records the fact it was asked —
+ * plus a `codex` stub on PATH, so the reviewer resolves as installed on a
+ * machine where no vendor CLI is (CI included); `review` replaces that shim's
+ * body, as a function of the calls file, for stateful reviewers.
  */
 function delegate({ code = 0, stdout = resultLine({}), note = '', task = 'do the thing',
                     writes = null, commit = false, verify = null, reviewer = false,
-                    git = true, isolate = false, repoDir = null } = {}) {
+                    git = true, isolate = false, repoDir = null,
+                    worker = null, review = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'glm-delegation-test-'));
   const bin = join(dir, 'bin'); mkdirSync(bin);
   for (const f of ['glm-task', '_glm-hosts.sh', '_glm-capacity.sh']) {
@@ -66,16 +77,18 @@ function delegate({ code = 0, stdout = resultLine({}), note = '', task = 'do the
     chmodSync(join(bin, f), 0o755);
   }
   const notes = join(dir, 'notes.jsonl');
-  const worker = join(bin, 'glm-worker');
-  const work = writes
-    ? `printf '%s' ${JSON.stringify(String(writes))} > "$TEST_REPO/feature.txt"\n` +
-      (commit
-        ? `git -C "$TEST_REPO" -c user.email=a@example.invalid -c user.name=agent add -A >/dev/null\n` +
-          `git -C "$TEST_REPO" -c user.email=a@example.invalid -c user.name=agent commit -qm "the agent's own commit" >/dev/null\n`
-        : '')
-    : '';
-  writeFileSync(worker, `#!/usr/bin/env bash\n${work}${note ? `printf '%s\\n' '${note}' >> "$GLM_NOTES"\n` : ''}${stdout ? `cat <<'TESTEOF'\n${stdout}\nTESTEOF\n` : ':'}\nexit ${code}\n`);
-  chmodSync(worker, 0o755);
+  const workerFile = join(bin, 'glm-worker');
+  const work = worker !== null
+    ? worker
+    : writes
+      ? `printf '%s' ${JSON.stringify(String(writes))} > "$TEST_REPO/feature.txt"\n` +
+        (commit
+          ? `git -C "$TEST_REPO" -c user.email=a@example.invalid -c user.name=agent add -A >/dev/null\n` +
+            `git -C "$TEST_REPO" -c user.email=a@example.invalid -c user.name=agent commit -qm "the agent's own commit" >/dev/null\n`
+          : '')
+      : '';
+  writeFileSync(workerFile, `#!/usr/bin/env bash\n${work}${note ? `printf '%s\\n' '${note}' >> "$GLM_NOTES"\n` : ''}${stdout ? `cat <<'TESTEOF'\n${stdout}\nTESTEOF\n` : ':'}\nexit ${code}\n`);
+  chmodSync(workerFile, 0o755);
 
   // A reviewer that records the fact it was asked, so a test can tell "spent
   // on nothing" from "never invoked" — the difference #93 is about.
@@ -83,7 +96,8 @@ function delegate({ code = 0, stdout = resultLine({}), note = '', task = 'do the
   const env = {};
   if (reviewer) {
     writeFileSync(join(bin, 'glm-review'),
-      `#!/usr/bin/env bash\necho "asked $*" >> ${JSON.stringify(reviewCalls)}\necho "VERDICT: PASS"\nexit 0\n`);
+      review ? review(reviewCalls)
+             : `#!/usr/bin/env bash\necho "asked $*" >> ${JSON.stringify(reviewCalls)}\necho "VERDICT: PASS"\nexit 0\n`);
     chmodSync(join(bin, 'glm-review'), 0o755);
     // glm-task keeps a reviewer only if its CLI resolves, and CI machines have
     // none — so provide one. glm-task invokes "$HERE/glm-review" directly, so
@@ -140,8 +154,19 @@ function delegate({ code = 0, stdout = resultLine({}), note = '', task = 'do the
     ? Number(gitAt('rev-list', '--count', `${baseHead}..HEAD`).stdout.trim() || '0')
     : null;
   const dirty = gitAt('status', '--porcelain').stdout.trim();
-  return { status: r.status, out: `${r.stdout}${r.stderr}`, row, added, dirty, dir, reviewed: existsSync(reviewCalls) };
+  const reviewCallCount = existsSync(reviewCalls)
+    ? readFileSync(reviewCalls, 'utf8').trim().split('\n').filter(Boolean).length : 0;
+  return { status: r.status, out: `${r.stdout}${r.stderr}`, row, added, dirty, dir, baseHead,
+           reviewed: existsSync(reviewCalls), reviewCallCount };
 }
+
+// The branch a -W run names in its terminal run line — the branch glm-drain
+// parses back out and hands to glm-ship. What THAT branch carries is what
+// ships, whatever the agent left HEAD pointing at.
+const shippedBranchOf = (r) => (r.out.match(/^glm-task: run dir=\S+ session=\S+ branch=(\S+)/m) || [])[1] || '';
+const commitsOn = (repo, baseHead, ref) =>
+  Number(spawnSync('git', ['-C', repo, 'rev-list', '--count', `${baseHead}..${ref}`],
+    { encoding: 'utf8' }).stdout.trim() || '0');
 
 // The blocked note, exactly as the escalation protocol tells the agent to
 // write it — the shape glm-task's own grep is written against.
@@ -244,6 +269,147 @@ test('CONTROL: an agent that commits is unaffected, and its reviewer still runs'
   assert.equal(r.reviewed, true,
     'skipping review for everything satisfies the empty-diff rule and defeats the entire loop');
   assert.equal(r.row?.review, 'pass', 'the verdict is a real one, not nothing_to_review');
+  assert.equal(r.row?.worker_ok, true);
+});
+
+// ---------------------------------------------------------------------------
+// Round 2 of #93 — three reviewer findings against the first fix, each
+// reproduced before being fixed. The property is unchanged; what these pin
+// down is WHICH branch certifies the run. glm-drain ships the branch named in
+// the run line, so that branch — not whatever the agent left HEAD pointing
+// at — is what "produced something" means; a git that cannot answer is not a
+// certificate; and a fix round can undo the commits it was asked to rework,
+// so the count is taken again after every agent, never carried over stale.
+
+test('a -W worker that commits on a SIDE BRANCH does not report success — the drain ships the named branch', () => {
+  // The agent works and commits... on a branch of its own. HEAD carries the
+  // work, the run line still names glm/<stamp>, and glm-ship pushes the
+  // latter. Counting HEAD certified a change the ship never sees, and the
+  // empty-PR failure #93 exists to prevent came straight back.
+  const r = delegate({ isolate: true, reviewer: true, worker: `
+printf 'the work' > feature.txt
+git checkout -q -b agent-side-branch
+git add -A
+git -c user.email=a@example.invalid -c user.name=agent commit -qm "on the side branch"
+` });
+  const branch = shippedBranchOf(r);
+  assert.ok(branch, 'the run line must name the branch the drain will ship');
+  assert.equal(commitsOn(join(r.dir, 'repo'), r.baseHead, `refs/heads/${branch}`), 0,
+    'precondition: the shipped branch carries nothing');
+  assert.equal(r.status, 6,
+    `the branch glm-ship pushes carries nothing whatever HEAD carries; got exit ${r.status}`);
+  assert.equal(r.reviewed, false,
+    'the reviewer was spent judging a diff the ship never pushes');
+  const reason = String(r.row?.worker_reason ?? '');
+  assert.match(reason, new RegExp(`committed nothing to ${branch}`),
+    'the reason must name the branch that will be shipped');
+  assert.doesNotMatch(reason, /uncommitted/i,
+    `nothing was left uncommitted — the work is on another ref — so the reason must not say it was; it says ${JSON.stringify(reason)}`);
+});
+
+test('a -W worker that commits on a DETACHED HEAD is refused the same way', () => {
+  const r = delegate({ isolate: true, worker: `
+printf 'the work' > feature.txt
+git checkout -q --detach
+git add -A
+git -c user.email=a@example.invalid -c user.name=agent commit -qm "nowhere at all"
+` });
+  const branch = shippedBranchOf(r);
+  assert.ok(branch);
+  assert.equal(commitsOn(join(r.dir, 'repo'), r.baseHead, `refs/heads/${branch}`), 0);
+  assert.equal(r.status, 6, `a detached commit is on no branch at all; got exit ${r.status}`);
+  assert.match(String(r.row?.worker_reason ?? ''), /committed nothing to/,
+    'the reason must say the shipped branch got nothing');
+});
+
+test('a worker that breaks the worktree git does not get a change certified on git silence', () => {
+  // rm .git: neither rev-list nor status can answer afterwards. The first fix
+  // failed OPEN ("assume a change"), which turned "git is broken" into exit 0
+  // and a success row on no evidence at all.
+  const r = delegate({ isolate: true, worker: `
+printf 'the work' > feature.txt
+rm -f .git
+` });
+  assert.equal(r.status, 6,
+    `"cannot tell" is not a certificate — a run that cannot show a commit must not report success; got exit ${r.status}`);
+  assert.equal(r.row?.worker_ok, false);
+  const reason = String(r.row?.worker_reason ?? '');
+  assert.match(reason, /could not count/,
+    'the reason must say git could not answer, not claim files or cleanliness it never saw');
+  assert.doesNotMatch(reason, /uncommitted/i,
+    'with git broken, naming uncommitted files would be a guess');
+});
+
+test('a fix round that undoes the commit and leaves work uncommitted is refused, not re-reviewed', () => {
+  // Round 1 commits; the reviewer asks for changes; the fix worker resets
+  // HEAD^ and reworks the file without committing. The count taken before the
+  // first review is stale by then: the re-review was spent on a diff already
+  // known to be empty, its empty-diff error was recorded as the run's review
+  // state — "the reviewer keeps breaking" — and the rework sat uncommitted and
+  // unnamed.
+  const r = delegate({ reviewer: true, worker: `
+case "$*" in
+  *"REVIEW FINDINGS"*)
+    git reset -q HEAD^
+    printf 'the reworked work' > feature.txt
+    ;;
+  *)
+    printf 'the work' > feature.txt
+    git add -A
+    git -c user.email=a@example.invalid -c user.name=agent commit -qm "the agent's own commit"
+    ;;
+esac
+`, review: (calls) => `#!/usr/bin/env bash
+echo asked >> ${JSON.stringify(calls)}
+if [[ $(wc -l < ${JSON.stringify(calls)} | tr -d ' ') -eq 1 ]]; then
+  echo "VERDICT: CHANGES_REQUIRED"
+  echo "finding one: please rework the implementation"
+  exit 1
+fi
+echo "glm-review: empty diff (as the real glm-review does on one)" >&2
+exit 2
+` });
+  assert.equal(r.status, 6,
+    `nothing is committed after the fix round, so there is nothing a branch can carry; got exit ${r.status}`);
+  assert.equal(r.row?.review, 'nothing_to_review',
+    'the review state must say there was nothing to review, not that the reviewer errored');
+  assert.equal(r.reviewCallCount, 1,
+    'the second reviewer call was spent on a diff already known to be empty');
+  assert.match(String(r.row?.worker_reason ?? ''), /uncommitted.*feature\.txt|feature\.txt.*uncommitted/,
+    'the rework left in the tree must be named — it is about to be destroyed with the worktree');
+  assert.equal(r.added, 0, 'nothing is committed');
+  assert.match(r.dirty, /feature\.txt/, 'the reworked file stays exactly where the agent left it');
+});
+
+test('CONTROL: a fix round that COMMITS its rework is re-measured, re-reviewed, and can still pass', () => {
+  const r = delegate({ reviewer: true, worker: `
+case "$*" in
+  *"REVIEW FINDINGS"*)
+    printf 'the reworked work' > feature.txt
+    git add -A
+    git -c user.email=a@example.invalid -c user.name=agent commit -qm "the agent's rework"
+    ;;
+  *)
+    printf 'the work' > feature.txt
+    git add -A
+    git -c user.email=a@example.invalid -c user.name=agent commit -qm "the agent's own commit"
+    ;;
+esac
+`, review: (calls) => `#!/usr/bin/env bash
+echo asked >> ${JSON.stringify(calls)}
+if [[ $(wc -l < ${JSON.stringify(calls)} | tr -d ' ') -eq 1 ]]; then
+  echo "VERDICT: CHANGES_REQUIRED"
+  echo "finding one: please rework the implementation"
+  exit 1
+fi
+echo "VERDICT: PASS"
+echo "the rework addresses the finding in full"
+exit 0
+` });
+  assert.equal(r.status, 0, `a fix round that commits its rework must still succeed; got exit ${r.status}`);
+  assert.equal(r.reviewCallCount, 2, 'the re-review must still run when the fix round committed');
+  assert.equal(r.row?.review, 'pass');
+  assert.equal(r.row?.fix_rounds, 1);
   assert.equal(r.row?.worker_ok, true);
 });
 

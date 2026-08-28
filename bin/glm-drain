@@ -32,13 +32,15 @@
 #   6 NO AGENT    one retry, then park as incomplete. The delegated agent did
 #                 not complete — it could not start, died, was killed, reported
 #                 failure, exited non-zero despite a clean result, or finished
-#                 having committed NOTHING: it either left files uncommitted in
-#                 the worktree (glm-task names them; they are recoverable until
-#                 the worktree is removed) or made no change at all. Unlike 1
-#                 the branch carries no change to judge or merge — an empty PR
-#                 would get green CI BECAUSE nothing changed — and the parked
-#                 record must say THAT rather than "failed", which would read as
-#                 "a change was made and was found wanting".
+#                 having committed NOTHING to the branch the ship pushes: it
+#                 left files uncommitted in the worktree (glm-task names them;
+#                 they are recoverable until the worktree is removed), made no
+#                 change at all, committed to a different branch, or wrecked
+#                 git so nothing can be certified. Unlike 1 the branch carries
+#                 no change to judge or merge — an empty PR would get green CI
+#                 BECAUSE nothing changed — and the parked record must say THAT
+#                 rather than "failed", which would read as "a change was made
+#                 and was found wanting".
 #
 # Exit 3 parks after five backed-off attempts, and that ceiling is deliberate:
 # with every reviewer out of capacity, an unbounded wait is a night spent idle
@@ -416,14 +418,15 @@ while :; do
           ;;
       6)  # NO AGENT. The delegated agent did not complete — it could not
           # start, died, was killed, reported failure, exited non-zero
-          # despite a clean result, or finished having committed nothing
-          # (work left uncommitted in the worktree, or no change at all) —
-          # so, unlike exit 1, the branch carries no change: nothing was
-          # reviewed, and nothing here is safe to merge — a verify that passed
-          # counts for nothing, since it runs against the working tree. One
-          # retry, then park, as with 1; but the record must say THIS, not
-          # "failed", because a human reading parked.jsonl needs to know the
-          # work never happened, not that it happened badly.
+          # despite a clean result, or finished having committed nothing to
+          # the branch the ship pushes (work left uncommitted in the worktree,
+          # no change at all, commits on a different branch, or git too broken
+          # to certify anything) — so, unlike exit 1, the branch carries no
+          # change: nothing was reviewed, and nothing here is safe to merge —
+          # a verify that passed counts for nothing, since it runs against the
+          # working tree. One retry, then park, as with 1; but the record must
+          # say THIS, not "failed", because a human reading parked.jsonl needs
+          # to know the work never happened, not that it happened badly.
           if (( ru < 1 )); then
             echo "glm-drain: item $id's agent did not complete — one retry" >&2
             QUEUE=("$id" ${QUEUE[@]+"${QUEUE[@]}"})

@@ -22,13 +22,16 @@
 #   4  BLOCKED — the agent stopped to ask a question
 #   6  the delegated agent did not complete — it could not start, died, was
 #      killed, reported failure, or exited non-zero despite a clean result;
-#      OR it finished having committed NOTHING: either it left files
-#      uncommitted in the tree (named in the ledger's worker_reason — they are
-#      still recoverable until the worktree is deleted) or it made no change
-#      at all. glm-ship pushes commits, so either way the branch carries no
-#      change, and a verify that passed counts for nothing: -v runs against
-#      the working tree and is satisfied by uncommitted files. glm-task never
-#      commits on the agent's behalf — it refuses and says so.
+#      OR it finished having committed NOTHING to the branch that will be
+#      shipped: it left files uncommitted in the tree (named in the ledger's
+#      worker_reason — they are still recoverable until the worktree is
+#      deleted), it made no change at all, or it put its commits on some other
+#      branch than the one glm-ship pushes; OR git could not say what the
+#      branch carries, so no change can be certified. glm-ship pushes commits
+#      onto the branch this run names, so in every one of these the branch
+#      carries no change, and a verify that passed counts for nothing: -v runs
+#      against the working tree and is satisfied by uncommitted files.
+#      glm-task never commits on the agent's behalf — it refuses and says so.
 #   1  a change WAS produced and was judged wanting — verify failed, or the
 #      reviewer required changes
 #   2  UNREVIEWED — the review errored; nothing checked the change
@@ -315,38 +318,56 @@ trap cleanup_tail EXIT INT TERM
 run_agent "$TASK$ESCALATION" "$LOG"
 sleep 1; cleanup_tail
 
-# DID THE DELEGATION LEAVE A CHANGE A BRANCH CAN CARRY? glm-ship pushes
-# COMMITS, so an agent that commits nothing has produced nothing to merge:
-# uncommitted files are discarded with the worktree while every other signal —
-# a green verify above all, since -v runs against the working tree and is
-# perfectly happy with uncommitted work — says the item succeeded (#93).
+# DID THE DELEGATION LEAVE A CHANGE ON THE BRANCH THAT WILL BE SHIPPED?
+# glm-ship pushes COMMITS, and the drain ships the branch this run names in its
+# run line — not whatever the agent left HEAD pointing at. So the named branch
+# is what gets counted: an agent that commits to a side branch, or detaches or
+# orphans HEAD, has produced nothing the ship can carry, however much work it
+# did. Uncommitted files are discarded with the worktree while every other
+# signal — a green verify above all, since -v runs against the working tree and
+# is perfectly happy with uncommitted work — says the item succeeded (#93).
 # Same property as #91 one step further on: there the agent never ran, here it
-# ran and left no trace that survives the worktree.
+# ran and left no trace on the branch that ships.
 #
-# Measured at the agent's exit, BEFORE do_verify: the files listed must be the
-# agent's work, not artifacts a verify command left behind.
+# Measured at each agent's exit, BEFORE do_verify — the files listed must be
+# the agent's work, not artifacts a verify command left behind — and measured
+# AGAIN after every fix round: a fix worker can undo the commits the first
+# round made while reworking them, and a stale count re-reviews a diff already
+# known to be empty, recording "the reviewer broke" for what is really
+# "nothing is committed".
 #
 # Counted only against a base commit: with no git base ($BASE empty) there is
 # nothing to count, and such a run must neither crash nor start failing here.
-# A git that cannot answer fails OPEN — back to "assume a change" — for the
-# same reason: this check must refuse delegations that produced nothing, not
-# delegations whose counting hiccuped.
+# A git that cannot answer — the agent broke the worktree's git, deleted the
+# branch, or left HEAD unborn — fails CLOSED: this check is what certifies a
+# change exists, and "cannot tell" is not a certificate. The first version
+# failed open ("assume a change"), which let a worker that had wrecked the
+# worktree's git report success on no evidence at all.
 #
 # glm-task does NOT commit the work itself, ever. That would invent an author
 # and a commit message and sweep in whatever else the tree happened to hold;
 # the fix for "nothing was committed" is to refuse and say so, leaving the
-# files exactly where the agent left them. The two outcomes are different
-# facts and are worded differently: files left uncommitted are work a human
-# can still recover if the reason NAMES them, which is why they are listed.
-NEW_COMMITS=1; UNCOMMITTED_FILES=""; UNCOMMITTED_COUNT=0; LEFT_UNCOMMITTED=0
-if [[ -n "$BASE" ]]; then
-  NEW_COMMITS="$(git rev-list --count "$BASE..HEAD" 2>/dev/null || echo 1)"
-  [[ "$NEW_COMMITS" =~ ^[0-9]+$ ]] || NEW_COMMITS=1
+# files exactly where the agent left them. The outcomes are different facts
+# and are worded differently: files left uncommitted are work a human can
+# still recover if the reason NAMES them, which is why they are listed.
+SHIPREF="HEAD"
+[[ $ISOLATE -eq 1 ]] && SHIPREF="refs/heads/$BRANCH"
+NEW_COMMITS=""; COUNT_OK=0; UNCOMMITTED_FILES=""; UNCOMMITTED_COUNT=0
+LEFT_UNCOMMITTED=0; STATE_UNKNOWN=0
+check_committed() { # counts what the SHIPPED branch carries; may demote WORKER_OK
+  local _count="" _count_ok=0 _st="" _status_ok=0 _names="" _head_tip="" _ship_tip="" _cur=""
+  NEW_COMMITS=""; COUNT_OK=0; UNCOMMITTED_FILES=""; UNCOMMITTED_COUNT=0
+  LEFT_UNCOMMITTED=0; STATE_UNKNOWN=0
+  [[ -z "$BASE" ]] && return 0
+  _count="$(git rev-list --count "$BASE..$SHIPREF" 2>/dev/null)" && _count_ok=1
+  _st="$(git status --porcelain 2>/dev/null)" && _status_ok=1
+  if [[ "$_count" =~ ^[0-9]+$ ]]; then NEW_COMMITS="$_count"; fi
+  [[ "$_count_ok" == "1" && "$_status_ok" == "1" && -n "$NEW_COMMITS" ]] && COUNT_OK=1
   # -W links node_modules into the worktree so runs share installed deps; that
   # symlink is ours, not the agent's work, and must not be named as work the
   # agent "left uncommitted". Trailing slash dropped: porcelain marks untracked
   # directories with one.
-  _names="$(git status --porcelain 2>/dev/null | sed -e 's/^...//' -e 's:/$::')"
+  _names="$(printf '%s\n' "$_st" | sed -e 's/^...//' -e 's:/$::')"
   if [[ "${LINKED_NM:-0}" == "1" ]]; then
     _names="$(printf '%s\n' "$_names" | grep -vx node_modules)"
   fi
@@ -357,16 +378,39 @@ if [[ -n "$BASE" ]]; then
   if [[ "$UNCOMMITTED_COUNT" -gt 10 ]]; then
     UNCOMMITTED_FILES="$UNCOMMITTED_FILES, and $((UNCOMMITTED_COUNT - 10)) more"
   fi
-fi
-if [[ "${WORKER_OK:-0}" == "1" && "$NEW_COMMITS" == "0" ]]; then
+  # An agent that already failed keeps its own, more specific reason; a branch
+  # that COUNTS as carrying a change has nothing to demote. Everything else —
+  # including a git that could not answer — falls through to refuse.
+  [[ "${WORKER_OK:-0}" == "1" ]] || return 0
+  [[ "$_count_ok" == "1" && "$NEW_COMMITS" =~ ^[0-9]+$ && "$NEW_COMMITS" != "0" ]] && return 0
   WORKER_OK=0
-  if [[ -n "$UNCOMMITTED_FILES" ]]; then
+  if [[ "$COUNT_OK" != "1" ]]; then
+    # The count failed, or answered zero while the tree's state — clean, or
+    # holding work worth recovering — could not be read.
+    STATE_UNKNOWN=1
+    if [[ "$_count_ok" != "1" || ! "$NEW_COMMITS" =~ ^[0-9]+$ ]]; then
+      WORKER_REASON="git could not count what $SHIPREF carries since the base - the worktree git is broken or the ref is gone, so no change can be certified"
+    else
+      WORKER_REASON="git could not read the working tree to say what was left in it - with nothing committed, no change can be certified"
+    fi
+  elif [[ "$UNCOMMITTED_COUNT" -gt 0 ]]; then
     LEFT_UNCOMMITTED=1
     WORKER_REASON="the agent finished its session but left ${UNCOMMITTED_COUNT} file(s) uncommitted: ${UNCOMMITTED_FILES}. Nothing was committed to the branch, so there is no change to ship — the files are still in the working tree"
   else
-    WORKER_REASON="the agent finished its session but produced no change at all: no commit since base and the working tree is clean"
+    # Clean tree, nothing on the branch that ships. When the worktree is left
+    # pointing somewhere else, the agent may well have worked — on a ref the
+    # ship will never push, which is a different fact from no work at all.
+    _head_tip="$(git rev-parse HEAD 2>/dev/null)"
+    _ship_tip="$(git rev-parse "$SHIPREF" 2>/dev/null)"
+    if [[ $ISOLATE -eq 1 && ( -z "$_head_tip" || "$_head_tip" != "$_ship_tip" ) ]]; then
+      _cur="$(git branch --show-current 2>/dev/null)"
+      WORKER_REASON="the agent finished its session but committed nothing to ${BRANCH}, the branch that will be shipped - the worktree is left on ${_cur:-a detached or unborn HEAD}, so any work it did sits on a ref the ship will not push"
+    else
+      WORKER_REASON="the agent finished its session but produced no change at all: no commit since base and the working tree is clean"
+    fi
   fi
-fi
+}
+check_committed
 
 do_verify
 
@@ -375,12 +419,17 @@ REVIEW_VERDICT="skipped"; ROUNDS=0
 # known to be empty spends a reviewer call to obtain an empty-diff error, and
 # storing that error as the run's review state is how this defect read as "the
 # reviewer keeps breaking" for two rounds. The verdict says there was nothing
-# to review — not that the reviewer failed.
-if [[ -n "$BASE" && "$NEW_COMMITS" == "0" ]]; then
+# to review — not that the reviewer failed. Review runs only on a COUNTED
+# change: with the count unknown there is no diff to hand over either, and the
+# run is being refused regardless.
+if [[ -n "$BASE" && "$COUNT_OK" == "1" && "$NEW_COMMITS" == "0" ]]; then
   REVIEW_VERDICT="nothing_to_review"
   echo "glm-task: nothing committed since base — skipping review, there is no diff to judge" >&2
-elif [[ "$REVIEWER" != "none" && -n "$BASE" ]]; then
-  "$HERE/glm-review" -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>>"$REVERR"
+elif [[ "$REVIEWER" != "none" && -n "$BASE" && "$COUNT_OK" == "1" ]]; then
+  # -H: judge the branch that will be SHIPPED. The agent can leave the
+  # worktree's HEAD elsewhere than the ship branch; reviewing HEAD would
+  # approve a diff the ship never pushes.
+  "$HERE/glm-review" -C "$DIR" -b "$BASE" -H "$SHIPREF" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>>"$REVERR"
   rc=$?
   case $rc in 0) REVIEW_VERDICT="pass" ;; 1) REVIEW_VERDICT="changes_required" ;;
              3) REVIEW_VERDICT="no_capacity" ;; *) REVIEW_VERDICT="error" ;; esac
@@ -424,8 +473,20 @@ Follow this protocol in order:
 5. Re-run the full verification, then commit.
 
 Report at the end: which findings you reproduced and fixed, and which you refuted and why." "$FIXLOG"
+    # Re-measure before any further verify or review, exactly as after the
+    # first agent: a fix worker can undo the commits it was asked to rework,
+    # and the count taken before the first review is stale by now. Without
+    # this, the re-review below was spent on a diff already known to be empty,
+    # its empty-diff error was recorded as the run's review state, and the
+    # uncommitted rework was never named.
+    check_committed
     do_verify
-    "$HERE/glm-review" -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>>"$REVERR"
+    if [[ "$COUNT_OK" != "1" || "$NEW_COMMITS" == "0" ]]; then
+      if [[ "$COUNT_OK" == "1" ]]; then REVIEW_VERDICT="nothing_to_review"; fi
+      echo "glm-task: nothing committed to the branch after round $ROUNDS — no diff to review" >&2
+      break
+    fi
+    "$HERE/glm-review" -C "$DIR" -b "$BASE" -H "$SHIPREF" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>>"$REVERR"
     rc=$?
     # Same mapping as the first review, exit 3 included. Omitting it here turned
     # "every reviewer was out of capacity" into "error", which glm-task reports as
@@ -531,19 +592,23 @@ if grep -q '"level":"blocked"' "$NOTES" 2>/dev/null; then
 fi
 
 # The delegated agent did not complete — it could not start, it died, it was
-# killed, it reported failure itself, or (#93) it finished having committed
-# nothing. Checked BELOW rate limiting (a throttled run says nothing about the
-# change: the item is retried, not marked broken) and BELOW blocked (a question
-# waiting is more specific than this), but ABOVE verify and review: verify runs
-# against the working tree, so a green verify over work that was never
-# committed is exactly the case this catches, and review is skipped altogether
-# when there is no committed diff to judge. A weak verify command passing over
-# work that was never attempted is why BLOCKED already sits above them (#91).
+# killed, it reported failure itself, or (#93) it left nothing on the branch
+# that will be shipped: uncommitted files, no change at all, commits on a
+# branch the ship never pushes, or a git state nobody could read. Checked
+# BELOW rate limiting (a throttled run says nothing about the change: the item
+# is retried, not marked broken) and BELOW blocked (a question waiting is more
+# specific than this), but ABOVE verify and review: verify runs against the
+# working tree, so a green verify over work that was never committed is
+# exactly the case this catches, and review is skipped altogether when there
+# is no committed diff to judge. A weak verify command passing over work that
+# was never attempted is why BLOCKED already sits above them (#91).
 # Distinct from exit 1, which means a change WAS produced and was found wanting.
 if [[ "${WORKER_OK:-0}" != "1" ]]; then
   echo "glm-task: the delegated agent did not complete — ${WORKER_REASON:-no reason recorded}." >&2
   if [[ "$LEFT_UNCOMMITTED" == "1" ]]; then
     echo "glm-task: those files are still in $DIR — recover them before the worktree is removed. glm-task will not commit them on the agent's behalf." >&2
+  elif [[ "$STATE_UNKNOWN" == "1" ]]; then
+    echo "glm-task: what the branch carries could not be determined, so nothing about this run is certified — inspect $DIR before the worktree is removed." >&2
   else
     echo "glm-task: no change was produced, so verify and review had nothing to judge." >&2
   fi
