@@ -705,6 +705,41 @@ function takeUnits(s: string, maxUnits: number): string {
 const skipNote = (p: string): string => `skipped (no matches): ${p}`;
 
 /**
+ * The sentence that separates "nothing matched" from "we looked somewhere
+ * else" (#67). Confinement defaults to the server process's own working
+ * directory at startup — deliberate, since a boundary the caller can set is
+ * not a boundary — but where the server STARTS is the host's choice: Claude
+ * Code uses the project directory, Codex the session directory, and
+ * Antigravity wherever `agy` itself was invoked, which `--add-dir` does not
+ * change. Ask for a project-relative glob from a server started in the wrong
+ * place and the glob matches nothing, the call still succeeds, and the reply
+ * reads as "the model had nothing to say about those files" when the fact is
+ * "this server was looking somewhere else entirely" — two situations that
+ * need completely different fixes and, before this note, shared one wording.
+ *
+ * The obvious remedy — name the root that was searched — is the one #26
+ * forbids: this note crosses the trust boundary to the caller, and under
+ * Antigravity the root IS typically the account's home directory. What the
+ * caller needs instead is a fact about its OWN request, which it already
+ * knows and which is the whole difference between the two situations: did it
+ * supply `cwd`, or did the server fall back to where the host launched it?
+ * Saying the fallback happened discloses nothing, and it is the one thing
+ * that tells the caller which knob to reach for — `cwd` to search the
+ * directory it means (which must resolve inside the allowed roots), or
+ * `GLM_MCP_ROOTS`, the operator's escape hatch, where it does not.
+ *
+ * Deciding by whether the ARGUMENT was present is load-bearing, never by
+ * comparing the resolved cwd to the startup directory: a caller that names
+ * the startup directory itself chose its ground as surely as one that names
+ * anywhere else, and it gets the ordinary no-match — the search happened
+ * where it asked, and this sentence would point at the wrong fix.
+ */
+const NO_CWD_SEARCH_NOTE =
+  "no cwd was supplied, so the search ran in the directory this server was " +
+  "started in — pass cwd to search the directory you mean, or set " +
+  "GLM_MCP_ROOTS to widen where the server may search";
+
+/**
  * How many leading bytes are inspected for a NUL before a file is believed to
  * be text. 8,000 is git's own sniffing length and the conventional one: no
  * human-written text encoding contains a NUL, while nearly every binary
@@ -864,10 +899,19 @@ export interface FileContext {
  * as sent. The files assemble into what remains, and a cut the history caused
  * says so in its note. Zero — the two- and three-argument calls every existing
  * caller makes — is no thread, and behaves exactly as before.
+ *
+ * `cwd` is undefined-able on purpose (#67): whether it is undefined is a fact
+ * about the CALLER's request — it supplied no `cwd` — that no resolved value
+ * can stand for, because the directory the caller names may BE the startup
+ * directory, and it is what decides whether an answer of `no matches` carries
+ * {@link NO_CWD_SEARCH_NOTE}. Undefined resolves exactly as the tools
+ * advertise the default: the server process's own working directory. The
+ * callers that resolve a cwd of their own pass it as a string and get the
+ * plain no-match, which is the answer their callers asked for.
  */
 export function buildFileContext(
   paths: string[],
-  cwd: string,
+  cwd: string | undefined,
   model: string = DEFAULT_MODEL,
   historyChars: number = 0,
 ): FileContext {
@@ -883,6 +927,13 @@ export function buildFileContext(
   const notes: Array<{ arg: number; msg: string }> = [];
   const chunks: string[] = [];
   let total = 0;
+
+  // #67: captured BEFORE the default is applied, because the applied value
+  // cannot stand for it — a caller that names the startup directory chose its
+  // ground as surely as one that names anywhere else. Read once, here, and
+  // only ever again by the no-match answer below.
+  const cwdSupplied = cwd !== undefined;
+  cwd ??= process.cwd();
 
   const roots = confineRoots();
   if (roots && !insideRoots(realpathish(cwd), roots)) {
@@ -1414,10 +1465,19 @@ export function buildFileContext(
   // answer, so a wording that depended on it would reopen the oracle #26
   // closed: absent, unreadable and simply-never-reached must all produce this
   // same note.
-  const answerNote = (pending: (typeof pendings)[number]): string =>
-    capCutAt >= 0 && pending.arg >= capCutAt
-      ? `skipped (char cap reached, not read): ${pending.via}`
-      : skipNote(pending.via);
+  // #67: whether any argument was answered with the plain `no matches` — the
+  // one answer that can mean the server searched somewhere the caller never
+  // meant, and so the only one the NO_CWD_SEARCH_NOTE below may explain. The
+  // char-cap answer is deliberately not counted: those arguments DID match,
+  // and where the search ran is not why they went unread.
+  let matchedNothing = false;
+  const answerNote = (pending: (typeof pendings)[number]): string => {
+    if (capCutAt >= 0 && pending.arg >= capCutAt) {
+      return `skipped (char cap reached, not read): ${pending.via}`;
+    }
+    matchedNothing = true;
+    return skipNote(pending.via);
+  };
 
   for (const pending of pendings) {
     // An argument whose walk a limit or a boundary refusal cut short is excused
@@ -1442,6 +1502,20 @@ export function buildFileContext(
     // for me" — matched nothing, unreadable, already read through another
     // spelling, never reached past the cap — answers here identically.
     if (!spokenArgs.has(pending.arg)) notes.push({ arg: pending.arg, msg: answerNote(pending) });
+  }
+
+  // #67: one hint per call, after every argument's own answer, and only when
+  // both halves hold — some argument matched nothing, and the caller supplied
+  // no `cwd`. A call whose files all arrived has nothing to explain; a caller
+  // that named its own `cwd` got an ordinary no-match, and sending it to cwd
+  // and GLM_MCP_ROOTS would point at the wrong fix. The hint does not vary
+  // with anything on disk — it follows the no-match note, which #26 already
+  // keeps identical across the absent and unreadable worlds, so adding it
+  // here opens no oracle the merged wording did not already close. Filed
+  // under `paths.length`, one past every real argument, so the sort puts it
+  // last: it explains the answers, it is not one.
+  if (matchedNothing && !cwdSupplied) {
+    notes.push({ arg: paths.length, msg: NO_CWD_SEARCH_NOTE });
   }
 
   // The separators were budgeted per chunk above, so joining is the identity:

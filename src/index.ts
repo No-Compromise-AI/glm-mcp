@@ -274,7 +274,13 @@ server.registerTool(
       const historyChars = priorTurns.reduce((n, m) => n + m.content.length, 0);
 
       if (files?.length) {
-        const ctx = buildFileContext(files, cwd ?? process.cwd(), chosenModel, historyChars);
+        // #67: `cwd` passes through unresolved — undefined included — because
+        // whether the ARGUMENT was present is the fact a no-match note now
+        // turns on, and this is the only place that can know it. Resolving it
+        // to process.cwd() here would erase the one distinction that separates
+        // "nothing matched" from "we looked somewhere else"; buildFileContext
+        // applies the default this tool advertises either way.
+        const ctx = buildFileContext(files, cwd, chosenModel, historyChars);
         notes.push(...ctx.notes);
         // A refused call read nothing. Sending the prompt anyway would answer
         // the question with none of the material it asked about — a silent
@@ -495,8 +501,12 @@ server.registerTool(
       if (files?.length) {
         // The same buildFileContext glm_ask calls — not a reimplementation —
         // so confinement, de-duplication, binary skips and the cap and its
-        // notes are all of it inherited, once, here.
-        const ctx = buildFileContext(files, cwd ?? process.cwd(), chosenModel);
+        // notes are all of it inherited, once, here. `cwd` passes through
+        // unresolved for the same #67 reason as glm_ask's: a review whose
+        // files matched nothing under a mis-launched server is told where the
+        // search ran exactly as an ask is, and by the same fact — whether the
+        // argument was there.
+        const ctx = buildFileContext(files, cwd, chosenModel);
         notes.push(...ctx.notes);
         // A refused call read nothing; sending the review anyway would have
         // the model opine about code it was never shown — a silent failure
