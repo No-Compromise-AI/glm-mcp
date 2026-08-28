@@ -21,8 +21,8 @@
 #   5  rate limited — the run was NOT attempted; retry later
 #   4  BLOCKED — the agent stopped to ask a question
 #   6  the delegated agent did not complete (could not start, died, reported
-#      failure, or was killed) — no change was produced, so verify and review
-#      had nothing to judge
+#      failure, was killed, or exited non-zero despite a clean result) — no
+#      change was produced, so verify and review had nothing to judge
 #   1  a change WAS produced and was judged wanting — verify failed, or the
 #      reviewer required changes
 #   2  UNREVIEWED — the review errored; nothing checked the change
@@ -221,14 +221,24 @@ PYEOF
   # channels — its exit status and its stream-json — and neither alone is
   # enough. The status alone misses an agent that ran and reported failure
   # (is_error, exit 0); the result event alone misses a worker that never
-  # emitted one. "Did not complete" is three shapes, and all three land here
-  # (#91):
+  # emitted one, and certifies a worker that reported success and then exited
+  # non-zero anyway. Completion is the CONJUNCTION — a clean result event AND
+  # exit 0 — and everything else lands here (#91):
   #   (a) non-zero exit, no result    — it could not start, or it died;
   #   (b) result with is_error, or a subtype other than success;
-  #   (c) zero exit, no result at all — killed, truncated, stopped between events.
+  #   (c) zero exit, no result at all — killed, truncated, stopped between events;
+  #   (d) a clean result beside a NON-ZERO exit — the channels disagree, and a
+  #       disagreement is not a completion: something failed after the result,
+  #       or the log is stale, and a success here is what an unattended drain
+  #       merges on.
   # Both halves, or a delegation that never ran reports success. Anything this
   # cannot classify reads as NOT complete: the honest direction to fail in.
   # Read from the log, like ERRTEXT, because the pipeline consumed stdout.
+  # (Both PYEOF heredocs below: keep apostrophes and any other unbalanced
+  # quote character out of the bodies. bash 3.2 — the floor bin/ targets —
+  # scans a heredoc body for quotes even here, inside a command substitution
+  # behind a quoted delimiter, and one apostrophe fails the parse at EOF,
+  # nowhere near the line that caused it.)
   WORKER_OK=0; WORKER_REASON=""
   WORKER_VERDICT="$(GLM_LOGF="$2" GLM_WRC="$WORKER_RC" python3 - <<'PYEOF'
 import json, os
@@ -247,6 +257,11 @@ elif res.get("is_error") or res.get("subtype") not in (None, "success"):
     detail = " ".join(str(res.get("result") or res.get("error") or "").split())[:300]
     why = "the worker ran and reported %s" % (res.get("subtype") or "an error")
     print("0\t%s%s" % (why, ": " + detail if detail else ""))
+elif os.environ["GLM_WRC"] != "0":
+    # Shape (d): the result event is clean, but the worker exit status says
+    # otherwise. Reading only the log here certified exactly this
+    # contradiction as success, and glm-drain ships on a zero exit.
+    print("0\tthe worker exited %s after reporting a successful result - its exit status contradicts its own result event" % os.environ["GLM_WRC"])
 else:
     print("1\t")
 PYEOF

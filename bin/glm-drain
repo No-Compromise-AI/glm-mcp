@@ -30,7 +30,8 @@
 #   4 BLOCKED     park with the question, continue        5 RATE LIMITED  requeue with backoff,
 #                                                                attempt not consumed
 #   6 NO AGENT    one retry, then park as incomplete. The delegated agent did
-#                 not complete — it could not start, died, or was killed — so
+#                 not complete — it could not start, died, was killed, reported
+#                 failure, or exited non-zero despite a clean result — so
 #                 unlike 1 there is no change to judge, and the parked record
 #                 must say THAT rather than "failed", which would read as
 #                 "a change was made and was found wanting".
@@ -410,7 +411,8 @@ while :; do
           throttle "$id" "$ru" "$rh" "$asked" "rate limited on item $id (attempt not consumed)" "$session" "$worktree"
           ;;
       6)  # NO AGENT. The delegated agent did not complete — it could not
-          # start, died, was killed, or reported failure — so, unlike exit 1,
+          # start, died, was killed, reported failure, or exited non-zero
+          # despite a clean result — so, unlike exit 1,
           # no change was ever produced: nothing was verified, nothing was
           # reviewed, and nothing here is safe to merge. One retry, then park,
           # as with 1; but the record must say THIS, not "failed", because a

@@ -18,8 +18,13 @@
 //     into the parked record. The gate asserts a park happened; a drain that
 //     never retried, or parked under "failed", would pass it.
 //
-// npm test's file list is fixed in package.json's "test" script, so this
-// file is run directly:  node --test test/delegation.test.mjs
+// WIRING, stated plainly rather than papered over: this file is NOT run by
+// `npm test`. package.json's "test" script names its files explicitly, and
+// package.json is frozen by the task these tests belong to — so the
+// one-token change that puts them in CI (add test/delegation.test.mjs to
+// that list; both workflows already run `npm test`, nothing else is needed)
+// belongs to the maintainer. Until then, run them directly:
+//   node --test test/delegation.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -111,6 +116,21 @@ test('worker_reason names which shape of incomplete happened', () => {
   const c = delegate({ code: 0, stdout: JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } }) });
   assert.match(c.row?.worker_reason ?? '', /exited 0 without emitting a result/,
     'shape (c) — a zero exit with no result must be named as the truncation it is');
+});
+
+// The two channels disagree: the result event says the session finished
+// cleanly, the worker's own exit status says something failed anyway. The
+// exit status is one of the only two routes the worker can present failure
+// on, so a disagreement is not a completion — a zero exit here is what an
+// unattended drain merges on.
+test('a successful result does not rescue a failing exit status: exit 6, worker_ok=false', () => {
+  const r = delegate({ code: 1, stdout: resultLine({}) });
+  assert.equal(r.status, 6,
+    `completion requires BOTH a clean result and exit 0; got exit ${r.status}`);
+  assert.equal(r.row?.worker_ok, false,
+    'the row must record the contradiction as not-complete, not certify the result it half-heard');
+  assert.match(r.row?.worker_reason ?? '', /exited 1 .*successful result/,
+    'the reason must name the exit code and the result it contradicts');
 });
 
 // The drain side. The stub speaks glm-task's dialect: the stderr line it
