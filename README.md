@@ -110,6 +110,14 @@ Step 3 is opt-in on purpose. It reads a credential belonging to a different appl
 and that should be a decision you make rather than behaviour you discover. Everything runs
 on the machine doing the installing: your key, your z.ai account, your billing.
 
+The key and the endpoint are resolved on every call, not once at startup, so rotating the
+key on disk takes effect on the next request and needs no restart. Nothing is rebuilt when
+nothing changed — an unchanged key and endpoint keep the same connection — and if a
+re-read fails while a working credential is already in use, the call is served from it
+rather than failing, with the reason on stderr. A credential that resolved once is
+evidence one exists, and a transient unreadable config should not take down a running
+server.
+
 Note that the ZCode **Start Plan** token is not usable here — that endpoint is captcha-locked to
 the ZCode app and rejects outside clients with `3007`. You need an `api.z.ai` key with a Coding
 Plan or credit on it.
