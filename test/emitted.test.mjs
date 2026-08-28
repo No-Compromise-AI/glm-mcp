@@ -27,7 +27,11 @@
 // `delivered > 0 && delivered < FILES`, a range no wrong number can fail.
 // A pin that cannot fail cannot hold a line, so the counts are now numbers,
 // measured at this fixture and this cap; if the accounting drifts by one file,
-// this says which direction rather than shrugging.
+// this says which direction rather than shrugging. The unread count is its own
+// measurement, not arithmetic on the delivered one: the child asks the
+// directory which files never got a header at all, so a count that drifts
+// while the disk does not (a header double-counted, a file's header lost)
+// fails here rather than cancelling inside FILES - delivered.
 //
 // Second, the README's own claim — the same half of the biconditional
 // verify-blocking holds for the serialisation sentence. The README discloses
@@ -42,7 +46,16 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+
+// The import specifier the child is told to load, from this file's own URL.
+// Kept as a named thing because a review found the construction matters: the
+// URL is already absolute, and anything that routes it through a PATH first
+// (.pathname, then pathToFileURL again) re-encodes every percent-escape the
+// path carries — a checkout under `/tmp/glm repo` reached the child as %2520
+// and died with ERR_MODULE_NOT_FOUND before the first assertion ran. The
+// specifier is the URL itself.
+const specifierFor = (moduleUrl) => new URL('../dist/glm.js', moduleUrl).href;
 
 const RAW = mkdtempSync(join(tmpdir(), 'glm-emitted-test-'));
 const ROOT = realpathSync.native(RAW);
@@ -70,17 +83,35 @@ after(() => rmSync(ROOT, { recursive: true, force: true }));
 // 85M characters back over stdout; the numbered body never starts a line with
 // `--- `, so the headers are unambiguous in the assembled text.
 const CHILD = `
-import { buildFileContext } from ${JSON.stringify(pathToFileURL(new URL('../dist/glm.js', import.meta.url).pathname).href)};
+import { buildFileContext } from ${JSON.stringify(specifierFor(import.meta.url))};
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
 const job = JSON.parse(process.argv[1]);
 const r = buildFileContext(job.paths, job.cwd);
 const delivered = [...String(r.text ?? '').matchAll(/--- src\\/f\\d+\\.ts(?: \\(truncated\\))? ---/g)];
+const named = new Set(delivered.map((m) => /--- (src\\/f\\d+\\.ts)/.exec(m[0])[1]));
+const onDisk = readdirSync(join(job.cwd, 'src')).filter((f) => f.endsWith('.ts')).map((f) => 'src/' + f);
+const unread = onDisk.filter((f) => !named.has(f)).length;
 process.stdout.write(JSON.stringify({
   delivered: delivered.length,
   truncated: delivered.filter((m) => m[0].includes('(truncated)')).length,
+  unread,
   chars: String(r.text ?? '').length,
   notes: (r.notes ?? []).map(String),
 }));
 `;
+
+test('the import specifier survives a checkout path that needs percent-encoding', () => {
+  // The construction above, exercised on a URL whose path is NOT already
+  // plain: a space reaches a URL as %20, and the specifier has to carry that
+  // escape once — not encode the percent itself.
+  const spaced = new URL('file:///tmp/glm%20repo/test/emitted.test.mjs');
+  assert.equal(
+    fileURLToPath(specifierFor(spaced)), '/tmp/glm repo/dist/glm.js',
+    'the specifier handed to the child must resolve to the real dist/glm.js ' +
+      'when the checkout lives under a path that percent-encoding exists for',
+  );
+});
 
 const run = (cap) => {
   const childEnv = { ...process.env };
@@ -121,9 +152,10 @@ test('a cap set to the bytes on disk is still cut: emitted text is longer than b
       `whole, and only one: ${JSON.stringify(r.notes)}`,
   );
   assert.equal(
-    FILES - r.delivered, 28,
-    `the files after the cut were never read: measured ${FILES - r.delivered} of them against ` +
-      `the 28 this pin holds`,
+    r.unread, 28,
+    `the files after the cut were never read: ${r.unread} of the ${FILES} on disk arrived ` +
+      `with no header at all, against the 28 this pin holds — measured from the directory, ` +
+      `not as arithmetic on the delivered count`,
   );
   assert.ok(
     r.notes.some((n) => /truncated at \d+ total chars/.test(n)),
@@ -149,6 +181,11 @@ test('the cap the README discloses for its measured run admits the whole workloa
       `that run delivered ${r.delivered} of them — the disclosure and the behaviour have drifted apart`,
   );
   assert.equal(r.truncated, 0, `nothing arrived truncated: ${JSON.stringify(r.notes)}`);
+  assert.equal(
+    r.unread, 0,
+    `every file on disk arrived with a header: ${r.unread} did not — the disclosure and ` +
+      `the behaviour have drifted apart`,
+  );
   assert.ok(
     !r.notes.some((n) => /truncated at/.test(n)),
     `no truncation note may stand over a run the README reports as reading the whole tree: ${JSON.stringify(r.notes)}`,
