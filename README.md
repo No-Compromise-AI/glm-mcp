@@ -279,12 +279,15 @@ them is the fastest way to be confused by it:
 | | what it is | what GLM is |
 | --- | --- | --- |
 | the MCP server — `glm_ask`, `glm_review`, `glm_models` | a server another agent calls mid-task | **a tool** the agent consults, keeping the wheel |
-| `bin/` — ten commands, below | shell around the Claude Code CLI | **the agent**, doing the work in the repository |
+| `bin/` — eleven commands, below | shell around GLM agent sessions | **the agent**, doing the work in the repository |
 
-`bin/claude-glm` points the Claude Code CLI at z.ai, so GLM drives a session. `bin/glm-task`
-delegates a task to that session, verifies it independently, has a *different vendor's* model
-review the result against the spec, and records the outcome. Reviewer selection follows the
-agent you are sitting in — `GLM_HOST` — so the host driving a delegation is never its own
+`bin/claude-glm` points the Claude Code CLI at z.ai, so GLM drives an interactive session.
+Delegation does not go through it: `bin/glm-task` hands the task to `bin/glm-worker`, which
+runs the Claude Agent SDK — a binary the worker package vendors, so the delegate → review →
+answer path needs no host CLI installed (#90) — verifies the result independently, has a
+*different vendor's* model review it against the spec, and records the outcome. Reviewer
+selection follows the agent you are sitting in — `GLM_HOST` — so the host driving a delegation
+is never its own
 reviewer: from Claude that is codex + agy, from Codex claude + agy, from Antigravity codex +
 claude. `-r all` asks all three.
 
@@ -292,7 +295,8 @@ claude. `-r all` asks all three.
 
 | | |
 | --- | --- |
-| `claude-glm` | points the Claude Code CLI at z.ai, so GLM drives the session. Everything else is built on this |
+| `claude-glm` | points the Claude Code CLI at z.ai, so GLM drives an interactive session. The delegation path does not use it — it needs no host CLI |
+| `glm-worker` | the headless agent the delegation path runs: the Claude Agent SDK against z.ai, vendored in `packages/worker` so delegating needs no Claude Code installed. `npm ci` at the repo root installs it (that is the `postinstall`); by hand: `npm ci --prefix packages/worker` |
 | `glm-task` | delegate one task: run the agent, verify independently, have a different vendor's model review it against the spec, one fix round, record the outcome |
 | `glm-drain` | work a list of GitHub issues unattended — `glm-task` per item, `glm-ship` for what passes, parking for what needs you |
 | `glm-review` | review a change against the spec it was meant to implement, with a chosen reviewer or `auto` |
@@ -347,9 +351,11 @@ rather than letting a broken main become the base for the rest of the night.
 | drain: override the commands it drives | `GLM_TASK_CMD` / `GLM_SHIP_CMD` | the siblings in `bin/` |
 
 **These are not in the published npm package.** This package's promise is the server; the
-scripts drive a CLI an npm consumer will not have. They are here because they are the other
-half of the same idea, and because ~1,700 lines of working shell deserve a history. Use them
-from a checkout.
+shell family is the other half of the same idea, and it lives here because ~1,700 lines of
+working shell deserve a history. Use them from a checkout. One of them is heavy: `glm-worker`
+runs a ~199MB vendored binary, which is why it sits in `packages/worker` as its own package
+rather than a dependency of this one — `npm ci` at the repo root installs it via `postinstall`,
+so a fresh checkout can delegate with nothing further.
 
 ## Reasoning
 

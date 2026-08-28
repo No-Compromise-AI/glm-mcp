@@ -90,7 +90,7 @@ run_one() { # $1 = reviewer name -> stdout is its raw output
   case "$1" in
     codex)  codex exec --sandbox read-only "$PROMPT" 2>&1 < /dev/null ;;
     claude) claude -p "$PROMPT" --allowedTools Read Grep Glob "Bash(git:*)" "Bash(node:*)" 2>&1 < /dev/null ;;
-    glm)    "$HERE/claude-glm" -p "$PROMPT" --allowedTools Read Grep Glob "Bash(git:*)" "Bash(node:*)" 2>&1 < /dev/null ;;
+    glm)    "$HERE/glm-worker" -p "$PROMPT" --allowedTools Read Grep Glob "Bash(git:*)" "Bash(node:*)" 2>&1 < /dev/null ;;
     agy)    agy -p "$PROMPT" --add-dir "$DIR" --model "${GLM_AGY_MODEL:-claude-opus-4-6-thinking}" 2>&1 < /dev/null ;;
     *) echo "unknown reviewer: $1" >&2; return 2 ;;
   esac

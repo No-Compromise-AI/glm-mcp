@@ -1,0 +1,30 @@
+#!/usr/bin/env node
+// glm-worker — the headless delegation worker (#90).
+//
+// glm-task, glm-review and glm-answer call this instead of a host Claude Code
+// CLI: the implementation runs the Claude Agent SDK, which vendors its own
+// binary, so delegation works on a machine with no `claude` installed (#89).
+//
+// A Node shim, not the bash idiom the rest of bin/ uses to find itself
+// (dirname/readlink): it must work on whatever PATH can run the worker at
+// all, and that PATH is only guaranteed one binary — node itself.
+//
+// The implementation and its dependency on @anthropic-ai/claude-agent-sdk
+// live in packages/worker, a separate package, because the vendored binary is
+// ~199MB and glm-mcp's own published package must stay light
+// (scripts/verify-worker.mjs rule 5). This shim exists so the call sites read
+// exactly as they did before the swap.
+import { realpathSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+// Follow symlinks (~/.local/bin/glm-worker -> here) so the worker package is
+// found relative to where this file really lives, not where it was invoked.
+const self = realpathSync(fileURLToPath(import.meta.url));
+
+await import(pathToFileURL(join(dirname(self), '..', 'packages', 'worker', 'bin', 'glm-worker.mjs')))
+  .catch((err) => {
+    console.error(`glm-worker: could not start: ${err?.message ?? err}`);
+    console.error('glm-worker: is the worker package installed? npm ci --prefix packages/worker');
+    process.exit(1);
+  });

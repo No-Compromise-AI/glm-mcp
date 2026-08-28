@@ -57,3 +57,4 @@ jobs:
       - run: npm run verify:review
       - run: npm run verify:docs
       - run: npm run verify:drain
+      - run: npm run verify:worker
