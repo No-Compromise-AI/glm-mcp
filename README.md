@@ -406,8 +406,11 @@ already have against glob characters. A range that names nothing readable is rep
   call supplied no `cwd`, that report also says the search ran in the directory the server was
   started in and names `cwd` and `GLM_MCP_ROOTS` as the knobs, so a mis-launched server (see the
   per-host table above) is diagnosable from the reply instead of reading as an ordinary no-match.
-  The note names no path — which directory the server started in is the machine's business, not
-  the caller's.
+  The knobs are companions, not alternatives: `cwd` moves the search, and `GLM_MCP_ROOTS` widens
+  the roots the new `cwd` must resolve inside — a `cwd` outside the roots is refused until it is
+  widened. Only patterns carry the extra sentence; a missing file, a duplicate, or an empty line
+  range reads as the plain no-match it always was. The note names no path — which directory the
+  server started in is the machine's business, not the caller's.
 - Symlinked directories are followed only when the pattern names one explicitly
   (`linked/*.ts`). Wildcards never follow them, and a link to a directory is never
   listed as a file.

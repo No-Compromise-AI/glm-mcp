@@ -724,9 +724,15 @@ const skipNote = (p: string): string => `skipped (no matches): ${p}`;
  * knows and which is the whole difference between the two situations: did it
  * supply `cwd`, or did the server fall back to where the host launched it?
  * Saying the fallback happened discloses nothing, and it is the one thing
- * that tells the caller which knob to reach for — `cwd` to search the
- * directory it means (which must resolve inside the allowed roots), or
- * `GLM_MCP_ROOTS`, the operator's escape hatch, where it does not.
+ * that tells the caller which knob to reach for — `cwd`, which moves the
+ * search, with `GLM_MCP_ROOTS`, the operator's escape hatch, widening the
+ * roots the new cwd must resolve inside. The two are companions, never
+ * alternatives: a relative pattern anchors at the cwd wherever the roots
+ * lie, so roots alone leave the search exactly where it ran, and a cwd
+ * outside the roots refuses the call outright. Where the directory the
+ * caller means is already inside the roots — the Antigravity default, where
+ * the boundary IS the startup home — cwd alone is enough; outside them,
+ * both are needed.
  *
  * Deciding by whether the ARGUMENT was present is load-bearing, never by
  * comparing the resolved cwd to the startup directory: a caller that names
@@ -736,8 +742,10 @@ const skipNote = (p: string): string => `skipped (no matches): ${p}`;
  */
 const NO_CWD_SEARCH_NOTE =
   "no cwd was supplied, so the search ran in the directory this server was " +
-  "started in — pass cwd to search the directory you mean, or set " +
-  "GLM_MCP_ROOTS to widen where the server may search";
+  "started in — pass cwd to search the directory you mean; where that " +
+  "directory lies outside the allowed roots, GLM_MCP_ROOTS must be widened " +
+  "to include it as well: cwd alone is refused there, and GLM_MCP_ROOTS " +
+  "alone does not move the search";
 
 /**
  * How many leading bytes are inspected for a NUL before a file is believed to
@@ -1465,17 +1473,27 @@ export function buildFileContext(
   // answer, so a wording that depended on it would reopen the oracle #26
   // closed: absent, unreadable and simply-never-reached must all produce this
   // same note.
-  // #67: whether any argument was answered with the plain `no matches` — the
-  // one answer that can mean the server searched somewhere the caller never
-  // meant, and so the only one the NO_CWD_SEARCH_NOTE below may explain. The
-  // char-cap answer is deliberately not counted: those arguments DID match,
-  // and where the search ran is not why they went unread.
+  // #67: whether any argument was answered with the plain `no matches` FOR A
+  // PATTERN — the one answer that can mean the server searched somewhere the
+  // caller never meant, and so the only one the NO_CWD_SEARCH_NOTE below may
+  // explain. Two answers are deliberately not counted. The char-cap one:
+  // those arguments DID match, and where the search ran is not why they went
+  // unread. And every spelling without glob metacharacters — a missing
+  // literal, a duplicate, a range past the end of a file that was found and
+  // read — because `no matches` is #26's merged wording for all of them, and
+  // the hint reads as "the wrong directory was searched", which for those is
+  // the wrong fix pointed at by the one signal this change exists to add.
+  // Pattern-ness is the line because it is the caller's own SYNTAX, the one
+  // fact the eligibility can turn on without reopening the oracle the merged
+  // wording closed: anything read off the disk — whether the file was
+  // de-duplicated into an earlier argument, whether a range selected a line —
+  // would put the hint's presence where #26 spent its effort putting nothing.
   let matchedNothing = false;
   const answerNote = (pending: (typeof pendings)[number]): string => {
     if (capCutAt >= 0 && pending.arg >= capCutAt) {
       return `skipped (char cap reached, not read): ${pending.via}`;
     }
-    matchedNothing = true;
+    if (isGlobPattern(pending.via)) matchedNothing = true;
     return skipNote(pending.via);
   };
 
@@ -1505,7 +1523,7 @@ export function buildFileContext(
   }
 
   // #67: one hint per call, after every argument's own answer, and only when
-  // both halves hold — some argument matched nothing, and the caller supplied
+  // both halves hold — some pattern matched nothing, and the caller supplied
   // no `cwd`. A call whose files all arrived has nothing to explain; a caller
   // that named its own `cwd` got an ordinary no-match, and sending it to cwd
   // and GLM_MCP_ROOTS would point at the wrong fix. The hint does not vary
