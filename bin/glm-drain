@@ -29,6 +29,12 @@
 #                                                                at most five, then park
 #   4 BLOCKED     park with the question, continue        5 RATE LIMITED  requeue with backoff,
 #                                                                attempt not consumed
+#   6 NO AGENT    one retry, then park as incomplete. The delegated agent did
+#                 not complete — it could not start, died, was killed, reported
+#                 failure, or exited non-zero despite a clean result — so
+#                 unlike 1 there is no change to judge, and the parked record
+#                 must say THAT rather than "failed", which would read as
+#                 "a change was made and was found wanting".
 #
 # Exit 3 parks after five backed-off attempts, and that ceiling is deliberate:
 # with every reviewer out of capacity, an unbounded wait is a night spent idle
@@ -100,7 +106,7 @@ trap 'rm -rf "$RESDIR"' EXIT
 
 jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\r\t' '   '; }
 DONE=0; UNVER=0; SKIPPED=0; CONSEC=0; HALT=""
-P_BLOCK=0; P_UNREV=0; P_FAIL=0; P_HALT=0
+P_BLOCK=0; P_UNREV=0; P_FAIL=0; P_HALT=0; P_INCOMPLETE=0
 park() { # $1 id  $2 reason  $3 session  $4 worktree  $5 question
   printf '{"item":"%s","session_id":"%s","worktree":"%s","reason":"%s","question":"%s","ts":"%s"}\n' \
     "$(jesc "$1")" "$(jesc "$3")" "$(jesc "$4")" "$(jesc "$2")" "$(jesc "$5")" \
@@ -108,6 +114,7 @@ park() { # $1 id  $2 reason  $3 session  $4 worktree  $5 question
   case "$2" in
     blocked) P_BLOCK=$((P_BLOCK+1)) ;; unreviewed) P_UNREV=$((P_UNREV+1)) ;;
     failed) P_FAIL=$((P_FAIL+1)) ;; halted) P_HALT=$((P_HALT+1)) ;;
+    incomplete) P_INCOMPLETE=$((P_INCOMPLETE+1)) ;;
   esac
   echo "glm-drain: parked item $1 ($2)" >&2
 }
@@ -221,7 +228,7 @@ backoff_wait() { # $1 backoffs taken  $2 provider-asked secs ("" if none)
 # scheduler applies results in the order their work was launched.
 run_item() { # $1 id  $2 spec  $3 ru  $4 rh  $5 launch seq
   local id="$1" spec="$2" ru="$3" rh="$4" rc=0
-  local session="" worktree="" branch="" question="" asked=""
+  local session="" worktree="" branch="" question="" asked="" noreason=""
   local err="$RESDIR/err.$$.$RANDOM"
   local args=(-W -b "glm/drain-$RUNSTAMP/item-$id-a$((ru + rh + 1))")
   [[ -n "$VERIFY" ]] && args=("${args[@]}" -v "$VERIFY")
@@ -240,8 +247,15 @@ run_item() { # $1 id  $2 spec  $3 ru  $4 rh  $5 launch seq
   question="$(sed -n 's/.*"level":"blocked","msg":"\([^"]*\)".*/\1/p' "$err" | tail -1)"
   [[ -z "$question" ]] && question="$(sed -n 's/^.*\[blocked\] \(.*\)$/\1/p' "$err" | tail -1)"
   asked="$(sed -n 's/.*It asked for \([0-9][0-9]*\)s\{0,1\}\..*/\1/p' "$err" | tail -1)"
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$id" "$ru" "$rh" "$rc" "$session" "$worktree" "$branch" \
-    "$(printf '%s' "$question" | tr '\t\n\r|' '    ')" "$asked" > "$RESDIR/res-$(printf '%06d' "$5")"
+  # glm-task's own words for why an agent did not complete (exit 6), so a
+  # parked record can say what happened — could not start, died, reported
+  # failure — rather than only that it did. Stripped by prefix, not sed: the
+  # reason is free text and may contain anything sed would treat specially.
+  noreason="$(grep '^glm-task: the delegated agent did not complete' "$err" | tail -1)"
+  noreason="${noreason#glm-task: the delegated agent did not complete — }"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$id" "$ru" "$rh" "$rc" "$session" "$worktree" "$branch" \
+    "$(printf '%s' "$question" | tr '\t\n\r|' '    ')" "$asked" \
+    "$(printf '%s' "$noreason" | tr '\t\n\r|' '    ')" > "$RESDIR/res-$(printf '%06d' "$5")"
   rm -f "$err"
 }
 
@@ -323,7 +337,7 @@ while :; do
   while :; do
     res="$RESDIR/res-$(printf '%06d' "$NEXTRES")"
     [[ -e "$res" ]] || break
-    IFS='|' read -r id ru rh rc session worktree branch question asked < "$res"
+    IFS='|' read -r id ru rh rc session worktree branch question asked noreason < "$res"
     # Mid-write: BREAK, not continue. In the old for-loop continue moved to the
     # next file; in this barrier it would retry the same one forever.
     [[ -n "$id" ]] || break
@@ -395,6 +409,27 @@ while :; do
       5)  # RATE LIMITED. The attempt is not consumed: throttling says nothing
           # about the change, so the retry does not burn the item's one retry.
           throttle "$id" "$ru" "$rh" "$asked" "rate limited on item $id (attempt not consumed)" "$session" "$worktree"
+          ;;
+      6)  # NO AGENT. The delegated agent did not complete — it could not
+          # start, died, was killed, reported failure, or exited non-zero
+          # despite a clean result — so, unlike exit 1,
+          # no change was ever produced: nothing was verified, nothing was
+          # reviewed, and nothing here is safe to merge. One retry, then park,
+          # as with 1; but the record must say THIS, not "failed", because a
+          # human reading parked.jsonl needs to know the work never happened,
+          # not that it happened badly.
+          if (( ru < 1 )); then
+            echo "glm-drain: item $id's agent did not complete — one retry" >&2
+            QUEUE=("$id" ${QUEUE[@]+"${QUEUE[@]}"})
+            QSPEC=("$(spec_of "$id")" ${QSPEC[@]+"${QSPEC[@]}"})
+            QRU=(1 ${QRU[@]+"${QRU[@]}"})
+            QRH=("$rh" ${QRH[@]+"${QRH[@]}"})
+            QCOUNT=(0 ${QCOUNT[@]+"${QCOUNT[@]}"})
+          else
+            park "$id" incomplete "$session" "$worktree" \
+              "the delegated agent did not complete (glm-task exit 6)${noreason:+: $noreason}"
+            CONSEC=$((CONSEC + 1))
+          fi
           ;;
       *)  # An exit code the contract does not define — glm-task crashed or was
           # killed mid-run, and the run produced no information about the
@@ -539,7 +574,7 @@ while :; do
 done
 wait
 
-echo "glm-drain: done=$DONE unverified=$UNVER parked=$((P_BLOCK + P_UNREV + P_FAIL + P_HALT)) (blocked=$P_BLOCK unreviewed=$P_UNREV failed=$P_FAIL halted=$P_HALT) skipped=$SKIPPED"
+echo "glm-drain: done=$DONE unverified=$UNVER parked=$((P_BLOCK + P_UNREV + P_FAIL + P_INCOMPLETE + P_HALT)) (blocked=$P_BLOCK unreviewed=$P_UNREV failed=$P_FAIL incomplete=$P_INCOMPLETE halted=$P_HALT) skipped=$SKIPPED"
 if [[ -n "$HALT" ]]; then
   echo "glm-drain: halted — $HALT. Parked items are in $PARKED" >&2
   exit 1

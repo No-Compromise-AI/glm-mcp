@@ -147,6 +147,10 @@ const PLUMBING = new Set([
   'GLM_BASE', 'GLM_BRANCH', 'GLM_DIR', 'GLM_FULL', 'GLM_LEDGER', 'GLM_LOG', 'GLM_LOGF',
   'GLM_NOTES_F', 'GLM_REVERR', 'GLM_REVF', 'GLM_ROUNDS', 'GLM_RVERDICT', 'GLM_TASK_TEXT',
   'GLM_VERIFY', 'GLM_VRC', 'GLM_VSTATUS',
+  // The delegation-outcome verdict travels bash -> heredoc -> ledger row (#91):
+  // GLM_WRC hands the worker's captured PIPESTATUS in, GLM_WORKER_OK/REASON hand
+  // the computed verdict out. Read by nothing a user could set.
+  'GLM_WRC', 'GLM_WORKER_OK', 'GLM_WORKER_REASON',
 ]);
 const binVars = new Set();
 for (const f of readdirSync(binDir)) {
