@@ -11,19 +11,22 @@
 // load, so the child has to be BORN in the directory standing in for the
 // launch directory for either to mean what the note turns on.
 //
-// Two properties beyond the gate's four rules, both caught in review:
+// Properties beyond the gate's rules, most caught in review:
 //   - the note's remedies are companions, not alternatives — `cwd` moves the
 //     search and `GLM_MCP_ROOTS` widens what it may resolve inside; roots
 //     alone leave the search where it ran, and a cwd outside the roots is
 //     refused outright;
-//   - only a PATTERN's no-match carries the sentence. A missing literal, a
-//     duplicate, a range past the end of a found file — those are the plain
-//     no-match they always were, and "the wrong directory was searched" is
-//     the wrong fix pointed at by the one signal this note exists to add.
+//   - the sentence belongs to a call that DELIVERED NOTHING, whatever notes
+//     its individual arguments owe. A duplicate beside its own delivered
+//     match, a pattern no-match beside content that arrived — those keep the
+//     plain no-match and lose the sentence, because "this argument matched
+//     nothing" is not "this call found nothing", and only the second says the
+//     search ran somewhere the caller never meant. A missing literal and a
+//     range past the end of a found file never carry it either.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync, realpathSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -57,6 +60,19 @@ async function launchDir() {
   writeFileSync(join(dir, 'present.md'), 'found where the search ran\n');
   return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
+
+// Whether chmod 000 actually denies a read here — completeness.test.mjs's
+// deniesRead, same stance: probing the denial beats reading the uid, which
+// says nothing about the filesystem's answer.
+const deniesRead = (path) => {
+  chmodSync(path, 0o000);
+  try {
+    readFileSync(path, 'utf8');
+    return false;
+  } catch {
+    return true;
+  }
+};
 
 test('a pattern matching nothing with no cwd is told where the search ran', async (t) => {
   const { dir, cleanup } = await launchDir();
@@ -108,6 +124,19 @@ test('a range past the end of a found file carries no hint', async (t) => {
   assert.deepEqual(ranged.notes, ['skipped (no matches): present.md:999999-1000000']);
 });
 
+test('a range past the end of a bracket-named file that was found carries no hint', async (t) => {
+  const { dir, cleanup } = await launchDir();
+  t.after(cleanup);
+  // The review's second repro. The spelling is glob-shaped by its brackets,
+  // but the ask is ranged and the FILE was found and read — only the range
+  // selected no lines. Counting glob-shaped arguments is what let the
+  // brackets take this spelling down the pattern branch; the call's outcome
+  // is what settles it, and this call found its file.
+  writeFileSync(join(dir, 'report[final].md'), 'found where the search ran\n');
+  const ranged = ctx(['report[final].md:999999-1000000'], dir);
+  assert.deepEqual(ranged.notes, ['skipped (no matches): report[final].md:999999-1000000']);
+});
+
 test('a duplicate argument carries no hint', async (t) => {
   const { dir, cleanup } = await launchDir();
   t.after(cleanup);
@@ -117,6 +146,18 @@ test('a duplicate argument carries no hint', async (t) => {
   const dup = ctx(['present.md', 'present.md'], dir);
   assert.ok(dup.text.includes('found where the search ran'));
   assert.deepEqual(dup.notes, ['skipped (no matches): present.md']);
+});
+
+test('a duplicate PATTERN beside its own delivered match carries no hint', async (t) => {
+  const { dir, cleanup } = await launchDir();
+  t.after(cleanup);
+  // The review's first repro, and the gate's rule 5: *.md matched present.md
+  // and it was read and returned, yet the duplicate still owes — and gets —
+  // its no-match note. The hint would send the caller hunting elsewhere for a
+  // file already in its reply.
+  const dup = ctx(['*.md', '*.md'], dir);
+  assert.ok(dup.text.includes('found where the search ran'));
+  assert.deepEqual(dup.notes, ['skipped (no matches): *.md']);
 });
 
 test('a missing literal carries no hint — only a pattern can mean the wrong directory', async (t) => {
@@ -129,28 +170,44 @@ test('a missing literal carries no hint — only a pattern can mean the wrong di
   assert.deepEqual(missing.notes, ['skipped (no matches): nope.md']);
 });
 
-test('a pattern no-match among files that arrived still explains itself', async (t) => {
+test('a pattern no-match among files that arrived names itself and carries no hint', async (t) => {
   const { dir, cleanup } = await launchDir();
   t.after(cleanup);
+  // The call found present.md; src/**/*.ts still matched nothing and is still
+  // named, exactly as #13 and #40 settled. But the sentence belongs to a call
+  // that delivered NOTHING — beside returned content it would point at the
+  // wrong fix, the duplicate case wearing a mixed argument list.
   const mixed = ctx(['present.md', 'src/**/*.ts'], dir);
   assert.ok(mixed.text.includes('found where the search ran'));
   assert.ok(mixed.notes.some((n) => n === 'skipped (no matches): src/**/*.ts'));
-  assert.ok(mixed.notes.some((n) => HINT.test(n)));
+  assert.ok(!mixed.notes.some((n) => HINT.test(n)),
+    'content was delivered, so the no-cwd hint points at the wrong fix');
 });
 
 test('an unreadable metacharacter twin hints exactly like an absent one', async (t) => {
-  if (process.getuid?.() === 0) t.skip('running as root: chmod 000 denies nothing');
   const { dir, cleanup } = await launchDir();
   t.after(cleanup);
-  writeFileSync(join(dir, 'repo?rt.md'), 'unreadable\n');
-  chmodSync(join(dir, 'repo?rt.md'), 0o000);
-  const unreadable = ctx(['repo?rt.md'], dir);
+  // `repo[final].md`, not the review's `repo?rt.md`: `?` is not a legal
+  // filename on Windows, and the repo's metacharacter fixtures spell brackets
+  // for exactly that reason (disclosure.test.mjs's locked[.]txt). The
+  // eligibility line is the argument's own SYNTAX plus the call's outcome,
+  // both already visible to the caller, so the hint's presence cannot vary
+  // with what exists on disk — the property that keeps #26 closed where the
+  // merged wording left it.
+  writeFileSync(join(dir, 'repo[final].md'), 'unreadable\n');
+  // chmod 000 denies a read to every account but root — and root is exactly
+  // the account a CI box tends to run as, where the unreadable half of this
+  // probe would silently test nothing. Deny and try the read: when the read
+  // lands anyway, skip loudly rather than pass falsely, and RETURN — t.skip
+  // marks the test skipped but does not stop this callback (865ec47).
+  if (!deniesRead(join(dir, 'repo[final].md'))) {
+    t.skip('chmod 000 did not deny the read (running as root?) — the twin oracle cannot be exercised here');
+    return;
+  }
+  const unreadable = ctx(['repo[final].md'], dir);
   const absentDir = realpathSync.native(mkdtempSync(join(tmpdir(), 'glm-searchroot-')));
   t.after(() => rmSync(absentDir, { recursive: true, force: true }));
-  const absent = ctx(['repo?rt.md'], absentDir);
-  // The eligibility line is the argument's own SYNTAX, so the hint's presence
-  // cannot vary with what exists on disk — the property that keeps #26 closed
-  // where the merged wording left it.
+  const absent = ctx(['repo[final].md'], absentDir);
   assert.deepEqual(unreadable.notes, absent.notes);
   assert.ok(unreadable.notes.some((n) => HINT.test(n)));
 });

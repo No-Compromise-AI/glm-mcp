@@ -1473,27 +1473,33 @@ export function buildFileContext(
   // answer, so a wording that depended on it would reopen the oracle #26
   // closed: absent, unreadable and simply-never-reached must all produce this
   // same note.
-  // #67: whether any argument was answered with the plain `no matches` FOR A
-  // PATTERN — the one answer that can mean the server searched somewhere the
-  // caller never meant, and so the only one the NO_CWD_SEARCH_NOTE below may
-  // explain. Two answers are deliberately not counted. The char-cap one:
-  // those arguments DID match, and where the search ran is not why they went
-  // unread. And every spelling without glob metacharacters — a missing
-  // literal, a duplicate, a range past the end of a file that was found and
-  // read — because `no matches` is #26's merged wording for all of them, and
-  // the hint reads as "the wrong directory was searched", which for those is
-  // the wrong fix pointed at by the one signal this change exists to add.
-  // Pattern-ness is the line because it is the caller's own SYNTAX, the one
-  // fact the eligibility can turn on without reopening the oracle the merged
-  // wording closed: anything read off the disk — whether the file was
-  // de-duplicated into an earlier argument, whether a range selected a line —
-  // would put the hint's presence where #26 spent its effort putting nothing.
-  let matchedNothing = false;
+  // #67: whether any PATTERN-shaped argument was answered with the plain
+  // `no matches` — one fact of the hint's eligibility, and the only one
+  // decided per argument. Three answers are deliberately not counted. The
+  // char-cap one: those arguments DID match, and where the search ran is not
+  // why they went unread. Every spelling without glob metacharacters — a
+  // missing literal, a duplicate — because `no matches` is #26's merged
+  // wording for those, and the hint reads as "the wrong directory was
+  // searched", the wrong fix pointed at by the one signal this change exists
+  // to add. And every RANGED spelling, whatever its metacharacters:
+  // `report[final].md:999999-1000000` is glob-shaped by its brackets while
+  // being a ranged ask, and a range that selects no lines of a file that was
+  // found and read is not the search having run elsewhere — the first round
+  // let that spelling's brackets carry it into the pattern branch and hinted
+  // at a directory the caller's own file had already been found in. Ranges
+  // are excluded by SYNTAX alone, found file or not, because pattern-ness
+  // and range-ness are the caller's own facts — the ones the eligibility can
+  // turn on without reopening the oracle the merged wording closed; anything
+  // read off the disk would put the hint's presence where #26 spent its
+  // effort putting nothing. A duplicate pattern's no-match is not settled
+  // here at all: it is excluded by the call's whole outcome, where the hint
+  // is issued.
+  let unmatchedPattern = false;
   const answerNote = (pending: (typeof pendings)[number]): string => {
     if (capCutAt >= 0 && pending.arg >= capCutAt) {
       return `skipped (char cap reached, not read): ${pending.via}`;
     }
-    if (isGlobPattern(pending.via)) matchedNothing = true;
+    if (isGlobPattern(pending.via) && rangeOf(pending.via) === undefined) unmatchedPattern = true;
     return skipNote(pending.via);
   };
 
@@ -1523,16 +1529,24 @@ export function buildFileContext(
   }
 
   // #67: one hint per call, after every argument's own answer, and only when
-  // both halves hold — some pattern matched nothing, and the caller supplied
-  // no `cwd`. A call whose files all arrived has nothing to explain; a caller
-  // that named its own `cwd` got an ordinary no-match, and sending it to cwd
-  // and GLM_MCP_ROOTS would point at the wrong fix. The hint does not vary
-  // with anything on disk — it follows the no-match note, which #26 already
-  // keeps identical across the absent and unreadable worlds, so adding it
-  // here opens no oracle the merged wording did not already close. Filed
-  // under `paths.length`, one past every real argument, so the sort puts it
-  // last: it explains the answers, it is not one.
-  if (matchedNothing && !cwdSupplied) {
+  // all three hold — some pattern-shaped argument matched nothing, the caller
+  // supplied no `cwd`, and the call DELIVERED NOTHING. The third is the
+  // second round's, and it is decided on the call's whole outcome rather
+  // than any one argument's: `['*.md', '*.md']` against a directory that has
+  // a.md returns a.md and still owes the duplicate a no-match note, and a
+  // hint beside delivered content sends the caller hunting elsewhere for
+  // files already in its reply. "This argument matched nothing" and "this
+  // call found nothing" are different facts, and only the second says the
+  // search may have run somewhere the caller never meant. `chunks` is empty
+  // exactly when no content was delivered, and that is already caller-visible
+  // in the reply — so the eligibility stays a function of the caller's own
+  // syntax, its own `cwd` and output it already has, opening no oracle the
+  // merged wording did not already close. A caller that named its own `cwd`
+  // got an ordinary no-match, and sending it to cwd and GLM_MCP_ROOTS would
+  // point at the wrong fix. Filed under `paths.length`, one past every real
+  // argument, so the sort puts it last: it explains the answers, it is not
+  // one.
+  if (unmatchedPattern && !cwdSupplied && chunks.length === 0) {
     notes.push({ arg: paths.length, msg: NO_CWD_SEARCH_NOTE });
   }
 
