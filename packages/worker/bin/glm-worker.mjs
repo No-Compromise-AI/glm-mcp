@@ -18,6 +18,7 @@
 //
 //   -p <prompt>              headless prompt (or pass the prompt positionally)
 //   --resume <session_id>    continue a prior session
+//   --max-turns <n>          stop the agent loop after n turns
 //   --permission-mode <m>    passed through to the SDK
 //   --allowedTools <t>...    variadic list, as glm-task passes it
 //   --add-dir <dir>          extra writable directory (repeatable)
@@ -42,6 +43,7 @@ const USAGE = `usage: glm-worker [-p <prompt>] [options]
 
   -p <prompt>              headless prompt (or pass the prompt positionally)
   --resume <session_id>    continue a prior session
+  --max-turns <n>          stop the agent loop after n turns
   --permission-mode <m>    passed through to the SDK
   --allowedTools <t>...    variadic tool allowlist
   --add-dir <dir>          extra writable directory (repeatable)
@@ -109,6 +111,7 @@ process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ||= '1';
 const args = process.argv.slice(2);
 let prompt = '';
 let resume = '';
+let maxTurns;
 let permissionMode = '';
 let model = '';
 let outputFormat = 'text';
@@ -124,6 +127,7 @@ for (let i = 0; i < args.length; i++) {
   switch (a) {
     case '-p': case '--print': prompt = value(); break;
     case '--resume': resume = value(); break;
+    case '--max-turns': maxTurns = Number(value()); break;
     case '--permission-mode': permissionMode = value(); break;
     case '--model': model = value(); break;
     case '--output-format': outputFormat = value(); break;
@@ -157,6 +161,16 @@ const withErrorField = (message) => {
       ? (message.errors?.join('\n') || message.result || message.subtype || '')
       : false;
   }
+  // `result` too, and for the same reason. The SDK's SDKResultError variants
+  // carry `errors` and NO `result` at all — so a native SDK failure produced a
+  // record missing the one field glm-task reads for what the agent said, and
+  // the row recorded an empty string for a run that had plenty to say. The
+  // host CLI's line always had it; consumers were written against that.
+  if (!('result' in message)) {
+    message.result = message.is_error
+      ? (message.errors?.join('\n') || message.subtype || '')
+      : '';
+  }
   return message;
 };
 
@@ -179,6 +193,7 @@ try {
     options: {
       cwd: process.cwd(),
       ...(resume ? { resume } : {}),
+      ...(Number.isFinite(maxTurns) ? { maxTurns } : {}),
       ...(permissionMode ? { permissionMode } : {}),
       ...(model ? { model } : {}),
       ...(allowedTools.length ? { allowedTools } : {}),

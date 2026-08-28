@@ -17,7 +17,7 @@
 // agent loop and executing its REAL Write tool; only the model's tokens are
 // synthetic. Measured: two agent-loop turns, no network, no key, ~50ms.
 //
-// TWO THINGS THIS GATE LEARNED THE HARD WAY, both now encoded as rules:
+// THREE THINGS THIS GATE LEARNED THE HARD WAY, all now encoded as rules:
 //
 //   (a) A stub can return {subtype:"success", is_error:false} while NOTHING ran.
 //       Observed directly while building this: the first stub answered Claude
@@ -30,12 +30,22 @@
 //       that only cover the worker would pass while review and resume still die
 //       on a missing executable. Rule 4 is stated over the tree for that reason.
 //
+//   (c) A failure the GATE causes is not the failure the code will meet. Rule
+//       2b first made the upstream refuse the request, which makes the SDK
+//       throw — and the worker's catch block builds its own record by hand, so
+//       of course it had every field. Reverting the fix the rule existed for
+//       left it green. The untested shape was the SDK's OWN error result, which
+//       arrives as an ordinary message carrying `errors` and no `result`. The
+//       rule now reaches it through the turn ceiling.
+//
 // Rules, stated as what an operator on a bare machine observes:
 //   1. a delegated task that REQUIRES TOOL USE completes with no host CLI on
 //      PATH, and the evidence is the file on disk, not the exit status;
 //   2. the result record carries every field glm-task projects into the ledger —
 //      derived from glm-task's own res.get(...) calls, so a consumer that starts
-//      reading a fifth field fails this gate instead of silently getting null;
+//      reading a fifth field fails this gate instead of silently getting null —
+//      and 2b holds the SAME contract on the path that FAILS, which is the path
+//      the ledger exists for;
 //   3. the session id RESUMES and carries prior state, because glm-answer's
 //      whole purpose is continuing a worker that stopped to ask something;
 //   4. no call site on the delegate -> review -> answer path requires a host
@@ -60,6 +70,7 @@ const SHIMBIN = join(WORK, 'shim-bin');
 const TARGET = join(WORK, 'written-by-a-real-tool.txt');
 
 let upstream;
+let upstreamNeverFinishes = false;   // flipped to exercise the SDK's OWN error result (rule 2b)
 const requests = [];
 
 try {
@@ -99,6 +110,26 @@ try {
     req.on('end', () => {
       let body = null; try { body = JSON.parse(raw); } catch { /* not JSON */ }
       if (req.method !== 'POST' || !body) { res.statusCode = 200; return res.end('{}'); }
+
+      // Never end_turn: every reply is another tool_use, so the loop can only
+      // stop by hitting the turn ceiling — which is how the SDK produces its
+      // own error result rather than throwing.
+      if (upstreamNeverFinishes) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'text/event-stream');
+        sse(res, 'message_start', { type: 'message_start', message: { id: 'm', type: 'message',
+          role: 'assistant', model: 'glm-4.6', content: [], stop_reason: null, stop_sequence: null,
+          usage: { input_tokens: 5, output_tokens: 0 } } });
+        sse(res, 'content_block_start', { type: 'content_block_start', index: 0,
+          content_block: { type: 'tool_use', id: `spin-${requests.length}`, name: 'Read', input: {} } });
+        sse(res, 'content_block_delta', { type: 'content_block_delta', index: 0,
+          delta: { type: 'input_json_delta', partial_json: JSON.stringify({ file_path: TARGET }) } });
+        sse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+        sse(res, 'message_delta', { type: 'message_delta',
+          delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 9 } });
+        sse(res, 'message_stop', { type: 'message_stop' });
+        return res.end();
+      }
 
       const convo = JSON.stringify(body.messages || []);
       const hasWrite = (body.tools || []).some((t) => t && t.name === 'Write');
@@ -224,6 +255,39 @@ try {
     // every successful run as broken.
     if (result.is_error === true || (result.subtype != null && result.subtype !== 'success')) {
       fail(`#90: the worker wrote the file and returned a well-formed record that reports FAILURE — is_error=${JSON.stringify(result.is_error)}, subtype=${JSON.stringify(result.subtype)}. glm-task:191 fails the delegation on exactly that pair, so every run would be recorded as failed while the work itself succeeded.`);
+    }
+
+    // ---- rule 2b: the SAME contract on the path that FAILS
+    // Checking the shape only where everything worked is how the failure path
+    // ships unexamined, and the failure path is the one the ledger exists for.
+    // Found exactly this way: the SDK's own error results carry `errors` and no
+    // `result` at all, so a native failure produced a record missing the field
+    // glm-task reads for what the agent said — and the row said nothing about a
+    // run that had plenty to say. A run that fails must still be RECORDABLE.
+    // Reached through the TURN CEILING, not through a refused request. That
+    // distinction is the whole rule: a refused request makes the SDK THROW, and
+    // the worker's catch block builds its own record by hand — which of course
+    // has every field, because the same author wrote both. The first version of
+    // this rule did that and could not fail: reverting the fix it was written
+    // for left it green. The SDK's OWN error results are the untested shape,
+    // they arrive as ordinary result messages, and they carry `errors` with no
+    // `result` at all — confirmed against the locked SDK's SDKResultError.
+    upstreamNeverFinishes = true;
+    const failed = await runWorker([...WORKER_ARGS(`${SENTINEL}: this run cannot finish`), '--max-turns', '2']);
+    upstreamNeverFinishes = false;
+    if (failed.code === 0) {
+      fail(`#90: the upstream refused every request and the worker exited 0. A delegation that could not run must not report success — glm-drain ships on a zero exit.`);
+    }
+    const failResult = resultLineOf(failed.out);
+    if (!failResult) {
+      fail(`#90: the run failed and the worker emitted no {"type":"result"} line, so the ledger row carries null turns, null duration and no session. That reads as "nothing happened" rather than "this broke", and it is the difference between an operator retrying and an operator never knowing.\n  stderr: ${failed.err.slice(-400)}`);
+    }
+    const missingOnFailure = [...required].filter((k) => !(k in failResult));
+    if (missingOnFailure.length > 0) {
+      fail(`#90: the FAILURE record is missing ${JSON.stringify(missingOnFailure)} — the success record carries the full set, so the two paths disagree about their own contract. glm-task projects the same ${JSON.stringify([...required])} regardless of how the run ended, and reads \`result\` for what the agent said; a failure that omits it is recorded as a run that said nothing.\n  got: ${JSON.stringify(Object.keys(failResult))}`);
+    }
+    if (failResult.is_error !== true) {
+      fail(`#90: the upstream refused every request and the result record says is_error=${JSON.stringify(failResult.is_error)}. glm-task branches on that field; a failure that describes itself as a success is worse than no record at all.`);
     }
   }
 
