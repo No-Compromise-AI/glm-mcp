@@ -95,7 +95,7 @@ Two things it is genuinely good at:
 | arg | type | default | notes |
 | --- | --- | --- | --- |
 | `prompt` | string | — | required |
-| `files` | string[] | — | files to include as context: literal paths and/or globs (`src/**/*.ts`, `*.md`, `{lib,src}/*.ts`) |
+| `files` | string[] | — | files to include as context, each numbered `cat -n` style: literal paths (optionally with an inclusive line range, `src/auth/session.ts:40-120`) and/or globs (`src/**/*.ts`, `*.md`, `{lib,src}/*.ts`) |
 | `cwd` | string | server cwd | what relative `files` resolve against |
 | `model` | string | `glm-5.3` | any id from `glm_models` |
 | `reasoning` | `none`\|`low`\|`high`\|`max` | `low` | higher is slower |
@@ -207,6 +207,21 @@ to control where your key is sent — see [Errors and endpoints](#errors-and-end
 `files` accepts literal paths and glob patterns, mixed freely. Matches are sorted and
 de-duplicated by file identity across the whole list, so overlapping patterns never send the
 same file twice.
+
+Every file arrives **with line numbers, `cat -n` style** — each line prefixed with its own
+number, so an answer like `session.ts:88 reads expiresAt before taking the lock` cites a line
+the model can actually see rather than one it had to count blind. The example answer above is
+a description of what comes back, not an aspiration.
+
+A literal path may name a **line range**: `src/auth/session.ts:40-120` sends lines 40 through
+120, both ends inclusive, and nothing outside them. The excerpt keeps the **file's** numbering
+— those lines arrive numbered 40 to 120, never renumbered from 1 — so a citation against an
+excerpt points exactly where it would against the whole file. A range is how you send one
+region of a large file without the rest, which also cuts prefill and helps latency. A path
+that exists on disk is still read literally even when its name ends in something a range
+could be parsed out of: a real `weird:10-20.txt` is a filename, the same rule literal paths
+already have against glob characters. A range that names nothing readable is reported in
+`Notes` in your own spelling, exactly like a missing file.
 
 **Supported syntax:** `*`, `**`, `?`, `[a-z]`, `[!a-z]`, `{a,b}`, and `\` escapes.
 

@@ -153,9 +153,11 @@ out.len = c.text.length; out.notes = c.notes; out.cap = glm.MAX_FILE_CHARS;`, en
     fail(`#35: the default input budget is ${dflt.cap} chars — at ~3 chars/token that is ~${Math.round(dflt.cap / 3 / 1000)}k of a 1,048,576-token window. Size it to the window.`);
   }
   // Exact, but computed rather than written down: #19 made the header part of
-  // the assembled text, so an untruncated read is the body plus its header. A
-  // lower bound would accept a duplicated or padded result as success.
-  const expected = 1_500_000 + '--- big.txt ---\n'.length;
+  // the assembled text, so an untruncated read is the body plus its header —
+  // and #53 gave every line a number, so a one-line file's body grows by its
+  // `1\t` prefix. A lower bound would accept a duplicated or padded result as
+  // success.
+  const expected = 1_500_000 + '--- big.txt ---\n'.length + '1\t'.length;
   if (dflt.len !== expected) {
     fail(`#35: a 1.5M-char file assembled to ${dflt.len}, expected exactly ${expected} (body plus its header) — ${JSON.stringify(dflt.notes)}`);
   }
