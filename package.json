@@ -1,6 +1,6 @@
 {
   "name": "@nocompromiseai/glm-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "MCP server exposing Z.ai GLM models (GLM-5.3 and siblings) as tools inside Claude Code, Claude Desktop, Codex and Antigravity.",
   "type": "module",
   "bin": {

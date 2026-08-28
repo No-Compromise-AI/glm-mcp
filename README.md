@@ -29,19 +29,19 @@ per-project setup.
 **Claude Code / Claude Desktop**
 
 ```bash
-claude mcp add --scope user glm -- npx -y @nocompromiseai/glm-mcp@0.4.0
+claude mcp add --scope user glm -- npx -y @nocompromiseai/glm-mcp@0.5.0
 ```
 
 **Codex**
 
 ```bash
-codex mcp add glm -- npx -y @nocompromiseai/glm-mcp@0.4.0
+codex mcp add glm -- npx -y @nocompromiseai/glm-mcp@0.5.0
 ```
 
 **Antigravity**
 
 ```bash
-agy mcp add glm -- npx -y @nocompromiseai/glm-mcp@0.4.0
+agy mcp add glm -- npx -y @nocompromiseai/glm-mcp@0.5.0
 ```
 
 One caveat that decides whether file context works at all, per host. This server confines
@@ -57,7 +57,7 @@ so where the host launches it matters:
 For Antigravity, set the roots at registration:
 
 ```bash
-agy mcp add -e GLM_MCP_ROOTS=/abs/path/one:/abs/path/two glm -- npx -y @nocompromiseai/glm-mcp@0.4.0
+agy mcp add -e GLM_MCP_ROOTS=/abs/path/one:/abs/path/two glm -- npx -y @nocompromiseai/glm-mcp@0.5.0
 ```
 
 Note that `GLM_MCP_ROOTS` bounds where a caller may point `cwd`; it does not exempt the launch
