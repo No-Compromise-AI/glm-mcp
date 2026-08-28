@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# glm-drain — work a backlog unattended: delegate each item to glm-task, ship
+# what passes, park what needs a human, and stop the line when main looks broken.
+#
+#   glm-drain -i 65,67,71              # GitHub issues (needs gh)
+#   glm-drain -I 101,102 -j 3 -n 10    # raw ids, no network
+#
+#   -i <nums>   issue numbers; title+body become the item's spec (needs gh)
+#   -I <ids>    raw item ids, treated as opaque — no GitHub, works offline
+#   -j <n>      concurrent workers (default 2, HARD CEILING 4; above is refused)
+#   -n <n>      stop after this many items
+#   -T <secs>   stop launching new work after this many seconds
+#   -v <cmd>    verify command passed through to glm-task
+#
+# Runs overnight with nobody watching, which is the whole design constraint:
+# every decision below must be one you would be happy to find had been made
+# automatically at 3am. Two consequences run through the file:
+#
+#   * a BLOCKED item never stops the drain — it is parked, with its question,
+#     and the next item starts. The question is NOT answered here; a wrong
+#     auto-answer is worse than a pause.
+#   * one credential, one account, no rotation. Concurrency reacts to the
+#     provider's pressure and never probes upward: after a rate limit it drops
+#     to 1 and stays there for the rest of the run.
+#
+# Exit codes from glm-task are the whole scheduler:
+#   0 done        ship it ($GLM_SHIP_CMD -m -R)          1 failed    one retry, then park
+#   2 UNREVIEWED  park — never ship, nothing checked it   3 no reviewer  requeue with backoff
+#   4 BLOCKED     park with the question, continue        5 RATE LIMITED  requeue with backoff,
+#                                                                attempt not consumed
+# PARKED entries (session_id + worktree) go to $GLM_DRAIN_STATE_DIR/parked.jsonl;
+# glm-answer resumes a session id inside the worktree, so without both fields
+# "parked" means "lost".
+#
+# Written for bash 3.2, as the rest of bin/ is: no associative arrays, and every
+# array expansion carries its own default so `set -u` does not trip on an empty
+# one. Concurrency is background jobs, each writing one result file, polled from
+# a single loop that owns every scheduling decision.
+set -uo pipefail
+
+__self="${BASH_SOURCE[0]}"
+while [[ -L "$__self" ]]; do
+  __dir="$(cd -P "$(dirname -- "$__self")" && pwd)"
+  __self="$(readlink -- "$__self")"
+  [[ "$__self" != /* ]] && __self="$__dir/$__self"
+done
+HERE="$(cd -P "$(dirname -- "$__self")" && pwd)"
+
+TASK_CMD="${GLM_TASK_CMD:-$HERE/glm-task}"
+SHIP_CMD="${GLM_SHIP_CMD:-$HERE/glm-ship}"
+STATE_DIR="${GLM_DRAIN_STATE_DIR:-$HOME/.claude-glm}"
+BACKOFF_BASE="${GLM_DRAIN_BACKOFF_BASE:-60}"
+OFFLINE="${GLM_DRAIN_OFFLINE:-0}"
+MAX_FAILS="${GLM_DRAIN_MAX_FAILS:-2}"
+
+JOBS=2; ISSUES=""; RAWIDS=""; MAXITEMS=0; TSECS=0; VERIFY=""
+while getopts "i:I:j:n:T:v:h" opt; do
+  case "$opt" in
+    i) ISSUES="$OPTARG" ;; I) RAWIDS="$OPTARG" ;;
+    j) JOBS="$OPTARG" ;; n) MAXITEMS="$OPTARG" ;; T) TSECS="$OPTARG" ;;
+    v) VERIFY="$OPTARG" ;;
+    h) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -22; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# The ceiling is refused, not clamped: an operator who believes they are running
+# 9 wide while actually running 4 has been told something untrue — and widening
+# past 4 on one credential is exactly the limit-circumvention this tool refuses.
+case "$JOBS" in
+  ''|*[!0-9]*) echo "glm-drain: -j wants a number, got '$JOBS'" >&2; exit 2 ;;
+esac
+if [[ "$JOBS" -lt 1 ]]; then echo "glm-drain: -j must be at least 1" >&2; exit 2; fi
+if [[ "$JOBS" -gt 4 ]]; then
+  echo "glm-drain: refusing -j $JOBS — the ceiling is 4. One credential cannot go wider without circumventing the provider's rate limits; pass -j 4 or lower." >&2
+  exit 2
+fi
+
+[[ -n "$ISSUES$RAWIDS" ]] || { echo 'usage: glm-drain [-i issues] [-I ids] [-j n] [-n n] [-T secs] [-v cmd]' >&2; exit 2; }
+mkdir -p "$STATE_DIR" || exit 2
+PARKED="$STATE_DIR/parked.jsonl"
+RESDIR="$(mktemp -d "${TMPDIR:-/tmp}/glm-drain-XXXXXX")" || exit 2
+trap 'rm -rf "$RESDIR"' EXIT
+
+jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\r\t' '   '; }
+DONE=0; SKIPPED=0; CONSEC=0; HALT=""
+P_BLOCK=0; P_UNREV=0; P_FAIL=0; P_HALT=0
+park() { # $1 id  $2 reason  $3 session  $4 worktree  $5 question
+  printf '{"item":"%s","session_id":"%s","worktree":"%s","reason":"%s","question":"%s","ts":"%s"}\n' \
+    "$(jesc "$1")" "$(jesc "$3")" "$(jesc "$4")" "$(jesc "$2")" "$(jesc "$5")" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$PARKED"
+  case "$2" in
+    blocked) P_BLOCK=$((P_BLOCK+1)) ;; unreviewed) P_UNREV=$((P_UNREV+1)) ;;
+    failed) P_FAIL=$((P_FAIL+1)) ;; halted) P_HALT=$((P_HALT+1)) ;;
+  esac
+  echo "glm-drain: parked item $1 ($2)" >&2
+}
+
+# Queues, plus a spec list every id is looked up in when it must be requeued —
+# the result file carries outcomes, not task text. READY holds launchable items
+# (FIFO); WAIT holds items backing off after a rate limit or a missing
+# reviewer, with the epoch second each becomes ready at.
+QUEUE=(); QSPEC=(); QRU=(); QRH=()
+WID=(); WSPEC=(); WRU=(); WRH=(); WREADY=()
+ALL_IDS=(); ALL_SPECS=()
+
+add_item() { # $1 id  $2 spec
+  QUEUE=(${QUEUE[@]+"${QUEUE[@]}"} "$1")
+  QSPEC=(${QSPEC[@]+"${QSPEC[@]}"} "$2")
+  QRU=(${QRU[@]+"${QRU[@]}"} 0)
+  QRH=(${QRH[@]+"${QRH[@]}"} 0)
+  ALL_IDS=(${ALL_IDS[@]+"${ALL_IDS[@]}"} "$1")
+  ALL_SPECS=(${ALL_SPECS[@]+"${ALL_SPECS[@]}"} "$2")
+}
+spec_of() { # $1 id -> the item's spec on stdout
+  local i
+  for ((i = 0; i < ${#ALL_IDS[@]}; i++)); do
+    if [[ "${ALL_IDS[$i]}" == "$1" ]]; then printf '%s\n' "${ALL_SPECS[$i]}"; return 0; fi
+  done
+  printf 'drain item %s\n' "$1"
+}
+wait_item() { # $1 id  $2 spec  $3 ru  $4 rh  $5 ready-at (epoch secs)
+  WID=(${WID[@]+"${WID[@]}"} "$1")
+  WSPEC=(${WSPEC[@]+"${WSPEC[@]}"} "$2")
+  WRU=(${WRU[@]+"${WRU[@]}"} "$3")
+  WRH=(${WRH[@]+"${WRH[@]}"} "$4")
+  WREADY=(${WREADY[@]+"${WREADY[@]}"} "$5")
+}
+
+# One item's spec. Raw ids are opaque by design — the drain does not know what
+# they mean, and inventing a task for one at 3am is worse than passing it through.
+for _id in $(printf '%s' "$RAWIDS" | tr ',' ' '); do
+  [[ -n "$_id" ]] && add_item "$_id" "drain item $_id"
+done
+if [[ -n "$ISSUES" ]]; then
+  if [[ "$OFFLINE" == "1" ]]; then
+    echo "glm-drain: GLM_DRAIN_OFFLINE=1 — issue numbers treated as opaque ids, gh not called" >&2
+    for _id in $(printf '%s' "$ISSUES" | tr ',' ' '); do
+      [[ -n "$_id" ]] && add_item "$_id" "drain item $_id"
+    done
+  else
+    command -v gh >/dev/null 2>&1 || { echo "glm-drain: -i needs gh on PATH (or GLM_DRAIN_OFFLINE=1)" >&2; exit 2; }
+    for _id in $(printf '%s' "$ISSUES" | tr ',' ' '); do
+      [[ -n "$_id" ]] || continue
+      _spec="$(gh issue view "$_id" --json title,body --jq '.title + "\n\n" + .body' 2>/dev/null || true)"
+      if [[ -z "$_spec" ]]; then
+        # Parking, not guessing: a spec the drain invented is a task nobody chose.
+        echo "glm-drain: could not read issue #$_id — parked for the human" >&2
+        park "$_id" blocked "" "" "glm-drain could not fetch issue #$_id (gh issue view failed)"
+        continue
+      fi
+      add_item "$_id" "GitHub issue #$_id — $_spec"
+    done
+  fi
+fi
+
+# Seconds to wait before the next attempt. Honours a wait the provider actually
+# named over any guess of ours; otherwise exponential from the base with upward
+# jitter, capped at 30 minutes. The +1 keeps a whole-second clock from rounding
+# a backoff down into the refusal it exists to respect.
+backoff_wait() { # $1 backoffs taken  $2 provider-asked secs ("" if none)
+  local w=$BACKOFF_BASE k=0
+  if [[ -n "$2" && "$2" =~ ^[0-9]+$ && "$2" -gt 0 ]]; then
+    w="$2"
+  else
+    while [[ $k -lt $1 ]]; do w=$((w * 2)); k=$((k + 1)); done
+    [[ $w -gt 1800 ]] && w=1800
+    w=$((w + RANDOM % (w / 4 + 1)))
+  fi
+  echo $((w + 1))
+}
+
+# Run one item and report back through a file in $RESDIR. Parses the two lines
+# glm-task guarantees on stderr — the isolated worktree on the way in, the run
+# line with the session id on the way out — because a parked entry without both
+# is unrecoverable later.
+run_item() { # $1 id  $2 spec  $3 ru  $4 rh
+  local id="$1" spec="$2" ru="$3" rh="$4" rc=0
+  local session="" worktree="" question="" asked=""
+  local err="$RESDIR/err.$$.$RANDOM"
+  local args=(-W -b "glm/item-$id")
+  [[ -n "$VERIFY" ]] && args=("${args[@]}" -v "$VERIFY")
+  # ITEM=<id> is its own argument: callers read the id back out of argv, so it
+  # must arrive as one token, with the spec beside it — glm-task joins them.
+  args=("${args[@]}" -r auto "ITEM=$id" "$spec")
+  "$TASK_CMD" "${args[@]}" >"$err" 2>&1 || rc=$?
+  session="$(sed -n 's/^glm-task: run dir=[^ ]* session=\([^ ]*\) .*/\1/p' "$err" | tail -1)"
+  worktree="$(sed -n 's/^glm-task: isolated worktree=\([^ ]*\) .*/\1/p' "$err" | tail -1)"
+  question="$(sed -n 's/.*"level":"blocked","msg":"\([^"]*\)".*/\1/p' "$err" | tail -1)"
+  [[ -z "$question" ]] && question="$(sed -n 's/^.*\[blocked\] \(.*\)$/\1/p' "$err" | tail -1)"
+  asked="$(sed -n 's/.*It asked for \([0-9][0-9]*\)s\{0,1\}\..*/\1/p' "$err" | tail -1)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$ru" "$rh" "$rc" "$session" "$worktree" \
+    "$(printf '%s' "$question" | tr '\t\n\r' '   ')" "$asked" > "$RESDIR/res-$$.$RANDOM$RANDOM" 2>/dev/null
+  rm -f "$err"
+}
+
+# Ships only ever happen here, in the scheduling loop — never from a worker —
+# so at most one glm-ship runs at a time even at -j 4, and the next item's CI
+# runs against a main that already contains the last merge.
+ship_item() { # $1 id  $2 worktree
+  echo "glm-drain: shipping item $1" >&2
+  "$SHIP_CMD" -C "$2" -b "glm/item-$1" -m -R
+}
+
+# React to provider pressure: pin concurrency to 1 for the REST of the run and
+# hold new launches until the backoff expires, then retry the item. Backing off
+# and immediately widening again is the same evasion done more slowly, so the
+# drop is permanent — the queue still drains, one item at a time.
+throttle() { # $1 id  $2 ru the retry keeps  $3 rh  $4 asked-secs  $5 why
+  if [[ "$JOBS" != "1" ]]; then
+    echo "glm-drain: $5 — concurrency pinned to 1 for the rest of the run" >&2
+  fi
+  JOBS=1
+  local until=$((NOW + $(backoff_wait "$3" "$4")))
+  (( until > HOLD_UNTIL )) && HOLD_UNTIL=$until
+  wait_item "$1" "$(spec_of "$1")" "$2" "$(($3 + 1))" "$HOLD_UNTIL"
+}
+
+RUNNING=0; STARTED=0; HOLD_UNTIL=0; NOW=$(date +%s)
+
+# ---- the loop -------------------------------------------------------------
+while :; do
+  NOW=$(date +%s)
+
+  # Collect results first — a freed slot should be refillable in the same pass.
+  for res in "$RESDIR"/res-*; do
+    [[ -e "$res" ]] || continue
+    IFS=$'\t' read -r id ru rh rc session worktree question asked < "$res"
+    [[ -n "$id" ]] || continue    # mid-write; picked up on the next poll
+    rm -f "$res"
+    RUNNING=$((RUNNING - 1))
+    echo "glm-drain: item $id -> exit $rc" >&2
+
+    # Once the line has stopped, nothing requeues — it would only park again.
+    # A finished item still ships: its own verify and review passed, and that
+    # says more about it than the halt says about the rest of the queue.
+    if [[ -n "$HALT" && "$rc" != "0" ]]; then
+      park "$id" halted "$session" "$worktree" "drain halted with this item in flight (exit $rc): $HALT"
+      continue
+    fi
+
+    case "$rc" in
+      0)  # done. Ship it; a failed ship is a failure like any other.
+          if [[ -n "$worktree" ]] && ship_item "$id" "$worktree" >&2; then
+            DONE=$((DONE + 1)); CONSEC=0
+          else
+            echo "glm-drain: ship FAILED for item $id" >&2
+            park "$id" failed "$session" "$worktree" "glm-ship exited non-zero"
+            CONSEC=$((CONSEC + 1))
+          fi
+          ;;
+      1)  # failed. One retry, then park as failed.
+          if (( ru < 1 )); then
+            echo "glm-drain: item $id failed once — one retry" >&2
+            QUEUE=("$id" ${QUEUE[@]+"${QUEUE[@]}"})
+            QSPEC=("$(spec_of "$id")" ${QSPEC[@]+"${QSPEC[@]}"})
+            QRU=(1 ${QRU[@]+"${QRU[@]}"})
+            QRH=("$rh" ${QRH[@]+"${QRH[@]}"})
+          else
+            park "$id" failed "$session" "$worktree" "$question"
+            CONSEC=$((CONSEC + 1))
+          fi
+          ;;
+      2)  # UNREVIEWED. Never ship: with auto-merge on, shipping this is the
+          # difference between a drain and an accident.
+          park "$id" unreviewed "$session" "$worktree" "$question"
+          ;;
+      3)  # no reviewer anywhere. Requeue with backoff; after five, the human
+          # decides whether to keep waiting — that call is not ours to make.
+          if (( rh >= 5 )); then
+            park "$id" blocked "$session" "$worktree" "no reviewer had capacity after $rh backed-off attempts — keep waiting, or ship unreviewed?"
+          else
+            throttle "$id" "$ru" "$rh" "$asked" "no reviewer had capacity for item $id"
+          fi
+          ;;
+      4)  # BLOCKED. Park with the question and keep going; answering it here,
+          # unattended, is how a wrong guess becomes a merged commit.
+          park "$id" blocked "$session" "$worktree" "$question"
+          ;;
+      5)  # RATE LIMITED. The attempt is not consumed: throttling says nothing
+          # about the change, so the retry does not burn the item's one retry.
+          throttle "$id" "$ru" "$rh" "$asked" "rate limited on item $id (attempt not consumed)"
+          ;;
+      *)  # An exit code the contract does not define — glm-task crashed or was
+          # killed mid-run, and the run produced no information about the
+          # change. Retry the item once, after a backoff, narrowed: an
+          # unexplained exit is exactly when an unattended driver must not keep
+          # pressing at full width. A second undefined exit parks as failed.
+          if (( ru < 1 )); then
+            throttle "$id" 1 "$rh" "$asked" "glm-task exited $rc on item $id — undefined exit"
+          else
+            park "$id" failed "$session" "$worktree" "glm-task exited $rc twice"
+            CONSEC=$((CONSEC + 1))
+          fi
+          ;;
+    esac
+
+    # STOP THE LINE. Merges are automatic, so a bad item must not become the
+    # base for the rest of the night.
+    if (( CONSEC >= MAX_FAILS )) && [[ -z "$HALT" ]]; then
+      HALT="$CONSEC consecutive failed items — main may be broken; refusing to build the rest of the night on it"
+      echo "glm-drain: HALT — $HALT" >&2
+      for ((i = 0; i < ${#QUEUE[@]}; i++)); do
+        park "${QUEUE[$i]}" halted "" "" "$HALT"
+      done
+      for ((i = 0; i < ${#WID[@]}; i++)); do
+        park "${WID[$i]}" halted "" "" "$HALT"
+      done
+      QUEUE=(); QSPEC=(); QRU=(); QRH=(); WID=(); WSPEC=(); WRU=(); WRH=(); WREADY=()
+    fi
+  done
+
+  # Items whose backoff has expired go back to the front of the ready queue,
+  # ahead of work never tried.
+  _k_id=(); _k_spec=(); _k_ru=(); _k_rh=(); _k_ready=()
+  for ((i = 0; i < ${#WID[@]}; i++)); do
+    if (( ${WREADY[$i]} <= NOW )); then
+      QUEUE=("${WID[$i]}" ${QUEUE[@]+"${QUEUE[@]}"})
+      QSPEC=("${WSPEC[$i]}" ${QSPEC[@]+"${QSPEC[@]}"})
+      QRU=("${WRU[$i]}" ${QRU[@]+"${QRU[@]}"})
+      QRH=("${WRH[$i]}" ${QRH[@]+"${QRH[@]}"})
+    else
+      _k_id=("${_k_id[@]+"${_k_id[@]}"}" "${WID[$i]}")
+      _k_spec=("${_k_spec[@]+"${_k_spec[@]}"}" "${WSPEC[$i]}")
+      _k_ru=("${_k_ru[@]+"${_k_ru[@]}"}" "${WRU[$i]}")
+      _k_rh=("${_k_rh[@]+"${_k_rh[@]}"}" "${WRH[$i]}")
+      _k_ready=("${_k_ready[@]+"${_k_ready[@]}"}" "${WREADY[$i]}")
+    fi
+  done
+  WID=(${_k_id[@]+"${_k_id[@]}"}); WSPEC=(${_k_spec[@]+"${_k_spec[@]}"})
+  WRU=(${_k_ru[@]+"${_k_ru[@]}"}); WRH=(${_k_rh[@]+"${_k_rh[@]}"})
+  WREADY=(${_k_ready[@]+"${_k_ready[@]}"})
+
+  # Fill slots. Everything that says "don't start more" is checked here, in one
+  # place, so no worker can ever widen past what the run has been told.
+  while (( RUNNING < JOBS )) && (( ${#QUEUE[@]} > 0 )); do
+    [[ -n "$HALT" ]] && break
+    (( NOW < HOLD_UNTIL )) && break
+    (( MAXITEMS > 0 && STARTED >= MAXITEMS )) && break
+    (( TSECS > 0 && SECONDS >= TSECS )) && break
+    id="${QUEUE[0]}"; spec="${QSPEC[0]}"; ru="${QRU[0]}"; rh="${QRH[0]}"
+    QUEUE=(${QUEUE[@]+"${QUEUE[@]:1}"}); QSPEC=(${QSPEC[@]+"${QSPEC[@]:1}"})
+    QRU=(${QRU[@]+"${QRU[@]:1}"}); QRH=(${QRH[@]+"${QRH[@]:1}"})
+    (( ru == 0 )) && STARTED=$((STARTED + 1))
+    RUNNING=$((RUNNING + 1))
+    echo "glm-drain: start item $id" >&2
+    run_item "$id" "$spec" "$ru" "$rh" &
+  done
+
+  if (( RUNNING == 0 )); then
+    if (( ${#QUEUE[@]} == 0 && ${#WID[@]} == 0 )); then
+      break
+    fi
+    # -n or -T reached: the rest will never launch — count them and stop.
+    if (( MAXITEMS > 0 && STARTED >= MAXITEMS )) || (( TSECS > 0 && SECONDS >= TSECS )); then
+      SKIPPED=$((SKIPPED + ${#QUEUE[@]} + ${#WID[@]}))
+      echo "glm-drain: reached -n/-T — skipping ${#QUEUE[@]} queued and ${#WID[@]} waiting items" >&2
+      QUEUE=(); QSPEC=(); QRU=(); QRH=(); WID=(); WSPEC=(); WRU=(); WRH=(); WREADY=()
+      continue
+    fi
+    # Otherwise everything left is waiting out a backoff or a rate-limit hold.
+    # Sleep to the earliest moment anything can start, and never spin.
+    _next=$HOLD_UNTIL
+    for ((i = 0; i < ${#WREADY[@]}; i++)); do
+      (( ${WREADY[$i]} < _next )) && _next="${WREADY[$i]}"
+    done
+    (( _next <= NOW )) && _next=$((NOW + 1))
+    sleep $((_next - NOW))
+    continue
+  fi
+  sleep 0.2
+done
+wait
+
+echo "glm-drain: done=$DONE parked=$((P_BLOCK + P_UNREV + P_FAIL + P_HALT)) (blocked=$P_BLOCK unreviewed=$P_UNREV failed=$P_FAIL halted=$P_HALT) skipped=$SKIPPED"
+if [[ -n "$HALT" ]]; then
+  echo "glm-drain: halted — $HALT. Parked items are in $PARKED" >&2
+  exit 1
+fi
+exit 0
