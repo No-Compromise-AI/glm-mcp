@@ -34,6 +34,7 @@
     "verify:lines": "node scripts/verify-lines.mjs",
     "verify:thread": "node scripts/verify-thread.mjs",
     "verify:progress": "node scripts/verify-progress.mjs",
+    "verify:searchroot": "node scripts/verify-searchroot.mjs",
     "verify:api": "node scripts/verify-api.mjs",
     "verify:capacity": "node scripts/verify-capacity.mjs",
     "verify:disclosure": "node scripts/verify-disclosure.mjs",
