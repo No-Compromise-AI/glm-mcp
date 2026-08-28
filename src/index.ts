@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import {
@@ -16,6 +18,7 @@ import {
   type AskResult,
   type Reasoning,
 } from "./glm.js";
+import { DEFAULT_PROGRESS_MS, envLimit } from "./limits.js";
 import { buildReviewPrompt, minSubstance, substanceOf, verdictOf } from "./review.js";
 
 // Read rather than repeated: a literal here drifts from package.json on every
@@ -48,6 +51,77 @@ const usageFooter = (result: AskResult): string =>
     .filter(Boolean)
     .join(" · ");
 
+/**
+ * The heartbeat's cadence (#43): GLM_MCP_PROGRESS_MS, or five seconds. An
+ * unparsable value falls back the way every environment limit does (#24) —
+ * Number("abc") is NaN, and NaN as an interval is not a slow heartbeat but
+ * none at all, because every scheduling comparison against it is false.
+ */
+function progressIntervalMs(): number {
+  return envLimit("GLM_MCP_PROGRESS_MS", DEFAULT_PROGRESS_MS);
+}
+
+/**
+ * Beat `notifications/progress` to the client that asked for them, while a
+ * call to GLM is in flight (#43). GLM-5.3 at reasoning "max" over a near-full
+ * context window runs for many minutes, and a caller that cannot tell
+ * "working" from "hung" kills the call — or the session — while the model is
+ * still working, and a killed call delivers nothing at all, because nothing
+ * was ever delivered. The heartbeat is what the caller reads in place of the
+ * silence.
+ *
+ * The TOKEN is the client's own ask, and the whole ask: MCP has a client say
+ * it wants progress by sending `_meta.progressToken` on the request, and
+ * unsolicited progress is a protocol violation rather than a courtesy. No
+ * token returns a no-op stop — the call proceeds exactly as before and
+ * nothing is sent to a client that stayed silent.
+ *
+ * It is a heartbeat, not a stream and not an announcement: one notification
+ * per {@link progressIntervalMs} while the call lasts. A single beat at the
+ * start would tell a caller the request was accepted, not that it is still
+ * alive — the second beat is what distinguishes "working" from "hung" — and
+ * a beat per token would hand the transport a stream to absorb, in the name
+ * of the quiet the notification exists to buy. What a time-based heartbeat
+ * knows is time, so `progress` is milliseconds elapsed and `total` is
+ * omitted: a fraction of an unknown denominator is a number pretending to be
+ * information.
+ *
+ * Tokens-so-far would be the honest progress signal, and it needs streaming —
+ * deliberately not this change. The issue names it a later upgrade, and the
+ * request path it would rework is the one #51's prefix caching and #52's
+ * threads are shaped around; a heartbeat sends nothing to z.ai that was not
+ * already being sent.
+ *
+ * The returned stop is the contract's other half: a heartbeat that outlives
+ * its own call is a leak — invisible on one call, and on a busy server every
+ * finished call still beating. Callers stop it in a `finally`, so success,
+ * refusal and failure all silence it; the error path most of all, because
+ * the happy path is the one everybody tests and the orphan hides in the one
+ * nobody does.
+ */
+function heartbeat(
+  extra: RequestHandlerExtra<ServerRequest, ServerNotification>,
+): () => void {
+  const token = extra._meta?.progressToken;
+  if (token === undefined) return () => {};
+  const startedAt = Date.now();
+  const timer = setInterval(() => {
+    // A heartbeat must never kill the call it reports on. The SDK already
+    // no-ops a notification for an aborted request; this catch is for the
+    // transport's own refusal (the client hung up mid-call), which arrives
+    // as a rejection. The call itself fails — or lands — on its own terms.
+    void extra.sendNotification({
+      method: "notifications/progress",
+      params: {
+        progressToken: token,
+        progress: Date.now() - startedAt,
+        message: "GLM is still working",
+      },
+    }).catch(() => {});
+  }, progressIntervalMs());
+  return () => clearInterval(timer);
+}
+
 server.registerTool(
   "glm_ask",
   {
@@ -73,6 +147,34 @@ server.registerTool(
       "and glm-5.3-flash cannot, so 'low' is their shallowest setting.",
     inputSchema: {
       prompt: z.string().describe("The question or instruction to send to GLM."),
+      // #52: the caller owns the history — the issue's preferred half, because
+      // a `messages` array is no state for this server to hold and it survives
+      // the server restarting underneath the caller, where a session id is
+      // and does not. The role is a plain string in the schema on purpose:
+      // the refusal for a role outside "user"/"assistant" is ask()'s to make,
+      // in words that name the caller's own value, rather than a schema
+      // rejection the caller cannot read (#13) — the same layering #36 gives
+      // the over-ceiling max_tokens.
+      messages: z
+        .array(
+          z.object({
+            role: z.string().describe('Who spoke the turn: "user" or "assistant".'),
+            content: z.string().describe("What was said, exactly as it was said."),
+          }),
+        )
+        .optional()
+        .describe(
+          "The conversation so far: prior turns this call continues, in order, " +
+            "each {role, content}. `prompt` stays required and is sent as the FINAL " +
+            "user turn — do not repeat it inside messages. Roles are \"user\" and " +
+            '"assistant"; any other is refused here, before anything is sent, naming ' +
+            "the value you sent. No ordering is imposed — replay a real transcript as " +
+            "it happened. With `files`, the file context rides the FIRST turn and is " +
+            "never repeated on the newest, so the thread keeps a stable prefix: a " +
+            "follow-up reads its context from cache instead of re-prefilling it. The " +
+            "history spends the same character budget as the files, so a long thread " +
+            "leaves less room for file context — the cut is reported in the notes.",
+        ),
       files: z
         .array(z.string())
         .optional()
@@ -144,7 +246,11 @@ server.registerTool(
         ),
     },
   },
-  async ({ prompt, files, cwd, model, reasoning, system, max_tokens }) => {
+  async ({ prompt, files, cwd, model, reasoning, system, max_tokens, messages }, extra) => {
+    // #43: armed before the first byte of work, silenced by the finally on
+    // every exit — success, refusal and failure alike. A no-op for a client
+    // that sent no progress token, so the silent majority notices nothing.
+    const stop = heartbeat(extra);
     try {
       let finalPrompt = prompt;
       const notes: string[] = [];
@@ -155,8 +261,26 @@ server.registerTool(
       // before while every check beneath it stayed green.
       const chosenModel = model ?? DEFAULT_MODEL;
 
+      // #52: the thread the caller owns, copied so the turn carrying the file
+      // context below is this server's object and never a mutation of what
+      // the caller passed. An empty `messages` is no thread at all — the
+      // request stays the single user turn it has always been, exactly as
+      // when the parameter is omitted, so the two paths cannot drift apart.
+      const priorTurns = (messages ?? []).map((m) => ({ role: m.role, content: m.content }));
+      // The thread competes with the files for the same budget (#52, over
+      // #19's rule): measured as sent — the caller's own characters, before
+      // any file context is attached — and spent inside buildFileContext,
+      // where the cap, the cut and the note all live.
+      const historyChars = priorTurns.reduce((n, m) => n + m.content.length, 0);
+
       if (files?.length) {
-        const ctx = buildFileContext(files, cwd ?? process.cwd(), chosenModel);
+        // #67: `cwd` passes through unresolved — undefined included — because
+        // whether the ARGUMENT was present is the fact a no-match note now
+        // turns on, and this is the only place that can know it. Resolving it
+        // to process.cwd() here would erase the one distinction that separates
+        // "nothing matched" from "we looked somewhere else"; buildFileContext
+        // applies the default this tool advertises either way.
+        const ctx = buildFileContext(files, cwd, chosenModel, historyChars);
         notes.push(...ctx.notes);
         // A refused call read nothing. Sending the prompt anyway would answer
         // the question with none of the material it asked about — a silent
@@ -173,11 +297,32 @@ server.registerTool(
             ],
           };
         }
-        if (ctx.text) finalPrompt = `${ctx.text}\n\n---\n\n${prompt}`;
+        if (ctx.text) {
+          if (priorTurns.length > 0) {
+            // #52: the file context rides the FIRST turn, never the newest.
+            // This is why the issue pairs with caching: a stable prefix with a
+            // varying tail is what reads from cache, so the context has to
+            // stay at the front of the thread across every follow-up — move
+            // it to the latest turn and each one re-prefills the whole of it,
+            // which is the cost this parameter exists to remove. Sent on both
+            // ends it would be paid for twice and break the prefix match, so
+            // it is attached here and nowhere else: the final turn carries
+            // the new prompt alone.
+            priorTurns[0] = {
+              role: priorTurns[0].role,
+              content: `${ctx.text}\n\n---\n\n${priorTurns[0].content}`,
+            };
+          } else {
+            finalPrompt = `${ctx.text}\n\n---\n\n${prompt}`;
+          }
+        }
       }
 
       const result = await ask({
         prompt: finalPrompt,
+        // Spread only when a thread exists, so the no-thread call reaches
+        // ask() exactly as it did before #52 — the parameter is additive.
+        ...(priorTurns.length > 0 ? { messages: priorTurns } : {}),
         model: chosenModel,
         reasoning: (reasoning ?? "low") as Reasoning,
         system,
@@ -201,6 +346,8 @@ server.registerTool(
         isError: true,
         content: [{ type: "text" as const, text: `GLM request failed.\n\n${explainError(e)}` }],
       };
+    } finally {
+      stop();
     }
   },
 );
@@ -316,7 +463,13 @@ server.registerTool(
         ),
     },
   },
-  async ({ diff, files, spec, cwd, model, reasoning, max_tokens }) => {
+  async ({ diff, files, spec, cwd, model, reasoning, max_tokens }, extra) => {
+    // #43, and the same heartbeat glm_ask beats: glm_review makes model calls
+    // of the same shape — 'high' reasoning over a large diff is a minutes-long
+    // call too, and a reviewer's caller stares at the same black box. Armed
+    // before the refusals below and silenced by the finally whatever the
+    // outcome, so a review refused before GLM was ever asked never beats.
+    const stop = heartbeat(extra);
     try {
       // The refusal comes before anything else, and before GLM is ever asked
       // (#65): with neither a diff nor files there is no material in front of
@@ -348,8 +501,12 @@ server.registerTool(
       if (files?.length) {
         // The same buildFileContext glm_ask calls — not a reimplementation —
         // so confinement, de-duplication, binary skips and the cap and its
-        // notes are all of it inherited, once, here.
-        const ctx = buildFileContext(files, cwd ?? process.cwd(), chosenModel);
+        // notes are all of it inherited, once, here. `cwd` passes through
+        // unresolved for the same #67 reason as glm_ask's: a review whose
+        // files matched nothing under a mis-launched server is told where the
+        // search ran exactly as an ask is, and by the same fact — whether the
+        // argument was there.
+        const ctx = buildFileContext(files, cwd, chosenModel);
         notes.push(...ctx.notes);
         // A refused call read nothing; sending the review anyway would have
         // the model opine about code it was never shown — a silent failure
@@ -494,6 +651,8 @@ server.registerTool(
         isError: true,
         content: [{ type: "text" as const, text: `GLM request failed.\n\n${explainError(e)}` }],
       };
+    } finally {
+      stop();
     }
   },
 );

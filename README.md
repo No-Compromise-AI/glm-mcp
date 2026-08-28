@@ -144,12 +144,61 @@ Two things it is genuinely good at:
 | arg | type | default | notes |
 | --- | --- | --- | --- |
 | `prompt` | string | — | required |
+| `messages` | `{role, content}[]` | — | the conversation so far, as prior turns this call continues — see below |
 | `files` | string[] | — | files to include as context, each numbered `cat -n` style: literal paths (optionally with an inclusive line range, `src/auth/session.ts:40-120`) and/or globs (`src/**/*.ts`, `*.md`, `{lib,src}/*.ts`) |
 | `cwd` | string | server cwd | what relative `files` resolve against |
 | `model` | string | `glm-5.3` | any id from `glm_models` |
 | `reasoning` | `none`\|`low`\|`high`\|`max` | `low` | higher is slower |
 | `system` | string | — | optional system prompt |
 | `max_tokens` | number | the model's own default (65,536 for GLM-5.3) | hard ceiling on output; see Reasoning |
+
+**A long call reports that it is alive.** GLM-5.3 at `reasoning: "max"` over a
+near-full context window can run for many minutes, and silence for that long
+is indistinguishable from a hang — so if your client passes an MCP progress
+token, the server sends a progress notification every `GLM_MCP_PROGRESS_MS`
+(five seconds by default) while the call is in flight. No token, no
+notifications. The answer itself is unchanged by any of this.
+
+#### Pushing back on an answer
+
+Every call used to be independent, and the natural second-opinion flow is disagreement —
+*"you flagged session.ts:88, but the caller holds the lock."* Re-sending the whole file context
+and hoping the consultant re-derives its own prior reasoning is what `messages` removes: pass
+the conversation so far, and `prompt` as the push-back.
+
+```json
+{
+  "prompt": "You flagged session.ts:88 — but the caller holds the lock across that whole block. Re-read it.",
+  "files": ["src/auth/**/*.ts"],
+  "reasoning": "high",
+  "messages": [
+    { "role": "user", "content": "Does the refresh logic have a race condition? Point at the lines." },
+    { "role": "assistant", "content": "The refresh path in session.ts:88 reads expiresAt before taking the lock ..." }
+  ]
+}
+```
+
+The caller owns the history — there is no server-side session, so nothing is lost when the
+server restarts underneath you. Append each turn as the conversation grows and re-send the
+array; `prompt` stays required and is always sent as the **final user turn**, so never repeat
+it inside `messages`.
+
+- **File context rides the first turn.** With `files` and `messages` together, the context is
+  attached to the thread's *first* turn and never repeated on the newest. A thread is exactly
+  the shape prefix caching rewards, and the prefix stays cacheable only while the context
+  stays at the front — measured on this account, a stable prefix with a varying tail read
+  32,429 input tokens down to 45. Move the context to the latest turn and every follow-up
+  re-prefills it, which is the cost threads exist to remove.
+- **The thread spends the same budget as the files.** Prior turns count against the same
+  character budget (`GLM_MCP_MAX_FILE_CHARS`, or the per-model derivation), so a long thread
+  leaves less room for file context. The history itself is never cut — it is your own record
+  of what was said — the files give way, and the truncation note says so:
+  `truncated at 300 total chars (...; the thread history spent 1200 of it)`.
+- **Roles are checked here, not by z.ai.** Each turn's `role` must be `user` or `assistant`;
+  anything else is refused before anything is sent, naming the value you sent, rather than
+  discovered as a 422 after the round trip. Within that, no ordering is imposed — z.ai
+  accepts an assistant turn first, consecutive turns of one role and a trailing assistant
+  turn — so replay a real transcript as it happened.
 
 ### `glm_review`
 
@@ -187,6 +236,11 @@ reply the output cap severed is refused too, whatever verdict it had already wri
 Pass `spec` where you can. Review against intent is what catches silent scope-narrowing —
 an agent quietly implementing less than was asked while every test still passes — and no
 amount of reading the diff finds that on its own.
+
+Reviews get the same heartbeat `glm_ask` gets: a progress notification every
+`GLM_MCP_PROGRESS_MS` while the reviewer works, sent only to a client that
+passed a progress token. A review is the same minutes-long model call, and its
+caller stares at the same black box without one.
 
 **This server never runs `git`.** The diff comes from the caller. The trust boundary here is
 built around reading files (see [Path confinement](#path-confinement)), and executing a
@@ -323,6 +377,10 @@ to control where your key is sent — see [Errors and endpoints](#errors-and-end
 de-duplicated by file identity across the whole list, so overlapping patterns never send the
 same file twice.
 
+When `glm_ask` is called with a thread (`messages`), the assembled context is attached to the
+thread's **first** turn rather than the newest, so the prefix stays cacheable across
+follow-ups — see [Pushing back on an answer](#pushing-back-on-an-answer).
+
 Every file arrives **with line numbers, `cat -n` style** — each line prefixed with its own
 number, so an answer like `session.ts:88 reads expiresAt before taking the lock` cites a line
 the model can actually see rather than one it had to count blind. The example answer above is
@@ -344,7 +402,18 @@ already have against glob characters. A range that names nothing readable is rep
 - A path that exists on disk is read literally even if its name contains metacharacters — a
   real `report[final].md` is read, not pattern-matched.
 - Hidden (dot) entries match only when the pattern spells the dot out.
-- A pattern matching nothing is reported in `Notes`, exactly like a missing file.
+- A pattern matching nothing is reported in `Notes`, exactly like a missing file — and when the
+  call supplied no `cwd` and nothing else it asked for arrived either, that report also says the
+  search ran in the directory the server was started in and names `cwd` and `GLM_MCP_ROOTS` as
+  the knobs, so a mis-launched server (see the per-host table above) is diagnosable from the
+  reply instead of reading as an ordinary no-match. The knobs are companions, not alternatives:
+  `cwd` moves the search, and `GLM_MCP_ROOTS` widens the roots the new `cwd` must resolve
+  inside — a `cwd` outside the roots is refused until it is widened. The extra sentence belongs
+  to a call that delivered nothing: a duplicate beside its own delivered match, or a no-match
+  beside files that did arrive, reads as the plain no-match it always was, as do a missing file
+  and an empty line range — sending a caller who already has its files to look elsewhere would
+  point at the wrong fix. The note names no path — which directory the server started in is the
+  machine's business, not the caller's.
 - Symlinked directories are followed only when the pattern names one explicitly
   (`linked/*.ts`). Wildcards never follow them, and a link to a directory is never
   listed as a file.
@@ -379,6 +448,7 @@ variable that set it — nothing is ever silently truncated or silently dropped.
 | Wall-clock budget for glob expansion | `GLM_MCP_GLOB_TIMEOUT_MS` | 10,000 |
 | Total `{a,b}` brace expansions | `GLM_MCP_MAX_BRACE_EXPANSIONS` | 1,024 |
 | Request timeout, the whole call — all retries included | `GLM_MCP_TIMEOUT_MS` | 600,000 |
+| Heartbeat interval for progress notifications on a long call | `GLM_MCP_PROGRESS_MS` | 5,000 |
 | Least analysis a `glm_review` verdict may stand on, in characters of the reply beside the verdict line | `GLM_REVIEW_MIN_SUBSTANCE` | 200 |
 
 The character budget is **derived, per model**, not chosen: the context window
@@ -398,6 +468,10 @@ own published window, the window you set with `GLM_MCP_CONTEXT_TOKENS`, or the
 documented assumption for a model whose window nobody has recorded — because
 only the first of those is a fact about the model. Your explicit
 `GLM_MCP_MAX_FILE_CHARS` cap is named as itself.
+
+A thread's prior turns (`messages` to `glm_ask`) spend this same budget before the first
+file is read, so a long thread leaves less room for file context — and the truncation note
+says how much the history spent when it is what crowded the files.
 
 That ratio targets **English and code deliberately** — this is what the project
 is built for. Denser scripts pack more tokens per character (Chinese runs nearer
@@ -424,6 +498,17 @@ the normal case, so the budget is never divided to reserve room for retries
 that may never happen. One residual: the SDK's backoff sleep between attempts
 is not abort-aware, so a deadline that fires during a backoff wait overshoots
 by up to that sleep — bounded by whatever `retry-after` the server sent.
+
+A call that long is otherwise a black box, so `glm_ask` and `glm_review` send
+**MCP progress notifications** while the model works — one every
+`GLM_MCP_PROGRESS_MS` (five seconds by default), each carrying the time
+elapsed, and only to a client that asked by passing a progress token with the
+request. Unsolicited progress is a protocol violation rather than a courtesy;
+a client that sends no token gets none. The heartbeat is time-based, not
+token-based: what it tells you is that the call is still alive, which is what
+you cannot otherwise tell — tokens-so-far would need the request switched to
+streaming. It stops when the call ends, however it ends, and it changes
+nothing about the answer: same text, same usage footer, same notes.
 
 - Only regular files are read. A FIFO, device or socket is refused rather than
   blocking the server on a read that may never return.

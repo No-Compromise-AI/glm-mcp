@@ -705,6 +705,49 @@ function takeUnits(s: string, maxUnits: number): string {
 const skipNote = (p: string): string => `skipped (no matches): ${p}`;
 
 /**
+ * The sentence that separates "nothing matched" from "we looked somewhere
+ * else" (#67). Confinement defaults to the server process's own working
+ * directory at startup — deliberate, since a boundary the caller can set is
+ * not a boundary — but where the server STARTS is the host's choice: Claude
+ * Code uses the project directory, Codex the session directory, and
+ * Antigravity wherever `agy` itself was invoked, which `--add-dir` does not
+ * change. Ask for a project-relative glob from a server started in the wrong
+ * place and the glob matches nothing, the call still succeeds, and the reply
+ * reads as "the model had nothing to say about those files" when the fact is
+ * "this server was looking somewhere else entirely" — two situations that
+ * need completely different fixes and, before this note, shared one wording.
+ *
+ * The obvious remedy — name the root that was searched — is the one #26
+ * forbids: this note crosses the trust boundary to the caller, and under
+ * Antigravity the root IS typically the account's home directory. What the
+ * caller needs instead is a fact about its OWN request, which it already
+ * knows and which is the whole difference between the two situations: did it
+ * supply `cwd`, or did the server fall back to where the host launched it?
+ * Saying the fallback happened discloses nothing, and it is the one thing
+ * that tells the caller which knob to reach for — `cwd`, which moves the
+ * search, with `GLM_MCP_ROOTS`, the operator's escape hatch, widening the
+ * roots the new cwd must resolve inside. The two are companions, never
+ * alternatives: a relative pattern anchors at the cwd wherever the roots
+ * lie, so roots alone leave the search exactly where it ran, and a cwd
+ * outside the roots refuses the call outright. Where the directory the
+ * caller means is already inside the roots — the Antigravity default, where
+ * the boundary IS the startup home — cwd alone is enough; outside them,
+ * both are needed.
+ *
+ * Deciding by whether the ARGUMENT was present is load-bearing, never by
+ * comparing the resolved cwd to the startup directory: a caller that names
+ * the startup directory itself chose its ground as surely as one that names
+ * anywhere else, and it gets the ordinary no-match — the search happened
+ * where it asked, and this sentence would point at the wrong fix.
+ */
+const NO_CWD_SEARCH_NOTE =
+  "no cwd was supplied, so the search ran in the directory this server was " +
+  "started in — pass cwd to search the directory you mean; where that " +
+  "directory lies outside the allowed roots, GLM_MCP_ROOTS must be widened " +
+  "to include it as well: cwd alone is refused there, and GLM_MCP_ROOTS " +
+  "alone does not move the search";
+
+/**
  * How many leading bytes are inspected for a NUL before a file is believed to
  * be text. 8,000 is git's own sniffing length and the conventional one: no
  * human-written text encoding contains a NUL, while nearly every binary
@@ -858,11 +901,27 @@ export interface FileContext {
  * outside every root is the one refusal that cannot proceed: narrowing it to
  * a root would return an empty-but-successful read, the exact silent-failure
  * shape this project has spent the most effort removing.
+ *
+ * `historyChars` (#52) is what a thread riding the same request has already
+ * spent of the character budget — the prior turns glm_ask was handed, measured
+ * as sent. The files assemble into what remains, and a cut the history caused
+ * says so in its note. Zero — the two- and three-argument calls every existing
+ * caller makes — is no thread, and behaves exactly as before.
+ *
+ * `cwd` is undefined-able on purpose (#67): whether it is undefined is a fact
+ * about the CALLER's request — it supplied no `cwd` — that no resolved value
+ * can stand for, because the directory the caller names may BE the startup
+ * directory, and it is what decides whether an answer of `no matches` carries
+ * {@link NO_CWD_SEARCH_NOTE}. Undefined resolves exactly as the tools
+ * advertise the default: the server process's own working directory. The
+ * callers that resolve a cwd of their own pass it as a string and get the
+ * plain no-match, which is the answer their callers asked for.
  */
 export function buildFileContext(
   paths: string[],
-  cwd: string,
+  cwd: string | undefined,
   model: string = DEFAULT_MODEL,
+  historyChars: number = 0,
 ): FileContext {
   // Every note is filed under the argument that produced it, and the notes
   // leave in the order the arguments arrived (#26). Which branch handles an
@@ -876,6 +935,13 @@ export function buildFileContext(
   const notes: Array<{ arg: number; msg: string }> = [];
   const chunks: string[] = [];
   let total = 0;
+
+  // #67: captured BEFORE the default is applied, because the applied value
+  // cannot stand for it — a caller that names the startup directory chose its
+  // ground as surely as one that names anywhere else. Read once, here, and
+  // only ever again by the no-match answer below.
+  const cwdSupplied = cwd !== undefined;
+  cwd ??= process.cwd();
 
   const roots = confineRoots();
   if (roots && !insideRoots(realpathish(cwd), roots)) {
@@ -932,7 +998,23 @@ export function buildFileContext(
   // sized against that model's window rather than the default's million
   // tokens. maxFileChars applies GLM_MCP_MAX_FILE_CHARS over the derivation
   // for every model alike (#35), and an unparsable value falls back (#24).
-  const cap = maxFileChars(model);
+  //
+  // #52: the budget belongs to the REQUEST, not to the files alone. A thread's
+  // prior turns ride the same request as the file context, so they spend the
+  // same budget before the first header is written — a 1,200-character history
+  // under a 1,500-character cap leaves 300 for the files, which is #19's rule
+  // meeting the same interaction #53's line numbers had: what the server
+  // assembles has to fit the budget, whatever else is riding along. The
+  // history itself is never cut — it is the caller's own record of a
+  // conversation that happened, and the answer being pushed back on is the
+  // point of the thread — so the crowding lands on the files, whose
+  // truncation machinery and notes already exist. The remainder floors at
+  // zero: a thread longer than the whole budget leaves the files nothing, not
+  // a negative room for the first header to fit into. The spend is floored at
+  // zero on its own side too, so no caller error can spend a negative history
+  // and buy file context the cap never allowed.
+  const spent = Math.max(0, historyChars);
+  const cap = Math.max(0, maxFileChars(model) - spent);
   // Which bound the cap enforced, for the truncation note at the cut: the
   // window the budget derived from, or the operator's explicit override. A
   // caller routed to a smaller model has to be able to tell "this model's
@@ -1337,7 +1419,15 @@ export function buildFileContext(
       // (#59) — see capWhy above.
       notes.push({
         arg,
-        msg: `truncated at ${cap} total chars (${capWhy}), starting with: ${via}`,
+        // #52: where a thread spent part of the budget before the first header
+        // was written, the note says so — the cut landed below the cap the
+        // caller set, and a caller reading "truncated at 300" against a cap of
+        // 1,500 with no word of why would go looking for a bug in the cap
+        // rather than in the size of its own history. A no-thread call names
+        // no spend, so its note is word-for-word the one it has always been.
+        msg: `truncated at ${cap} total chars (${capWhy}${
+          spent > 0 ? `; the thread history spent ${spent} of it` : ""
+        }), starting with: ${via}`,
       });
       // The cap cut the loop here, so the entries after this one were never
       // attempted. `capCutAt` records whose read was underway (#40): every
@@ -1383,10 +1473,35 @@ export function buildFileContext(
   // answer, so a wording that depended on it would reopen the oracle #26
   // closed: absent, unreadable and simply-never-reached must all produce this
   // same note.
-  const answerNote = (pending: (typeof pendings)[number]): string =>
-    capCutAt >= 0 && pending.arg >= capCutAt
-      ? `skipped (char cap reached, not read): ${pending.via}`
-      : skipNote(pending.via);
+  // #67: whether any PATTERN-shaped argument was answered with the plain
+  // `no matches` — one fact of the hint's eligibility, and the only one
+  // decided per argument. Three answers are deliberately not counted. The
+  // char-cap one: those arguments DID match, and where the search ran is not
+  // why they went unread. Every spelling without glob metacharacters — a
+  // missing literal, a duplicate — because `no matches` is #26's merged
+  // wording for those, and the hint reads as "the wrong directory was
+  // searched", the wrong fix pointed at by the one signal this change exists
+  // to add. And every RANGED spelling, whatever its metacharacters:
+  // `report[final].md:999999-1000000` is glob-shaped by its brackets while
+  // being a ranged ask, and a range that selects no lines of a file that was
+  // found and read is not the search having run elsewhere — the first round
+  // let that spelling's brackets carry it into the pattern branch and hinted
+  // at a directory the caller's own file had already been found in. Ranges
+  // are excluded by SYNTAX alone, found file or not, because pattern-ness
+  // and range-ness are the caller's own facts — the ones the eligibility can
+  // turn on without reopening the oracle the merged wording closed; anything
+  // read off the disk would put the hint's presence where #26 spent its
+  // effort putting nothing. A duplicate pattern's no-match is not settled
+  // here at all: it is excluded by the call's whole outcome, where the hint
+  // is issued.
+  let unmatchedPattern = false;
+  const answerNote = (pending: (typeof pendings)[number]): string => {
+    if (capCutAt >= 0 && pending.arg >= capCutAt) {
+      return `skipped (char cap reached, not read): ${pending.via}`;
+    }
+    if (isGlobPattern(pending.via) && rangeOf(pending.via) === undefined) unmatchedPattern = true;
+    return skipNote(pending.via);
+  };
 
   for (const pending of pendings) {
     // An argument whose walk a limit or a boundary refusal cut short is excused
@@ -1413,12 +1528,42 @@ export function buildFileContext(
     if (!spokenArgs.has(pending.arg)) notes.push({ arg: pending.arg, msg: answerNote(pending) });
   }
 
+  // #67: one hint per call, after every argument's own answer, and only when
+  // all three hold — some pattern-shaped argument matched nothing, the caller
+  // supplied no `cwd`, and the call DELIVERED NOTHING. The third is the
+  // second round's, and it is decided on the call's whole outcome rather
+  // than any one argument's: `['*.md', '*.md']` against a directory that has
+  // a.md returns a.md and still owes the duplicate a no-match note, and a
+  // hint beside delivered content sends the caller hunting elsewhere for
+  // files already in its reply. "This argument matched nothing" and "this
+  // call found nothing" are different facts, and only the second says the
+  // search may have run somewhere the caller never meant. `chunks` is empty
+  // exactly when no content was delivered, and that is already caller-visible
+  // in the reply — so the eligibility stays a function of the caller's own
+  // syntax, its own `cwd` and output it already has, opening no oracle the
+  // merged wording did not already close. A caller that named its own `cwd`
+  // got an ordinary no-match, and sending it to cwd and GLM_MCP_ROOTS would
+  // point at the wrong fix. Filed under `paths.length`, one past every real
+  // argument, so the sort puts it last: it explains the answers, it is not
+  // one.
+  if (unmatchedPattern && !cwdSupplied && chunks.length === 0) {
+    notes.push({ arg: paths.length, msg: NO_CWD_SEARCH_NOTE });
+  }
+
   // The separators were budgeted per chunk above, so joining is the identity:
   // `total` and text.length agree by construction. Notes leave in argument
   // order — see the top of this function.
   notes.sort((a, b) => a.arg - b.arg);
   return { text: chunks.join(""), notes: notes.map((n) => n.msg), refusedCall: false };
 }
+
+/**
+ * The two roles a turn of a thread may carry (#52): the caller's words and
+ * the model's own prior answers. Measured against the live API, z.ai's schema
+ * admits exactly these and answers any other role with a 422 — which is why
+ * ask() refuses one locally, before the round trip.
+ */
+export type TurnRole = "user" | "assistant";
 
 export interface AskArgs {
   prompt: string;
@@ -1430,6 +1575,27 @@ export interface AskArgs {
    * applies (see {@link outputLimits}) — not a constant of ours.
    */
   maxTokens?: number;
+  /**
+   * The conversation so far (#52): prior turns, in order, that this call
+   * continues. `prompt` is appended after them as the final user turn, and
+   * stays required — a thread says what was already said; only `prompt` says
+   * what is being asked now. Omitted (or empty), the request is the single
+   * user turn it has always been, byte for byte: every existing caller is on
+   * that path and must not notice this field exists.
+   *
+   * The roles arrive as plain strings rather than {@link TurnRole} because
+   * they cross a boundary that erases types — MCP hands the tool JSON — so
+   * the guarantee is made at runtime instead: a role outside the union is
+   * refused here, naming the caller's own value, rather than sent for z.ai
+   * to reject with a 422 after the round trip, exactly as #36 refuses an
+   * over-ceiling max_tokens locally. Nothing checks ORDER, on purpose: z.ai
+   * imposes no alternation (measured: assistant-first, two users in a row,
+   * two assistants in a row and a trailing assistant turn are all accepted),
+   * and validation stricter than the upstream turns a working conversation
+   * into an error for no gain — a caller replaying a real transcript would
+   * hit it on the first odd turn.
+   */
+  messages?: Array<{ role: string; content: string }>;
 }
 
 export interface AskResult {
@@ -1448,6 +1614,26 @@ export interface AskResult {
 
 export async function ask(args: AskArgs): Promise<AskResult> {
   const { prompt, model, system } = args;
+
+  // #52: the thread, validated turn by turn — narrowed on the way through, so
+  // the body below is built from values the guard has already approved. A role
+  // outside "user"/"assistant" is refused HERE, before a request exists,
+  // naming the caller's own value: z.ai answers it with a 422 after the round
+  // trip, and spending one to learn what this server already knows is what
+  // #36 refuses the over-ceiling max_tokens for. The guard deliberately has no
+  // opinion about ORDER — first among equals, repeated, trailing — because
+  // z.ai has none (measured, see AskArgs.messages), and a caller replaying a
+  // real transcript must not be refused for the shape the upstream accepts.
+  const turns = (args.messages ?? []).map((turn, i): { role: TurnRole; content: string } => {
+    if (turn.role === "user" || turn.role === "assistant") {
+      return { role: turn.role, content: turn.content };
+    }
+    throw new Error(
+      `messages[${i}] has role ${JSON.stringify(turn.role)}, which is neither "user" nor ` +
+        `"assistant" — the request is refused here rather than rejected by z.ai with a ` +
+        `422 after the round trip. Send the turn as role "user" or "assistant".`,
+    );
+  });
 
   // THINKING_REQUIRED models cannot run with reasoning off: glm-5.3 rejects
   // the request outright (z.ai 1210), glm-5.3-flash accepts it and silently
@@ -1478,10 +1664,16 @@ export async function ask(args: AskArgs): Promise<AskResult> {
   // role outside its union — is a compile error here rather than a runtime
   // error against the live endpoint. The `as never` this replaces switched
   // the compiler off for the whole request.
+  // #52: the caller's history goes first, in order and with its roles —
+  // flattened into one voice, the model cannot tell its own prior answer from
+  // the caller's words — and the new prompt is the final user turn, never
+  // duplicated into the history above it: sent twice, the model would be
+  // answering a question it has already been shown. An empty `messages` is
+  // the no-thread call exactly, so that path cannot drift from this one.
   const body: Anthropic.Messages.MessageCreateParamsNonStreaming = {
     model,
     max_tokens: maxTokens,
-    messages: [{ role: "user", content: prompt }],
+    messages: [...turns, { role: "user", content: prompt }],
   };
   if (system) body.system = system;
 
