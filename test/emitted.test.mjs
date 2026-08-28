@@ -16,7 +16,18 @@
 // still cuts the walk, because what the cap measures is bigger than what `du`
 // reports — so nobody sizes a cap from byte counts again, and a change that
 // quietly stops counting line numbers or headers toward the cap (silently
-// loosening every operator's pin) fails here.
+// loosening every operator's pin) fails here. Measured at exactly that cap on
+// this fixture: 371 files whole, the 372nd truncated mid-body, 28 never read.
+//
+// Those counts are asserted EXACTLY, and that is deliberate. Two review rounds
+// of the change this file accompanies each quoted a figure under conditions
+// that did not produce it — "400 files" under a cap admitting 375, then
+// 376/24, which is the 80,000,000 cap's answer, offered for the 79,200,000
+// cap. The test that stood over the second claim asserted only
+// `delivered > 0 && delivered < FILES`, a range no wrong number can fail.
+// A pin that cannot fail cannot hold a line, so the counts are now numbers,
+// measured at this fixture and this cap; if the accounting drifts by one file,
+// this says which direction rather than shrugging.
 //
 // Second, the README's own claim — the same half of the biconditional
 // verify-blocking holds for the serialisation sentence. The README discloses
@@ -92,14 +103,27 @@ const run = (cap) => {
 test('a cap set to the bytes on disk is still cut: emitted text is longer than bytes read', () => {
   const bytes = FILES * LINE.length * 3_000; // 79,200,000 — exactly what `du` reports
   const r = run(bytes);
-  assert.ok(
-    r.delivered > 0 && r.delivered < FILES,
+  // 372 / 1 / 28, measured: 371 files arrive whole, the 372nd arrives truncated
+  // mid-body (it is `src/f73.ts` — the 372nd spelling in the walk's sorted
+  // order), and the 28 after it are never read. Every number exact, so a drift
+  // of one file in either direction fails here rather than hiding inside a
+  // range. Re-measure if the fixture changes; these are the walk's answers for
+  // THIS fixture at THIS cap, not constants of nature.
+  assert.equal(
+    r.delivered, 372,
     `${FILES} files of ${bytes} bytes assemble to more than ${bytes} CHARACTERS once numbered ` +
-      `and headered, so a cap sized to the byte count cut the walk at ${r.delivered} of ${FILES} files`,
+      `and headered, and the cap sized to the byte count delivered ${r.delivered} of them — ` +
+      `the trap still cuts, but no longer where it did when this number was pinned`,
   );
-  assert.ok(
-    r.truncated >= 1,
-    `the file the cap landed on must be delivered truncated, not dropped whole: ${JSON.stringify(r.notes)}`,
+  assert.equal(
+    r.truncated, 1,
+    `exactly one file — the one the cap landed on — must be delivered truncated, not dropped ` +
+      `whole, and only one: ${JSON.stringify(r.notes)}`,
+  );
+  assert.equal(
+    FILES - r.delivered, 28,
+    `the files after the cut were never read: measured ${FILES - r.delivered} of them against ` +
+      `the 28 this pin holds`,
   );
   assert.ok(
     r.notes.some((n) => /truncated at \d+ total chars/.test(n)),

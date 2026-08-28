@@ -513,8 +513,8 @@ knowing when you size your own cap. It needed `GLM_MCP_MAX_FILE_CHARS` raised to
 for the run — the default derived budget would have cut the same walk far sooner — and even
 100,000,000 is less generous than it looks, because the cap measures the text delivered, not
 the bytes read: line numbers and headers swell 79 MB of files to 85.2M characters of prompt,
-so a cap sized to the bytes on disk would cut this walk at the 376th file and never read the
-last 24. Size the cap to the prompt you are willing to pay for, not to the tree.
+so a cap sized to the bytes on disk would cut this walk at the 372nd file and never read the
+last 28. Size the cap to the prompt you are willing to pay for, not to the tree.
 
 Output ceilings come from z.ai's published table and are **per model** — 131,072
 for the GLM-5 and 4.6/4.7 families, 98,304 for GLM-4.5, 32,768 for the vision
