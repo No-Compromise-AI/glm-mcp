@@ -858,11 +858,18 @@ export interface FileContext {
  * outside every root is the one refusal that cannot proceed: narrowing it to
  * a root would return an empty-but-successful read, the exact silent-failure
  * shape this project has spent the most effort removing.
+ *
+ * `historyChars` (#52) is what a thread riding the same request has already
+ * spent of the character budget — the prior turns glm_ask was handed, measured
+ * as sent. The files assemble into what remains, and a cut the history caused
+ * says so in its note. Zero — the two- and three-argument calls every existing
+ * caller makes — is no thread, and behaves exactly as before.
  */
 export function buildFileContext(
   paths: string[],
   cwd: string,
   model: string = DEFAULT_MODEL,
+  historyChars: number = 0,
 ): FileContext {
   // Every note is filed under the argument that produced it, and the notes
   // leave in the order the arguments arrived (#26). Which branch handles an
@@ -932,7 +939,23 @@ export function buildFileContext(
   // sized against that model's window rather than the default's million
   // tokens. maxFileChars applies GLM_MCP_MAX_FILE_CHARS over the derivation
   // for every model alike (#35), and an unparsable value falls back (#24).
-  const cap = maxFileChars(model);
+  //
+  // #52: the budget belongs to the REQUEST, not to the files alone. A thread's
+  // prior turns ride the same request as the file context, so they spend the
+  // same budget before the first header is written — a 1,200-character history
+  // under a 1,500-character cap leaves 300 for the files, which is #19's rule
+  // meeting the same interaction #53's line numbers had: what the server
+  // assembles has to fit the budget, whatever else is riding along. The
+  // history itself is never cut — it is the caller's own record of a
+  // conversation that happened, and the answer being pushed back on is the
+  // point of the thread — so the crowding lands on the files, whose
+  // truncation machinery and notes already exist. The remainder floors at
+  // zero: a thread longer than the whole budget leaves the files nothing, not
+  // a negative room for the first header to fit into. The spend is floored at
+  // zero on its own side too, so no caller error can spend a negative history
+  // and buy file context the cap never allowed.
+  const spent = Math.max(0, historyChars);
+  const cap = Math.max(0, maxFileChars(model) - spent);
   // Which bound the cap enforced, for the truncation note at the cut: the
   // window the budget derived from, or the operator's explicit override. A
   // caller routed to a smaller model has to be able to tell "this model's
@@ -1337,7 +1360,15 @@ export function buildFileContext(
       // (#59) — see capWhy above.
       notes.push({
         arg,
-        msg: `truncated at ${cap} total chars (${capWhy}), starting with: ${via}`,
+        // #52: where a thread spent part of the budget before the first header
+        // was written, the note says so — the cut landed below the cap the
+        // caller set, and a caller reading "truncated at 300" against a cap of
+        // 1,500 with no word of why would go looking for a bug in the cap
+        // rather than in the size of its own history. A no-thread call names
+        // no spend, so its note is word-for-word the one it has always been.
+        msg: `truncated at ${cap} total chars (${capWhy}${
+          spent > 0 ? `; the thread history spent ${spent} of it` : ""
+        }), starting with: ${via}`,
       });
       // The cap cut the loop here, so the entries after this one were never
       // attempted. `capCutAt` records whose read was underway (#40): every
@@ -1420,6 +1451,14 @@ export function buildFileContext(
   return { text: chunks.join(""), notes: notes.map((n) => n.msg), refusedCall: false };
 }
 
+/**
+ * The two roles a turn of a thread may carry (#52): the caller's words and
+ * the model's own prior answers. Measured against the live API, z.ai's schema
+ * admits exactly these and answers any other role with a 422 — which is why
+ * ask() refuses one locally, before the round trip.
+ */
+export type TurnRole = "user" | "assistant";
+
 export interface AskArgs {
   prompt: string;
   model: string;
@@ -1430,6 +1469,27 @@ export interface AskArgs {
    * applies (see {@link outputLimits}) — not a constant of ours.
    */
   maxTokens?: number;
+  /**
+   * The conversation so far (#52): prior turns, in order, that this call
+   * continues. `prompt` is appended after them as the final user turn, and
+   * stays required — a thread says what was already said; only `prompt` says
+   * what is being asked now. Omitted (or empty), the request is the single
+   * user turn it has always been, byte for byte: every existing caller is on
+   * that path and must not notice this field exists.
+   *
+   * The roles arrive as plain strings rather than {@link TurnRole} because
+   * they cross a boundary that erases types — MCP hands the tool JSON — so
+   * the guarantee is made at runtime instead: a role outside the union is
+   * refused here, naming the caller's own value, rather than sent for z.ai
+   * to reject with a 422 after the round trip, exactly as #36 refuses an
+   * over-ceiling max_tokens locally. Nothing checks ORDER, on purpose: z.ai
+   * imposes no alternation (measured: assistant-first, two users in a row,
+   * two assistants in a row and a trailing assistant turn are all accepted),
+   * and validation stricter than the upstream turns a working conversation
+   * into an error for no gain — a caller replaying a real transcript would
+   * hit it on the first odd turn.
+   */
+  messages?: Array<{ role: string; content: string }>;
 }
 
 export interface AskResult {
@@ -1448,6 +1508,26 @@ export interface AskResult {
 
 export async function ask(args: AskArgs): Promise<AskResult> {
   const { prompt, model, system } = args;
+
+  // #52: the thread, validated turn by turn — narrowed on the way through, so
+  // the body below is built from values the guard has already approved. A role
+  // outside "user"/"assistant" is refused HERE, before a request exists,
+  // naming the caller's own value: z.ai answers it with a 422 after the round
+  // trip, and spending one to learn what this server already knows is what
+  // #36 refuses the over-ceiling max_tokens for. The guard deliberately has no
+  // opinion about ORDER — first among equals, repeated, trailing — because
+  // z.ai has none (measured, see AskArgs.messages), and a caller replaying a
+  // real transcript must not be refused for the shape the upstream accepts.
+  const turns = (args.messages ?? []).map((turn, i): { role: TurnRole; content: string } => {
+    if (turn.role === "user" || turn.role === "assistant") {
+      return { role: turn.role, content: turn.content };
+    }
+    throw new Error(
+      `messages[${i}] has role ${JSON.stringify(turn.role)}, which is neither "user" nor ` +
+        `"assistant" — the request is refused here rather than rejected by z.ai with a ` +
+        `422 after the round trip. Send the turn as role "user" or "assistant".`,
+    );
+  });
 
   // THINKING_REQUIRED models cannot run with reasoning off: glm-5.3 rejects
   // the request outright (z.ai 1210), glm-5.3-flash accepts it and silently
@@ -1478,10 +1558,16 @@ export async function ask(args: AskArgs): Promise<AskResult> {
   // role outside its union — is a compile error here rather than a runtime
   // error against the live endpoint. The `as never` this replaces switched
   // the compiler off for the whole request.
+  // #52: the caller's history goes first, in order and with its roles —
+  // flattened into one voice, the model cannot tell its own prior answer from
+  // the caller's words — and the new prompt is the final user turn, never
+  // duplicated into the history above it: sent twice, the model would be
+  // answering a question it has already been shown. An empty `messages` is
+  // the no-thread call exactly, so that path cannot drift from this one.
   const body: Anthropic.Messages.MessageCreateParamsNonStreaming = {
     model,
     max_tokens: maxTokens,
-    messages: [{ role: "user", content: prompt }],
+    messages: [...turns, { role: "user", content: prompt }],
   };
   if (system) body.system = system;
 
