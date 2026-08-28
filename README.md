@@ -402,7 +402,18 @@ already have against glob characters. A range that names nothing readable is rep
 - A path that exists on disk is read literally even if its name contains metacharacters — a
   real `report[final].md` is read, not pattern-matched.
 - Hidden (dot) entries match only when the pattern spells the dot out.
-- A pattern matching nothing is reported in `Notes`, exactly like a missing file.
+- A pattern matching nothing is reported in `Notes`, exactly like a missing file — and when the
+  call supplied no `cwd` and nothing else it asked for arrived either, that report also says the
+  search ran in the directory the server was started in and names `cwd` and `GLM_MCP_ROOTS` as
+  the knobs, so a mis-launched server (see the per-host table above) is diagnosable from the
+  reply instead of reading as an ordinary no-match. The knobs are companions, not alternatives:
+  `cwd` moves the search, and `GLM_MCP_ROOTS` widens the roots the new `cwd` must resolve
+  inside — a `cwd` outside the roots is refused until it is widened. The extra sentence belongs
+  to a call that delivered nothing: a duplicate beside its own delivered match, or a no-match
+  beside files that did arrive, reads as the plain no-match it always was, as do a missing file
+  and an empty line range — sending a caller who already has its files to look elsewhere would
+  point at the wrong fix. The note names no path — which directory the server started in is the
+  machine's business, not the caller's.
 - Symlinked directories are followed only when the pattern names one explicitly
   (`linked/*.ts`). Wildcards never follow them, and a link to a directory is never
   listed as a file.
