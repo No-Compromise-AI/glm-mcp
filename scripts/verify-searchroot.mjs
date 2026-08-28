@@ -47,7 +47,11 @@
 //      configured roots (#26). This is the rule the obvious implementation
 //      breaks;
 //   4. everything #13 and #40 established still holds: the note names the
-//      caller's own pattern, and a genuine no-match still reads as no-match.
+//      caller's own pattern, and a genuine no-match still reads as no-match;
+//   5. the hint belongs to a call that delivered NOTHING. A duplicate argument,
+//      or a range past the end of a file that was found, both produce a
+//      no-match note while content is returned — and telling that caller to
+//      look elsewhere is false.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { createServer } from 'node:http';
@@ -120,8 +124,16 @@ try {
 
   // ---- rule 3: and it says that while naming nothing on this machine
   {
-    const secrets = [LAUNCH, homedir(), userInfo().username].filter((s) => s && s.length > 2);
-    const leaked = secrets.find((s) => bare.note.includes(s));
+    // Paths are matched as substrings; the USERNAME is matched as a word.
+    // Matching a username by substring is unsound: on a machine where the
+    // account is called `root` — which is the common case in a container — the
+    // phrase "allowed roots" contains it, and every honest note mentioning
+    // GLM_MCP_ROOTS would be reported as a leak. The bug is this gate's, not
+    // the note's, and it fails in the direction that blocks correct work.
+    const paths = [LAUNCH, homedir()].filter((s) => s && s.length > 2);
+    const user = userInfo().username;
+    const leaked = paths.find((s) => bare.note.includes(s))
+      ?? (user && user.length > 2 && new RegExp(`\\b${user.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(bare.note) ? user : undefined);
     if (leaked) {
       fail(`#67 / #26: the note names ${JSON.stringify(leaked)} — a path on this machine, or the account's own name. That is the disclosure #26 exists to prevent and verify:disclosure fails the build for it. The caller does not need to know WHERE the server looked, only that the place was the server's startup directory rather than anything it chose — which is a fact about its own request.`);
     }
@@ -139,6 +151,24 @@ try {
     }
     if (/start(ed|up)|launch|where the server/i.test(chosen.note)) {
       fail(`#67: the caller supplied a cwd and the note still blames the server's startup directory — ${JSON.stringify(chosen.note)}. Nothing matched where they asked, which is an ordinary no-match; sending them to cwd and GLM_MCP_ROOTS points at the wrong fix and spends the one signal this change exists to add. Decide by whether the ARGUMENT was supplied, not by comparing it to the startup directory — the two are the same path here, and only the tool knows which happened.`);
+    }
+  }
+
+  // ---- rule 5: the hint belongs to a call that delivered NOTHING
+  // "This argument matched nothing" and "this call found nothing" are different
+  // facts, and only the second justifies sending a caller to look elsewhere.
+  // A duplicate argument, or a range that falls past the end of a file that was
+  // found perfectly well, both produce a no-match note while content IS being
+  // returned — and telling that caller the search ran somewhere they did not
+  // mean is simply false. The eligibility test is the call's whole outcome, not
+  // any one argument's.
+  {
+    const delivered = await notesOf({ files: ['other/**/*.ts', 'other/**/*.ts'] });
+    if (!/no matches/i.test(delivered.note)) {
+      fail(`#67: expected the duplicate argument to produce a no-match note — got ${JSON.stringify(delivered.note)}. If that changed, this rule is no longer testing what it thinks it is.`);
+    }
+    if (/start(ed|up)|launch|where the server/i.test(delivered.note)) {
+      fail(`#67: file content WAS returned — the first argument matched and was read — and the reply still says the search ran in the directory the server was started in. The caller is being sent to look elsewhere for files it already has. "This argument matched nothing" is not "this call found nothing", and only the second earns the hint.\n  note: ${JSON.stringify(delivered.note)}`);
     }
   }
 
