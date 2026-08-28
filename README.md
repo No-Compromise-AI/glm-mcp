@@ -4,13 +4,15 @@
 [![ci](https://github.com/No-Compromise-AI/glm-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/No-Compromise-AI/glm-mcp/actions/workflows/ci.yml)
 [![license](https://img.shields.io/npm/l/@nocompromiseai/glm-mcp)](LICENSE)
 
-An MCP server that exposes Z.ai's GLM models — GLM-5.3 and siblings — as tools inside
-Claude Code and Claude Desktop.
+An MCP server that exposes Z.ai's GLM models — GLM-5.3 and siblings — as tools inside any
+MCP client. Verified in **Claude Code / Claude Desktop**, **Codex** and **Antigravity**.
 
-Claude Desktop pins its own model provider: when it spawns its embedded Claude Code it forces
-`ANTHROPIC_BASE_URL` to Anthropic's endpoint and strips `ANTHROPIC_API_KEY` /
-`ANTHROPIC_AUTH_TOKEN` from the child environment. So GLM cannot *drive* a desktop session.
-This server takes the other route — GLM becomes a tool Claude can call mid-conversation.
+The original reason was Claude Desktop, which pins its own model provider: when it spawns its
+embedded Claude Code it forces `ANTHROPIC_BASE_URL` to Anthropic's endpoint and strips
+`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the child environment. So GLM cannot *drive*
+a desktop session. This server takes the other route — GLM becomes a tool the agent calls
+mid-conversation — and that route happens to work everywhere, because MCP is a standard and
+nothing in here is Claude-specific.
 
 Useful for:
 
@@ -22,11 +24,45 @@ Useful for:
 ## Install
 
 Register it once, user-scoped, and it is available in **every** project on the machine — no
-per-project setup:
+per-project setup.
+
+**Claude Code / Claude Desktop**
 
 ```bash
 claude mcp add --scope user glm -- npx -y @nocompromiseai/glm-mcp@0.4.0
 ```
+
+**Codex**
+
+```bash
+codex mcp add glm -- npx -y @nocompromiseai/glm-mcp@0.4.0
+```
+
+**Antigravity**
+
+```bash
+agy mcp add glm -- npx -y @nocompromiseai/glm-mcp@0.4.0
+```
+
+One caveat that decides whether file context works at all, per host. This server confines
+file reads to the directory it was **started in** (see [Path confinement](#path-confinement)),
+so where the host launches it matters:
+
+| host | launches the server in | so |
+| --- | --- | --- |
+| Claude Code | the project directory | works as-is |
+| Codex | the session directory | works as-is |
+| Antigravity | wherever `agy` itself was invoked — and `--add-dir` does **not** change this | either launch `agy` from the project, or set `GLM_MCP_ROOTS` and pass `cwd` |
+
+For Antigravity, set the roots at registration:
+
+```bash
+agy mcp add -e GLM_MCP_ROOTS=/abs/path/one:/abs/path/two glm -- npx -y @nocompromiseai/glm-mcp@0.4.0
+```
+
+Note that `GLM_MCP_ROOTS` bounds where a caller may point `cwd`; it does not exempt the launch
+directory, which must also be inside a root. When it is not, the call is refused with a message
+naming the offending `cwd` — loudly, rather than quietly matching no files.
 
 The version is pinned on purpose: a bare `npx` resolves `latest` at run time, while the package
 itself ships the exact dependency graph it was tested with — pinning is what makes the two the
@@ -39,7 +75,8 @@ npm install && npm run build
 claude mcp add --scope user glm -- node /absolute/path/to/glm-mcp/dist/index.js
 ```
 
-Restart Claude Code / Claude Desktop for it to be picked up. Verify with `claude mcp list`.
+Restart the host for it to be picked up. Verify with `claude mcp list`, `codex mcp list` or
+`agy mcp list`.
 
 Requires Node 20 or newer, and a z.ai API key with credit or a Coding Plan.
 

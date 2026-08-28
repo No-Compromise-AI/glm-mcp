@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Show what delegated GLM runs have raised for you. Newest last.
+#   glm-notes            items from the most recent run
+#   glm-notes -a         everything recorded in the ledger
+set -uo pipefail
+exec python3 - "$@" <<'PY'
+import json, os, sys
+ledger = os.environ.get("GLM_TASK_LEDGER", os.path.expanduser("~/.claude-glm/outcomes.jsonl"))
+rows=[]
+if os.path.exists(ledger):
+    for line in open(ledger):
+        try: rows.append(json.loads(line))
+        except Exception: pass
+rows=[r for r in rows if r.get("notes")]
+if not rows:
+    print("Nothing raised. (Runs with no notes had nothing worth your attention.)"); sys.exit(0)
+sel = rows if "-a" in sys.argv else rows[-1:]
+ICON={"blocked":"!! BLOCKED","scope":" ~ SCOPE","discovery":" * DISCOVERY","decision":" - ASSUMPTION"}
+for r in sel:
+    print(f"\n{r.get('ts','')}  {r.get('dir','')}")
+    print(f"  task: {(r.get('task') or '')[:90]}")
+    if r.get("session_id"): print(f"  answer it with:  glm-answer -C {r.get('dir')} {r['session_id']} \"...\"")
+    for n in r["notes"]:
+        print(f"  {ICON.get(n.get('level'),'  ?')}: {(n.get('msg') or '')[:300]}")
+PY

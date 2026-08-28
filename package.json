@@ -1,7 +1,7 @@
 {
   "name": "@nocompromiseai/glm-mcp",
   "version": "0.4.0",
-  "description": "MCP server exposing Z.ai GLM models (GLM-5.3 and siblings) as tools inside Claude Code and Claude Desktop.",
+  "description": "MCP server exposing Z.ai GLM models (GLM-5.3 and siblings) as tools inside Claude Code, Claude Desktop, Codex and Antigravity.",
   "type": "module",
   "bin": {
     "glm-mcp": "dist/index.js"
@@ -20,7 +20,7 @@
     "prepare": "npm run build",
     "start": "node dist/index.js",
     "smoke": "node scripts/smoke.mjs",
-    "test": "npm run build && node --test test/glob.test.mjs test/api-key.test.mjs test/confinement.test.mjs test/limits.test.mjs test/redos.test.mjs test/api.test.mjs test/capacity.test.mjs test/disclosure.test.mjs test/completeness.test.mjs test/routing.test.mjs test/lines.test.mjs",
+    "test": "npm run build && node --test test/glob.test.mjs test/api-key.test.mjs test/confinement.test.mjs test/limits.test.mjs test/redos.test.mjs test/api.test.mjs test/capacity.test.mjs test/disclosure.test.mjs test/completeness.test.mjs test/routing.test.mjs test/review.test.mjs test/lines.test.mjs",
     "verify:ignore": "node scripts/verify-ignore.mjs",
     "verify:globs": "node scripts/verify-globs.mjs",
     "verify:confinement": "node scripts/verify-confinement.mjs",
@@ -37,7 +37,9 @@
     "verify:disclosure": "node scripts/verify-disclosure.mjs",
     "verify:supplychain": "node scripts/verify-supplychain.mjs",
     "verify:completeness": "node scripts/verify-completeness.mjs",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "verify:host-routing": "node scripts/verify-host-routing.mjs",
+    "verify:review": "node scripts/verify-review.mjs"
   },
   "keywords": [
     "mcp",
