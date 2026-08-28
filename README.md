@@ -281,6 +281,23 @@ them is the fastest way to be confused by it:
 | the MCP server — `glm_ask`, `glm_review`, `glm_models` | a server another agent calls mid-task | **a tool** the agent consults, keeping the wheel |
 | `bin/` — eleven commands, below | shell around GLM agent sessions | **the agent**, doing the work in the repository |
 
+**These commands are not in the npm package.** `npm install @nocompromiseai/glm-mcp` — or the
+`npx` registration above — gives you the MCP server and nothing else: `files` ships `dist/`,
+the README and the lockfile, deliberately, because an npm consumer has no CLI for these to
+drive and no reason to carry them. To get them, clone the repository and put its `bin/` on
+your PATH:
+
+```bash
+git clone https://github.com/No-Compromise-AI/glm-mcp.git
+cd glm-mcp && npm ci          # the postinstall also installs the delegation worker
+export PATH="$PWD/bin:$PATH"  # or symlink the commands into ~/.local/bin
+```
+
+The MCP server and these commands are independent: you can register the server from npm and
+never clone, and the server does not need `bin/` to work. What you cannot do is reach the
+delegation loop from an npm install alone, which is the thing that was previously undocumented
+(#89).
+
 `bin/claude-glm` points the Claude Code CLI at z.ai, so GLM drives an interactive session.
 Delegation does not go through it: `bin/glm-task` hands the task to `bin/glm-worker`, which
 runs the Claude Agent SDK — a binary the worker package vendors, so the delegate → review →
