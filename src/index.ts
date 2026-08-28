@@ -73,6 +73,34 @@ server.registerTool(
       "and glm-5.3-flash cannot, so 'low' is their shallowest setting.",
     inputSchema: {
       prompt: z.string().describe("The question or instruction to send to GLM."),
+      // #52: the caller owns the history — the issue's preferred half, because
+      // a `messages` array is no state for this server to hold and it survives
+      // the server restarting underneath the caller, where a session id is
+      // and does not. The role is a plain string in the schema on purpose:
+      // the refusal for a role outside "user"/"assistant" is ask()'s to make,
+      // in words that name the caller's own value, rather than a schema
+      // rejection the caller cannot read (#13) — the same layering #36 gives
+      // the over-ceiling max_tokens.
+      messages: z
+        .array(
+          z.object({
+            role: z.string().describe('Who spoke the turn: "user" or "assistant".'),
+            content: z.string().describe("What was said, exactly as it was said."),
+          }),
+        )
+        .optional()
+        .describe(
+          "The conversation so far: prior turns this call continues, in order, " +
+            "each {role, content}. `prompt` stays required and is sent as the FINAL " +
+            "user turn — do not repeat it inside messages. Roles are \"user\" and " +
+            '"assistant"; any other is refused here, before anything is sent, naming ' +
+            "the value you sent. No ordering is imposed — replay a real transcript as " +
+            "it happened. With `files`, the file context rides the FIRST turn and is " +
+            "never repeated on the newest, so the thread keeps a stable prefix: a " +
+            "follow-up reads its context from cache instead of re-prefilling it. The " +
+            "history spends the same character budget as the files, so a long thread " +
+            "leaves less room for file context — the cut is reported in the notes.",
+        ),
       files: z
         .array(z.string())
         .optional()
@@ -144,7 +172,7 @@ server.registerTool(
         ),
     },
   },
-  async ({ prompt, files, cwd, model, reasoning, system, max_tokens }) => {
+  async ({ prompt, files, cwd, model, reasoning, system, max_tokens, messages }) => {
     try {
       let finalPrompt = prompt;
       const notes: string[] = [];
@@ -155,8 +183,20 @@ server.registerTool(
       // before while every check beneath it stayed green.
       const chosenModel = model ?? DEFAULT_MODEL;
 
+      // #52: the thread the caller owns, copied so the turn carrying the file
+      // context below is this server's object and never a mutation of what
+      // the caller passed. An empty `messages` is no thread at all — the
+      // request stays the single user turn it has always been, exactly as
+      // when the parameter is omitted, so the two paths cannot drift apart.
+      const priorTurns = (messages ?? []).map((m) => ({ role: m.role, content: m.content }));
+      // The thread competes with the files for the same budget (#52, over
+      // #19's rule): measured as sent — the caller's own characters, before
+      // any file context is attached — and spent inside buildFileContext,
+      // where the cap, the cut and the note all live.
+      const historyChars = priorTurns.reduce((n, m) => n + m.content.length, 0);
+
       if (files?.length) {
-        const ctx = buildFileContext(files, cwd ?? process.cwd(), chosenModel);
+        const ctx = buildFileContext(files, cwd ?? process.cwd(), chosenModel, historyChars);
         notes.push(...ctx.notes);
         // A refused call read nothing. Sending the prompt anyway would answer
         // the question with none of the material it asked about — a silent
@@ -173,11 +213,32 @@ server.registerTool(
             ],
           };
         }
-        if (ctx.text) finalPrompt = `${ctx.text}\n\n---\n\n${prompt}`;
+        if (ctx.text) {
+          if (priorTurns.length > 0) {
+            // #52: the file context rides the FIRST turn, never the newest.
+            // This is why the issue pairs with caching: a stable prefix with a
+            // varying tail is what reads from cache, so the context has to
+            // stay at the front of the thread across every follow-up — move
+            // it to the latest turn and each one re-prefills the whole of it,
+            // which is the cost this parameter exists to remove. Sent on both
+            // ends it would be paid for twice and break the prefix match, so
+            // it is attached here and nowhere else: the final turn carries
+            // the new prompt alone.
+            priorTurns[0] = {
+              role: priorTurns[0].role,
+              content: `${ctx.text}\n\n---\n\n${priorTurns[0].content}`,
+            };
+          } else {
+            finalPrompt = `${ctx.text}\n\n---\n\n${prompt}`;
+          }
+        }
       }
 
       const result = await ask({
         prompt: finalPrompt,
+        // Spread only when a thread exists, so the no-thread call reaches
+        // ask() exactly as it did before #52 — the parameter is additive.
+        ...(priorTurns.length > 0 ? { messages: priorTurns } : {}),
         model: chosenModel,
         reasoning: (reasoning ?? "low") as Reasoning,
         system,

@@ -44,6 +44,7 @@ jobs:
       - run: npm run verify:thinking
       - run: npm run verify:window
       - run: npm run verify:lines
+      - run: npm run verify:thread
       - run: npm run verify:api
       - run: npm run verify:capacity
       - run: npm run verify:disclosure

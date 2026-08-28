@@ -144,12 +144,54 @@ Two things it is genuinely good at:
 | arg | type | default | notes |
 | --- | --- | --- | --- |
 | `prompt` | string | — | required |
+| `messages` | `{role, content}[]` | — | the conversation so far, as prior turns this call continues — see below |
 | `files` | string[] | — | files to include as context, each numbered `cat -n` style: literal paths (optionally with an inclusive line range, `src/auth/session.ts:40-120`) and/or globs (`src/**/*.ts`, `*.md`, `{lib,src}/*.ts`) |
 | `cwd` | string | server cwd | what relative `files` resolve against |
 | `model` | string | `glm-5.3` | any id from `glm_models` |
 | `reasoning` | `none`\|`low`\|`high`\|`max` | `low` | higher is slower |
 | `system` | string | — | optional system prompt |
 | `max_tokens` | number | the model's own default (65,536 for GLM-5.3) | hard ceiling on output; see Reasoning |
+
+#### Pushing back on an answer
+
+Every call used to be independent, and the natural second-opinion flow is disagreement —
+*"you flagged session.ts:88, but the caller holds the lock."* Re-sending the whole file context
+and hoping the consultant re-derives its own prior reasoning is what `messages` removes: pass
+the conversation so far, and `prompt` as the push-back.
+
+```json
+{
+  "prompt": "You flagged session.ts:88 — but the caller holds the lock across that whole block. Re-read it.",
+  "files": ["src/auth/**/*.ts"],
+  "reasoning": "high",
+  "messages": [
+    { "role": "user", "content": "Does the refresh logic have a race condition? Point at the lines." },
+    { "role": "assistant", "content": "The refresh path in session.ts:88 reads expiresAt before taking the lock ..." }
+  ]
+}
+```
+
+The caller owns the history — there is no server-side session, so nothing is lost when the
+server restarts underneath you. Append each turn as the conversation grows and re-send the
+array; `prompt` stays required and is always sent as the **final user turn**, so never repeat
+it inside `messages`.
+
+- **File context rides the first turn.** With `files` and `messages` together, the context is
+  attached to the thread's *first* turn and never repeated on the newest. A thread is exactly
+  the shape prefix caching rewards, and the prefix stays cacheable only while the context
+  stays at the front — measured on this account, a stable prefix with a varying tail read
+  32,429 input tokens down to 45. Move the context to the latest turn and every follow-up
+  re-prefills it, which is the cost threads exist to remove.
+- **The thread spends the same budget as the files.** Prior turns count against the same
+  character budget (`GLM_MCP_MAX_FILE_CHARS`, or the per-model derivation), so a long thread
+  leaves less room for file context. The history itself is never cut — it is your own record
+  of what was said — the files give way, and the truncation note says so:
+  `truncated at 300 total chars (...; the thread history spent 1200 of it)`.
+- **Roles are checked here, not by z.ai.** Each turn's `role` must be `user` or `assistant`;
+  anything else is refused before anything is sent, naming the value you sent, rather than
+  discovered as a 422 after the round trip. Within that, no ordering is imposed — z.ai
+  accepts an assistant turn first, consecutive turns of one role and a trailing assistant
+  turn — so replay a real transcript as it happened.
 
 ### `glm_review`
 
@@ -323,6 +365,10 @@ to control where your key is sent — see [Errors and endpoints](#errors-and-end
 de-duplicated by file identity across the whole list, so overlapping patterns never send the
 same file twice.
 
+When `glm_ask` is called with a thread (`messages`), the assembled context is attached to the
+thread's **first** turn rather than the newest, so the prefix stays cacheable across
+follow-ups — see [Pushing back on an answer](#pushing-back-on-an-answer).
+
 Every file arrives **with line numbers, `cat -n` style** — each line prefixed with its own
 number, so an answer like `session.ts:88 reads expiresAt before taking the lock` cites a line
 the model can actually see rather than one it had to count blind. The example answer above is
@@ -398,6 +444,10 @@ own published window, the window you set with `GLM_MCP_CONTEXT_TOKENS`, or the
 documented assumption for a model whose window nobody has recorded — because
 only the first of those is a fact about the model. Your explicit
 `GLM_MCP_MAX_FILE_CHARS` cap is named as itself.
+
+A thread's prior turns (`messages` to `glm_ask`) spend this same budget before the first
+file is read, so a long thread leaves less room for file context — and the truncation note
+says how much the history spent when it is what crowded the files.
 
 That ratio targets **English and code deliberately** — this is what the project
 is built for. Denser scripts pack more tokens per character (Chinese runs nearer
