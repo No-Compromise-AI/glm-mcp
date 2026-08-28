@@ -157,11 +157,28 @@ function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do
   const bin = join(dir, 'bin'); mkdirSync(bin);
   copyFileSync(join(BIN, 'glm-worker'), join(bin, 'glm-worker'));
   chmodSync(join(bin, 'glm-worker'), 0o755);
+  // The shim is ESM with no .mjs extension, exactly as it ships; Node only
+  // reads it that way when a package.json above it says so. Without this the
+  // process dies PARSING the file, which satisfies "exits non-zero, emits no
+  // result" while proving nothing whatever about the worker — the second way
+  // this one rule found to pass on a failure the gate itself had caused.
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module' }));
   // No packages/worker beside it — the shipped shim resolves its implementation
   // relative to its own realpath, so this is exactly "the worker package is not
   // installed", the failure #90 chose over a silently-disabled optional dep.
-  const r = spawnSync('bash', [join(bin, 'glm-worker'), '-p', 'hello', '--output-format', 'stream-json', '--verbose'],
+  // Executed directly, honouring its own shebang: running it through `bash`
+  // makes bash choke on JavaScript and exit 2, which is the FIRST way this rule
+  // found to pass while testing nothing.
+  const r = spawnSync(join(bin, 'glm-worker'), ['-p', 'hello', '--output-format', 'stream-json', '--verbose'],
     { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
+  // The load-bearing check, and the reason the other two can be believed: the
+  // worker must fail through its OWN diagnostic. That string can only be
+  // printed by the shipped catch handler, so it proves the real code ran and
+  // reached its real error path — where an exit code alone proves only that
+  // something, somewhere, went wrong.
+  check(/glm-worker: could not start/.test(r.stderr ?? ''),
+    'rule 1: the real glm-worker did not fail through its own error path. Whatever went wrong ' +
+    `here was caused by this gate, not by the worker, so the shape rules 2-9 imitate is unverified:\n${(r.stderr ?? '').slice(0, 400)}`);
   check(r.status !== 0 && r.status !== null,
     `rule 1: the real glm-worker STARTED with no worker package installed (exit ${r.status}). ` +
     'This gate imitates a failure shape it can no longer produce, so it has stopped vouching for it. ' +
@@ -266,9 +283,18 @@ exit 6
   const parked = join(state, 'parked.jsonl');
   check(existsSync(parked) && readFileSync(parked, 'utf8').trim().length > 0,
     `rule 9: an item whose delegation did not complete must be PARKED for a human. Drain said:\n${out.slice(-1500)}`);
-  check(!/undefined exit/.test(out),
-    'rule 9: glm-drain called exit 6 an "undefined exit". It is a defined outcome — the exit-code ' +
-    'contract in its header must name it, or the drain is guessing at a code the toolchain publishes.');
+  // Asserted on the PARKED RECORD, not on the terminal: the reason `throttle`
+  // prints for an undefined exit is suppressed at -j 1, so a terminal check
+  // here can never fire. The parked file is also the artifact a human actually
+  // reads in the morning, which is the thing that has to be true.
+  // The whole record, not one field: park() puts the category in `reason` and
+  // the explanation in `question`, and which slot carries the sentence is not
+  // the property — that a human reading this file learns what happened is.
+  const record = readFileSync(parked, 'utf8').trim().split('\n').pop();
+  check(/did not complete/i.test(record),
+    `rule 9: the parked record must say the delegated AGENT did not complete; it reads ${record}. ` +
+    'Exit 6 is a defined outcome — a drain that files it as an unexplained crash tells the human ' +
+    'the wrong thing about what happened, and its exit-code contract has stopped covering the toolchain it drives.');
 }
 
 console.log(`DELEGATION OK (${checks} checks)`);
