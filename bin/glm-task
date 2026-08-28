@@ -253,6 +253,10 @@ if [[ "$REVIEWER" != "none" && -n "$BASE" ]]; then
     ROUNDS=$((ROUNDS+1))
     echo "glm-task: fix round $ROUNDS" >&2
     FIXLOG="${LOG%.jsonl}-fix$ROUNDS.jsonl"
+    # The record below must describe the session that ran LAST. A fix round is
+    # a fresh session, so a blocked fix round resumed the ORIGINAL session — the
+    # one that had already finished — instead of the one asking the question.
+    LASTLOG="$FIXLOG"
     run_agent "A reviewer examined your change against the original task and asked for changes.
 
 Reviewers are often wrong. In measured testing one reviewer's findings were 40% false
@@ -291,7 +295,7 @@ Report at the end: which findings you reproduced and fixed, and which you refute
   done
 fi
 
-GLM_LOG="$LOG" GLM_LEDGER="$LEDGER" GLM_DIR="$DIR" GLM_TASK_TEXT="$TASK" \
+GLM_LOG="${LASTLOG:-$LOG}" GLM_LEDGER="$LEDGER" GLM_DIR="$DIR" GLM_TASK_TEXT="$TASK" \
 GLM_VERIFY="$VERIFY" GLM_VSTATUS="${VSTATUS:-skipped}" GLM_VRC="${VRC:-}" \
 GLM_REVIEWER="$REVIEWER" GLM_RVERDICT="$REVIEW_VERDICT" GLM_ROUNDS="$ROUNDS" \
 GLM_NOTES_F="$NOTES" GLM_REVF="$REVF" GLM_REVERR="$REVERR" GLM_BASE="$BASE" GLM_BRANCH="${BRANCH:-}" python3 - <<'PY'

@@ -230,7 +230,12 @@ run_item() { # $1 id  $2 spec  $3 ru  $4 rh  $5 launch seq
   args=("${args[@]}" -r auto "ITEM=$id" "$spec")
   "$TASK_CMD" "${args[@]}" >"$err" 2>&1 || rc=$?
   session="$(sed -n 's/^glm-task: run dir=[^ ]* session=\([^ ]*\) .*/\1/p' "$err" | tail -1)"
-  worktree="$(sed -n 's/^glm-task: isolated worktree=\([^ ]*\) .*/\1/p' "$err" | tail -1)"
+  # From `run dir=`, which glm-task writes at the END of every run, not from
+  # `isolated worktree=`, which it writes only when it made one (-W/-b). A
+  # conforming GLM_TASK_CMD emitting just the terminal record left this
+  # empty, and an empty worktree parks work that actually succeeded.
+  worktree="$(sed -n 's/^glm-task: run dir=\([^ ]*\) .*/\1/p' "$err" | tail -1)"
+  [[ -n "$worktree" ]] || worktree="$(sed -n 's/^glm-task: isolated worktree=\([^ ]*\) .*/\1/p' "$err" | tail -1)"
   branch="$(sed -n 's/^glm-task: run dir=[^ ]* session=[^ ]* branch=\([^ ]*\).*/\1/p' "$err" | tail -1)"
   question="$(sed -n 's/.*"level":"blocked","msg":"\([^"]*\)".*/\1/p' "$err" | tail -1)"
   [[ -z "$question" ]] && question="$(sed -n 's/^.*\[blocked\] \(.*\)$/\1/p' "$err" | tail -1)"
@@ -269,6 +274,16 @@ RUNNING=0; STARTED=0; RSEQ=0; NEXTRES=1; HOLD_UNTIL=0; NOW=$(date +%s)
 # ---- the loop -------------------------------------------------------------
 while :; do
   NOW=$(date +%s)
+
+    # -T bounds the RUN, not just launching. Without this a worker already
+    # running could finish long after the deadline and still be merged — so
+    # "stop after N seconds" quietly meant "stop starting after N seconds",
+    # and an unattended run could merge work an hour past the wall the
+    # operator set. Reusing HALT means the result loop already refuses to ship
+    # and parks what is left, with a reason that says which limit stopped it.
+    if [[ -z "$HALT" ]] && (( TSECS > 0 && SECONDS >= TSECS )); then
+    HALT="the -T deadline of ${TSECS}s passed — nothing further is shipped"
+    fi
 
   # Collect results first — a freed slot should be refillable in the same pass.
   # Results are applied in LAUNCH ORDER, and that is a barrier rather than a
@@ -366,11 +381,12 @@ while :; do
           ;;
       3)  # no reviewer anywhere. Requeue with backoff; after five, the human
           # decides whether to keep waiting — that call is not ours to make.
-          if (( rh >= 5 )); then
-            park "$id" blocked "$session" "$worktree" "no reviewer had capacity after $rh backed-off attempts — keep waiting, or ship unreviewed?"
-          else
-            throttle "$id" "$ru" "$rh" "$asked" "no reviewer had capacity for item $id"
-          fi
+            # Requeue with backoff, with no ceiling of its own. The five-attempt
+            # cutoff was never in the contract, and it counted the SHARED hold
+            # counter: five rate limits followed by one reviewer-capacity refusal
+            # parked the item immediately, on a count it had not earned. The run
+            # is already bounded by -T and -n, which the operator actually set.
+            throttle "$id" "$ru" "$rh" "$asked" "no reviewer had capacity for item $id" "$session" "$worktree"
           ;;
       4)  # BLOCKED. Park with the question and keep going; answering it here,
           # unattended, is how a wrong guess becomes a merged commit.
@@ -396,8 +412,14 @@ while :; do
 
     # STOP THE LINE. Merges are automatic, so a bad item must not become the
     # base for the rest of the night.
-    if (( CONSEC >= MAX_FAILS )) && [[ -z "$HALT" ]]; then
-      HALT="$CONSEC consecutive failed items — main may be broken; refusing to build the rest of the night on it"
+      if (( CONSEC >= MAX_FAILS )) && [[ -z "$HALT" ]]; then
+        HALT="$CONSEC consecutive failed items — main may be broken; refusing to build the rest of the night on it"
+      fi
+      # One place parks the remainder, whichever limit stopped the line — the
+      # deadline or the failure count. It used to live inside the failure branch,
+      # so a run stopped by -T left its queue unparked and unexplained.
+      if [[ -n "$HALT" && -z "${HALT_DONE:-}" ]]; then
+        HALT_DONE=1
       echo "glm-drain: HALT — $HALT" >&2
       for ((i = 0; i < ${#QUEUE[@]}; i++)); do
         park "${QUEUE[$i]}" halted "" "" "$HALT"
