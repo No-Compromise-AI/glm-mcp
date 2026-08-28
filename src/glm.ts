@@ -766,33 +766,66 @@ function rangeOf(p: string): { path: string; first: number; last: number } | und
 }
 
 /**
- * A body's lines, counted the way `cat -n` counts them (#53): a trailing
- * newline ends the last line rather than opening an empty one, and an empty
- * file has no lines at all — there is nothing to number and no number to
+ * How many lines a body has, counted the way `cat -n` counts them (#53): a
+ * trailing newline ends the last line rather than opening an empty one, and an
+ * empty file has no lines at all — there is nothing to number and no number to
  * cite, so it still contributes a header and no body, exactly as before.
+ * Counted by walking the body's newlines rather than by splitting it: the
+ * count is needed before the first line can be numbered (the numbers align to
+ * the LAST one), and splitting would materialise every line of a body whose
+ * excerpt is about to be cut down to a few of them.
  */
-function splitLines(body: string): string[] {
-  if (body === "") return [];
-  const lines = body.split("\n");
-  if (lines[lines.length - 1] === "") lines.pop();
-  return lines;
+function countLines(body: string): number {
+  if (body === "") return 0;
+  let newlines = 0;
+  for (let i = body.indexOf("\n"); i !== -1; i = body.indexOf("\n", i + 1)) newlines++;
+  return body.endsWith("\n") ? newlines : newlines + 1;
 }
 
 /**
- * An excerpt as the model receives it (#53): every line prefixed with its own
- * number, right-aligned to the width of the last number shown and followed by
- * a tab — `cat -n`'s shape. The numbers are the FILE's own: an excerpt taken
- * by range keeps them (lines 40-120 are numbered 40 to 120, never 1 to 81),
- * because the README's example answer is `session.ts:88` and a citation off
- * an excerpt renumbered from 1 points confidently at the wrong place, which
- * is worse than no numbers at all — the caller cannot tell.
+ * `count` lines of `body`, from its line `first` on, as the model receives
+ * them (#53): every line prefixed with its own number, right-aligned to the
+ * width of the last number shown and followed by a tab — `cat -n`'s shape.
+ * The numbers are the FILE's own: an excerpt taken by range keeps them (lines
+ * 40-120 are numbered 40 to 120, never 1 to 81), because the README's example
+ * answer is `session.ts:88` and a citation off an excerpt renumbered from 1
+ * points confidently at the wrong place, which is worse than no numbers at
+ * all — the caller cannot tell.
+ *
+ * Numbered INTO a budget, never past it. `room` is the most characters any
+ * consumer of this excerpt can take, so the walk stops the moment what it has
+ * assembled cannot fit — nothing beyond `room` characters can ever be
+ * delivered, and assembling it anyway is a cap (#19) that bounds its output
+ * but not its own cost. A file at the GLM_MCP_MAX_FILE_BYTES limit of nothing
+ * but newlines numbers to some 47M characters; built whole under a 2,000-char
+ * cap it is twenty-three thousand times the answer, and dies on a small heap
+ * before the cap is ever asked its opinion. The alignment still comes from
+ * the excerpt's LAST line number, whole excerpt or cut, because the width is
+ * part of the format the model reads; only the assembly is bounded, never the
+ * numbering it will be shown with.
  */
-function numberLines(lines: string[], first: number): string {
-  if (lines.length === 0) return "";
-  const width = String(first + lines.length - 1).length;
-  return lines
-    .map((line, i) => `${String(first + i).padStart(width, " ")}\t${line}`)
-    .join("\n");
+function numberLines(body: string, first: number, count: number, room: number): string {
+  if (count <= 0) return "";
+  const width = String(first + count - 1).length;
+  // Walk to line `first`: the lines before it are not this excerpt's.
+  let start = 0;
+  for (let seen = 1; seen < first; seen++) {
+    const nl = body.indexOf("\n", start);
+    if (nl === -1) return ""; // count promised line `first` exists; the body disagrees
+    start = nl + 1;
+  }
+  let shown = "";
+  let gap = "";
+  for (let i = 0; i < count; i++) {
+    const nl = body.indexOf("\n", start);
+    const end = nl === -1 ? body.length : nl;
+    shown += `${gap}${String(first + i).padStart(width, " ")}\t${body.slice(start, end)}`;
+    gap = "\n";
+    if (shown.length > room) break; // the rest cannot be delivered; see above
+    if (nl === -1) break; // the body's last line, which carried no trailing newline
+    start = nl + 1;
+  }
+  return shown;
 }
 
 export interface FileContext {
@@ -959,9 +992,10 @@ export function buildFileContext(
   // A ranged excerpt (#53) widens the entry: `key` is the resolved file WITH
   // its range, because two ranges of one file are two asks and must both be
   // delivered while the same range twice is the duplicate the set exists to
-  // catch — a NUL cannot occur in a resolved path on any platform, so the
-  // suffix can never collide with a real file that happens to be named like
-  // one. `read` is the path to read, the caller's spelling for everything
+  // catch — a NUL cannot occur in a REALPATH on any platform, and the range
+  // branch only ever keys files that realpath'd, so the suffix can never
+  // collide with another range's file. `read` is the path to read, the
+  // caller's spelling for everything
   // else and the range-stripped path for an excerpt, whose whole spelling
   // stays in `p`/`via` for the header and the notes. `first`/`last` name the
   // inclusive line range; absent, the whole file.
@@ -976,6 +1010,18 @@ export function buildFileContext(
     last?: number;
   }> = [];
   const included = new Set<string>();
+  // Range keys live in a set of their own (#53). The set above holds the
+  // identities of files — realpaths, except for the spellings that resolved to
+  // nothing, where keyOf's lexical fallback keeps the caller's bytes, NUL
+  // included. A range key is a realpath plus a NUL plus its range, so on a
+  // canonical root the fallback for an argument like "a.md\0" + "1-2" IS the
+  // string later computed for the valid range "a.md:1-2"; sharing one set let
+  // that phantom squat on the range's key and the range arrive as a duplicate
+  // of a file that does not exist. Ranges dedupe against ranges only: their
+  // keys cannot collide with each other (the realpath half is NUL-free, so the
+  // split is unambiguous), and no file — phantom or real — has any business
+  // folding a range away.
+  const includedRanges = new Set<string>();
   // The ARGUMENT POSITIONS this result already speaks for: the position's
   // own entry — the one its spelling created, never one an earlier argument
   // claimed first — delivered content, was truncated, or was refused in a
@@ -1051,13 +1097,13 @@ export function buildFileContext(
         }
         if (namesSomething(range.path)) {
           const key = `${rresolved}\0${range.first}-${range.last}`;
-          if (!included.has(key)) {
+          if (!includedRanges.has(key)) {
             if (roots && !insideRoots(rresolved, roots)) {
               notes.push({ arg, msg: `refused: ${p} resolves outside the allowed roots` });
-              included.add(key);
+              includedRanges.add(key);
               continue;
             }
-            included.add(key);
+            includedRanges.add(key);
             files.push({
               p,
               via: p,
@@ -1230,22 +1276,14 @@ export function buildFileContext(
     // never came. A whole-file read of an empty file is different: the file's
     // entire content did arrive, and its header still counts against the cap
     // exactly as it did before there were numbers.
-    let excerpt = splitLines(body);
+    const fileLines = countLines(body);
     let startNo = 1;
+    let shownLines = fileLines;
     if (first !== undefined && last !== undefined) {
-      excerpt = excerpt.slice(first - 1, last);
       startNo = first;
-      if (excerpt.length === 0) continue;
+      shownLines = Math.min(last, fileLines) - first + 1;
+      if (shownLines <= 0) continue;
     }
-    // The lines carry their numbers from here on, so everything downstream —
-    // the cap, the truncation, `total` — measures the text that is EMITTED,
-    // never the bytes that were read.
-    const shown = numberLines(excerpt, startNo);
-    // Content will be delivered — in full or truncated — so the result
-    // speaks for this argument either way: THIS entry was read on its
-    // behalf, and an entry read on an argument's behalf is the one thing
-    // that credits the argument with having arrived.
-    spokenArgs.add(arg);
     // #19: the header and the separator count toward the cap with the body, so
     // 300 empty files cannot produce a five-figure prompt under a
     // multimillion-char "cap" with no note. #53: the line numbers count too,
@@ -1257,6 +1295,18 @@ export function buildFileContext(
     const header = `--- ${p} ---\n`;
     const sep = chunks.length > 0 ? "\n\n" : "";
     const overhead = (sep ? 2 : 0) + header.length;
+    // The lines carry their numbers from here on, so everything downstream —
+    // the cap, the truncation, `total` — measures the text that is EMITTED,
+    // never the bytes that were read; and the numbering is built INTO the room
+    // the cap leaves for this excerpt, so the work of numbering is bounded by
+    // the same budget the answer is measured against (#19 again: a budget that
+    // constrains only its output has not constrained its own cost).
+    const shown = numberLines(body, startNo, shownLines, cap - total - overhead);
+    // Content will be delivered — in full or truncated — so the result
+    // speaks for this argument either way: THIS entry was read on its
+    // behalf, and an entry read on an argument's behalf is the one thing
+    // that credits the argument with having arrived.
+    spokenArgs.add(arg);
     if (total + overhead + shown.length > cap) {
       // The marker makes the truncated header longer than the plain one, so the
       // room left is measured against the header that will actually be pushed —
