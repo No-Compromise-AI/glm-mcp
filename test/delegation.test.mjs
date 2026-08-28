@@ -210,6 +210,37 @@ test('a "#n" that names a pull request records no issue: PRs and issues share on
     `a task naming both a PR and an issue records the issue; got ${JSON.stringify(mixed.row?.issue)}`);
 });
 
+// The PR guard's punctuation shapes. A task writes "Review PR #45" with only
+// whitespace between, but also "Review PR: #45" and "Review PR (#45), then
+// fix issue #50" — and a guard anchored on whitespace alone lets the PR
+// number fall through to the issue field, handing earliest-hit-wins to a
+// number that names a pull request. Same wrong as above, one shape along.
+test('a PR number behind punctuation is still not an issue: "PR: #45" and "PR (#45)"', () => {
+  const colon = delegate({ task: 'Review PR: #45' });
+  assert.equal(colon.row?.issue, null,
+    `a "#n" after "PR:" names a pull request, not an issue; got ${JSON.stringify(colon.row?.issue)}`);
+
+  const paren = delegate({ task: 'Review PR (#45) and merge it' });
+  assert.equal(paren.row?.issue, null,
+    `a "#n" in parens after PR names a pull request, not an issue; got ${JSON.stringify(paren.row?.issue)}`);
+
+  const pull = delegate({ task: 'Review pull request (#45) and merge it' });
+  assert.equal(pull.row?.issue, null,
+    `the parens shape spelled out as "pull request"; got ${JSON.stringify(pull.row?.issue)}`);
+
+  // And the real issue reference still wins when the PR number only looks
+  // like the earliest "#n": earliest hit must not go to a pull request.
+  const mixed = delegate({ task: 'Review PR (#45), then fix issue #50' });
+  assert.equal(mixed.row?.issue, 50,
+    `a task naming a PR in parens and a real issue records the issue; got ${JSON.stringify(mixed.row?.issue)}`);
+
+  // The widened separator must not over-reach: with words between the PR and
+  // the "#n" the association is broken, and the reference is an issue's.
+  const spaced = delegate({ task: 'See the PR for issue #50 before you start' });
+  assert.equal(spaced.row?.issue, 50,
+    `letters between the PR and the "#n" break the association; got ${JSON.stringify(spaced.row?.issue)}`);
+});
+
 test('an in-place run on a detached HEAD records branch as present-and-null, not a crash or a SHA', () => {
   const r = delegate({ detach: true });
   assert.equal(r.status, 0, `a detached HEAD is not an error; got exit ${r.status}`);

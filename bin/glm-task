@@ -421,7 +421,11 @@ if notes:
 # and a greedy digit scan would attribute work to an issue nobody touched:
 # absent is honestly unknown, wrong is a quietly false retro. First mention
 # wins when a task names several.
-_rx_pr = re.compile(r"(?:pr|pull\s+request)\s*$", re.I)
+# Separators a "#n" can sit behind and still name the PR it follows:
+# whitespace plus the punctuation tasks are written with ("PR: #45",
+# "PR (#45)") — but no letters, so "see the PR for issue #50" leaves #50
+# an issue reference and not PR-shaped.
+_rx_pr = re.compile(r"\b(?:pr|pull\s+request)\b[^0-9A-Za-z]*$", re.I)
 _text = os.environ["GLM_TASK_TEXT"]
 _hits = []
 for _rx in (
