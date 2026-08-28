@@ -25,11 +25,13 @@
 //   --output-format stream-json --verbose
 //
 // With --output-format stream-json, stdout is one JSON object per line — the
-// SDK's message stream, serialized — and the LAST line is the
-// {"type":"result",...} object glm-task parses into the ledger; a consumer
-// needs no porting. Without it, stdout is the final result text alone, which
-// is what glm-review greps a VERDICT line out of. Either way stderr carries
-// diagnostics, never results.
+// SDK's message stream, serialized. Exactly one of those lines is the
+// {"type":"result",...} object glm-task parses into the ledger; it is not
+// promised to be the last line (the SDK may emit informational messages after
+// the result, and this worker serializes whatever arrives), but glm-task finds
+// it by scanning every line, so placement does not matter to it. Without it,
+// stdout is the final result text alone, which is what glm-review greps a
+// VERDICT line out of. Either way stderr carries diagnostics, never results.
 
 import { mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -158,6 +160,19 @@ const withErrorField = (message) => {
   return message;
 };
 
+// Exit without losing the last write. glm-task and glm-answer read this
+// worker's output through a pipe (`| tee "$log" | trace`; glm-review
+// redirects to a file), and process.exit() terminates without draining writes
+// still queued for a pipe. A record queued behind stream output that has not
+// finished draining is dropped by it — reproduced here: a mid-run death
+// behind a busy pipe lost even a 200-byte record 50 times out of 50. So each
+// write is completed to the OS first (the callback fires once the bytes are
+// in the kernel's buffer, where exit can no longer lose them), and only then
+// does the exit land.
+const exitFlushed = (code, writes) => Promise.all(
+  writes.map(([stream, data]) => new Promise((resolve) => { stream.write(data, () => resolve()); })),
+).then(() => process.exit(code));
+
 try {
   for await (const message of query({
     prompt,
@@ -179,27 +194,37 @@ try {
   // row with null turns, null duration and no session, which reads as
   // "nothing happened" rather than "this broke".
   const msg = err?.message ?? String(err);
-  console.error(`glm-worker: ${msg}`);
+  const detail = `glm-worker: ${msg}`;
+  const writes = [[process.stderr, `${detail}\n`]];
   if (streamJSON) {
-    process.stdout.write(`${JSON.stringify({
+    // Same field set as every other result path — `error` included, because
+    // glm-task's projection reads it off the result line too.
+    writes.push([process.stdout, `${JSON.stringify({
       type: 'result', subtype: 'error_during_execution', is_error: true,
-      result: `glm-worker: ${msg}`, session_id: resume || lastResult?.session_id || null,
+      result: detail, error: detail,
+      session_id: resume || lastResult?.session_id || null,
       num_turns: lastResult?.num_turns ?? null, duration_ms: null,
-    })}\n`);
+    })}\n`]);
   }
-  process.exit(1);
+  await exitFlushed(1, writes);
 }
 
 if (!lastResult) {
-  console.error('glm-worker: the agent loop ended without a result message');
-  process.exit(1);
+  await exitFlushed(1, [
+    [process.stderr, 'glm-worker: the agent loop ended without a result message\n'],
+  ]);
 }
 
 // Text mode is glm-review's surface: the verdict line it greps for must be
 // the last line of prose on stdout, not buried in a JSON object.
 if (!streamJSON) {
   const text = typeof lastResult.result === 'string' ? lastResult.result : '';
-  if (lastResult.is_error) console.error(text || 'glm-worker: the run failed');
+  // The detail may live in `error` rather than `result`, and glm-review scans
+  // this output for capacity language: finding it ends as exit 3, which
+  // glm-task records as no_capacity (a wait), while a bare "run failed" ends
+  // as exit 2 — parked permanently by the caller. The detail itself, not a
+  // generic string, is what must arrive.
+  if (lastResult.is_error) console.error(text || lastResult.error || 'glm-worker: the run failed');
   else if (text) process.stdout.write(`${text}\n`);
 }
 
