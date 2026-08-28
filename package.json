@@ -48,7 +48,8 @@
     "verify:review": "node scripts/verify-review.mjs",
     "verify:docs": "node scripts/verify-docs.mjs",
     "verify:drain": "node scripts/verify-drain.mjs",
-    "verify:worker": "node scripts/verify-worker.mjs"
+    "verify:worker": "node scripts/verify-worker.mjs",
+    "verify:delegation": "node scripts/verify-delegation.mjs"
   },
   "keywords": [
     "mcp",
