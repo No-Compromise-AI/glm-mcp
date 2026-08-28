@@ -66,7 +66,7 @@ naming the offending `cwd` — loudly, rather than quietly matching no files.
 
 Sharing one server between several agents has a cost the roots do not show: file reads are
 synchronous, so a call that reads a tree delays every other call on that server until it
-finishes — measured, a trivial call waited ~170× its own latency beside a 79 MB read. See
+finishes — measured, a trivial call waited over 200× its own latency beside a 79 MB read. See
 [Limits](#limits) for that, and for what `GLM_MCP_GLOB_TIMEOUT_MS` does and does not bound.
 
 The version is pinned on purpose: a bare `npx` resolves `latest` at run time, while the package
@@ -501,14 +501,20 @@ server until it finishes.** The walk, the reads and the assembly around them are
 `statSync` / `readFileSync`, and they block the event loop; the round trip to z.ai is
 asynchronous. It is specifically the filesystem half that does not interleave: two calls with
 no files, issued together against an upstream deliberately held at 300 ms per call, finished in
-310 ms rather than 600. With files it is the other way round — measured through the real MCP
+306 ms rather than 600. With files it is the other way round — measured through the real MCP
 surface against an upstream that answers instantly, so every millisecond is the server's own
-doing, a call reading 400 files (79 MB) took 709 ms while a trivial call issued beside it, one
-that reads nothing and answers in 4 ms alone, took 665 ms and finished with the read rather
-than on its own schedule. That is ~170× its own latency, all of it spent waiting on another
+doing, a call reading 400 files (79 MB) took 680 ms while a trivial call issued beside it, one
+that reads nothing and answers in 3 ms alone, took 637 ms and finished with the read rather
+than on its own schedule. That is over 200× its own latency, all of it spent waiting on another
 caller's context, and it is the number to weigh before running one shared server for several
 agents: their calls serialise behind each other's file context, and the limits above are all
-that bound how long one read holds the rest.
+that bound how long one read holds the rest. Two things about that 400-file run are worth
+knowing when you size your own cap. It needed `GLM_MCP_MAX_FILE_CHARS` raised to 100,000,000
+for the run — the default derived budget would have cut the same walk far sooner — and even
+100,000,000 is less generous than it looks, because the cap measures the text delivered, not
+the bytes read: line numbers and headers swell 79 MB of files to 85.2M characters of prompt,
+so a cap sized to the bytes on disk would cut this walk at the 376th file and never read the
+last 24. Size the cap to the prompt you are willing to pay for, not to the tree.
 
 Output ceilings come from z.ai's published table and are **per model** — 131,072
 for the GLM-5 and 4.6/4.7 families, 98,304 for GLM-4.5, 32,768 for the vision
