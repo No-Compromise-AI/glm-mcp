@@ -18,13 +18,19 @@
 //     into the parked record. The gate asserts a park happened; a drain that
 //     never retried, or parked under "failed", would pass it.
 //
-// WIRING, stated plainly rather than papered over: this file is NOT run by
-// `npm test`. package.json's "test" script names its files explicitly, and
-// package.json is frozen by the task these tests belong to — so the
-// one-token change that puts them in CI (add test/delegation.test.mjs to
-// that list; both workflows already run `npm test`, nothing else is needed)
-// belongs to the maintainer. Until then, run them directly:
-//   node --test test/delegation.test.mjs
+// Also what a ledger row IDENTIFIES (#77), beyond what scripts/verify-ledger.mjs
+// drives. The gate covers the three forms of issue reference, the `-b` branch,
+// and the in-place branch. What it does not exercise:
+//
+//   * a "#n" that names a PULL REQUEST is not an issue. GitHub numbers issues
+//     and PRs from one shared sequence, so attributing "review PR #45" to
+//     issue 45 attributes work to an issue nobody touched — the exact wrong
+//     the field exists to avoid, one shape past the forms the gate enumerates.
+//   * a run on a detached HEAD has no branch to name. The row must record
+//     null, present, without crashing or inventing a SHA — an in-place run on
+//     a CI checkout is exactly this shape.
+//
+// WIRING: run by `npm test` (package.json names this file).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -47,7 +53,7 @@ const resultLine = (o) => JSON.stringify({
  * two channels. `note`, when given, is appended to the notes file as the
  * worker runs — the third channel a blocked agent speaks through.
  */
-function delegate({ code = 0, stdout = resultLine({}), note = '', task = 'do the thing' } = {}) {
+function delegate({ code = 0, stdout = resultLine({}), note = '', task = 'do the thing', onBranch = null, detach = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'glm-delegation-test-'));
   const bin = join(dir, 'bin'); mkdirSync(bin);
   for (const f of ['glm-task', '_glm-hosts.sh', '_glm-capacity.sh']) {
@@ -64,6 +70,8 @@ function delegate({ code = 0, stdout = resultLine({}), note = '', task = 'do the
     { encoding: 'utf8' });
   git('init', '-q', '.');
   git('commit', '-q', '--allow-empty', '-m', 'base');
+  if (onBranch) git('checkout', '-q', '-b', onBranch);
+  if (detach) git('checkout', '-q', '--detach');
 
   const ledger = join(dir, 'ledger.jsonl');
   const r = spawnSync('bash', [join(bin, 'glm-task'), '-C', repo, '-r', 'none', task], {
@@ -181,4 +189,33 @@ exit 6
     'glm-task’s own reason must travel into the parked record, so the morning reader learns WHY');
   assert.match(`${r.stdout ?? ''}`, /incomplete=1/,
     'the summary must count it as incomplete, not fold it into failed or drop it');
+});
+
+// What the row IDENTIFIES (#77), past the forms scripts/verify-ledger.mjs
+// enumerates. Both assert on fields the gate never reads, in the shapes the
+// gate never invokes: a PR reference where its issue forms point, and a
+// working directory with no branch at all.
+test('a "#n" that names a pull request records no issue: PRs and issues share one number sequence', () => {
+  const r = delegate({ task: 'Review PR #45, then merge it' });
+  assert.equal(r.status, 0, `the run itself must complete normally; got exit ${r.status}`);
+  assert.ok('issue' in (r.row ?? {}),
+    'the issue field must be present even when nothing is named');
+  assert.equal(r.row?.issue, null,
+    `issue 45 does not exist — that number is a pull request. Wrong is worse than absent; got ${JSON.stringify(r.row?.issue)}`);
+
+  // The guard must not over-reach: a real issue reference in the same task is
+  // still recorded, and is not swallowed by a nearby PR mention.
+  const mixed = delegate({ task: 'Review PR #45, then fix issue #50 it blocks' });
+  assert.equal(mixed.row?.issue, 50,
+    `a task naming both a PR and an issue records the issue; got ${JSON.stringify(mixed.row?.issue)}`);
+});
+
+test('an in-place run on a detached HEAD records branch as present-and-null, not a crash or a SHA', () => {
+  const r = delegate({ detach: true });
+  assert.equal(r.status, 0, `a detached HEAD is not an error; got exit ${r.status}`);
+  assert.ok(r.row, `a row must still be written; the run exited ${r.status}`);
+  assert.ok('branch' in r.row,
+    'the branch field must be present — a reader cannot tell an omitted field from an old row written before the field existed');
+  assert.equal(r.row.branch, null,
+    `a detached HEAD names no branch, and the row must not invent one; got ${JSON.stringify(r.row.branch)}`);
 });

@@ -302,7 +302,11 @@ delegation loop from an npm install alone, which is the thing that was previousl
 Delegation does not go through it: `bin/glm-task` hands the task to `bin/glm-worker`, which
 runs the Claude Agent SDK — a binary the worker package vendors, so the delegate → review →
 answer path needs no host CLI installed (#90) — verifies the result independently, has a
-*different vendor's* model review it against the spec, and records the outcome. Reviewer
+*different vendor's* model review it against the spec, and records the outcome. The record
+says what a run identifies, not only what happened: the branch it worked on — the one
+`-W`/`-b` created, or the branch an in-place run stands on — and the issue, when the task
+names one as `#123`, `issue 123`, or the `gh issue view 123` line. `dir` alone names a temp
+worktree that is deleted afterwards (#77). Reviewer
 selection follows the agent you are sitting in — `GLM_HOST` — so the host driving a delegation
 is never its own
 reviewer: from Claude that is codex + agy, from Codex claude + agy, from Antigravity codex +
