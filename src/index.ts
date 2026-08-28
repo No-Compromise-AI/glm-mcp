@@ -84,7 +84,10 @@ server.registerTool(
             "contains glob characters. Glob expansion skips node_modules, .git and build " +
             "output by default; naming a directory in the pattern (node_modules/foo/**/*.d.ts) " +
             "or setting GLM_MCP_GLOB_IGNORE overrides that. Relative paths — ./ and ../ " +
-            "prefixes included — resolve against 'cwd'.",
+            "prefixes included — resolve against 'cwd'. Every file arrives with cat -n style " +
+            "line numbers, so answers can cite path:line and mean it; a literal path may " +
+            'carry an inclusive line range ("src/auth/session.ts:40-120") to send just that ' +
+            "region, numbered with the file's own line numbers rather than renumbered from 1.",
         ),
       cwd: z
         .string()
