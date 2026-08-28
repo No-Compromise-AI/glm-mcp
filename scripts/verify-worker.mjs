@@ -189,6 +189,14 @@ try {
   if (readFileSync(TARGET, 'utf8').trim() !== 'written-by-a-real-tool') {
     fail(`#90: a file exists at the target path but does not carry what the tool call specified — got ${JSON.stringify(readFileSync(TARGET, 'utf8').slice(0, 80))}. Something other than the delegated tool call created it.`);
   }
+  // The tool ran AND the command completed. These are two facts, and asserting
+  // only the first was a real hole: a worker that wrote the file, emitted a
+  // well-formed record, then exited 1 passed rules 1-3 outright — verified by
+  // experiment. glm-task branches on this exit status, so a gate blind to it
+  // green-lights a worker that reports failure on every single delegation.
+  if (first.code !== 0) {
+    fail(`#90: the tool call ran and the file was written, but the worker exited ${first.code}. glm-task treats a non-zero worker as a failed delegation, so every run would be recorded as broken while doing exactly the right thing.\n  stderr: ${first.err.slice(-400)}`);
+  }
 
   // ------- rule 2: the record carries every field glm-task projects
   // DERIVED, not enumerated. glm-task turns the worker's result into a ledger
@@ -209,6 +217,13 @@ try {
     const missing = [...required].filter((k) => !(k in result));
     if (missing.length > 0) {
       fail(`#90: the result record is missing ${JSON.stringify(missing)}. glm-task reads ${JSON.stringify([...required])} off the worker's result — that set was read out of glm-task itself, not written here, so this list is what the ledger actually consumes today.\n\nA missing field does not crash anything: it lands in the ledger as null, and glm-stats, glm-why and glm-drain then report confidently on nothing. That is why the shape is a gate rule and not a review note.\n  got: ${JSON.stringify(Object.keys(result))}`);
+    }
+    // The fields being present is not the same as the record saying the run
+    // worked. glm-task:191 fails a delegation on either of these, so a gate that
+    // reads the shape but not the verdict would pass a worker that reports
+    // every successful run as broken.
+    if (result.is_error === true || (result.subtype != null && result.subtype !== 'success')) {
+      fail(`#90: the worker wrote the file and returned a well-formed record that reports FAILURE — is_error=${JSON.stringify(result.is_error)}, subtype=${JSON.stringify(result.subtype)}. glm-task:191 fails the delegation on exactly that pair, so every run would be recorded as failed while the work itself succeeded.`);
     }
   }
 
@@ -314,10 +329,19 @@ try {
           mkdirSync(dirname(dest), { recursive: true });
           try { writeFileSync(dest, readFileSync(join(REPO, rel))); } catch { /* not readable, skip */ }
         }
+        // Through `npm run <hook>`, NOT by executing the command string.
+        // Running the command directly leaves npm's own lifecycle environment
+        // absent — npm_lifecycle_event would still say `verify:worker` — and a
+        // hook that acts only when npm_lifecycle_event === 'postinstall' then
+        // does nothing here while doing its worst on a consumer's machine.
+        // Confirmed by experiment, not reasoned about: with such a hook this
+        // rule reported WORKER OK, and a real `npm install` of the same package
+        // created claude-agent-sdk-darwin-arm64.
         for (const [hook, cmd] of hooks) {
           let code = 0;
           try {
-            execFileSync(cmd, { cwd: SANDBOX, shell: true, timeout: 120_000, stdio: 'ignore' });
+            execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['run', hook],
+              { cwd: SANDBOX, timeout: 120_000, stdio: 'ignore' });
           } catch (e) { code = e.status ?? 1; }
           if (code !== 0) {
             fail(`#90: the ${hook} hook (\`${cmd}\`) exits ${code} in a directory laid out exactly as a published install — the shipped files, and no packages/ directory. That is every consumer's machine, so every one of their installs fails for the sake of a feature they cannot reach.`);
