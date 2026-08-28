@@ -61,6 +61,14 @@
 // speak their actual dialect. That is the lesson: a stub makes a gate fast and
 // free, and blind to exactly the mismatches it is standing in for.
 //
+//   14. An item that SUCCEEDS is actually shipped, with -m and -R. Nothing in
+//       rules 1-13 required the ship command to be called at all: an
+//       implementation that marked successful items done and merged nothing
+//       passed every one of them. A gate for a tool whose whole purpose is to
+//       merge work must assert that it merges work.
+//   15. Shipping is SERIALISED — never two at once, even at -j 4 — so CI for
+//       the next item runs against a main that already contains the last.
+//
 // Rules 5, 6, 7 and 8 exist to forbid the wrong fixes: "scale" must not come to
 // mean unbounded, "drain" must not come to mean merge-whatever-finished, and a
 // stuck night must not merge its way through a broken main.
@@ -84,7 +92,7 @@ const check = (ok, msg) => { checks++; if (!ok) fail(msg); };
  * from `codes` — a map of item id to either a code, or an array of codes
  * consumed one per attempt (so a requeue can succeed the second time).
  */
-function drain({ items, codes, jobs = 2, extraArgs = [], shipCode = 0, asked = 0 }) {
+function drain({ items, codes, jobs = 2, extraArgs = [], shipCode = 0, asked = 0, slow = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'glm-drain-gate-'));
   const state = join(dir, 'state'); mkdirSync(state, { recursive: true });
   const log = join(dir, 'calls.tsv');
@@ -111,7 +119,7 @@ n=$(grep -c "^START	$item	" ${JSON.stringify(log)} 2>/dev/null)
 [ -z "$n" ] && n=0
 echo "START	$item	$start	$n" >> ${JSON.stringify(log)}
 code=$(${JSON.stringify(join(dir, 'code.sh'))} "$item" "$n")
-sleep 0.4
+sleep "$(${JSON.stringify(join(dir, 'slow.sh'))} "$item")"
 end=$(perl -MTime::HiRes=time -e 'printf "%.0f", time*1000')
 echo "END	$item	$end	$code" >> ${JSON.stringify(log)}
 # What a real glm-task emits: the isolated worktree on the way in, and one
@@ -145,9 +153,23 @@ echo "\${codes[$i]}"
 `);
   chmodSync(codeSh, 0o755);
 
+  // Per-item duration. Without this every attempt took the same 0.4s, so an
+  // earlier item could never finish AFTER a later one — and the launch-order
+  // race this exists to catch was unreproducible.
+  const slowSh = join(dir, 'slow.sh');
+  writeFileSync(slowSh, `#!/usr/bin/env bash
+case "$1" in
+${Object.entries(slow).map(([id, secs]) => `  ${id}) echo ${secs} ;;`).join('\n')}
+  *) echo 0.4 ;;
+esac
+`);
+  chmodSync(slowSh, 0o755);
+
   const shipStub = join(dir, 'glm-ship');
   writeFileSync(shipStub, `#!/usr/bin/env bash
-echo "SHIP	$*" >> ${JSON.stringify(shipLog)}
+echo "SHIP	start	$(perl -MTime::HiRes=time -e 'printf "%.0f", time*1000')	$*" >> ${JSON.stringify(shipLog)}
+sleep 0.3
+echo "SHIP	end	$(perl -MTime::HiRes=time -e 'printf "%.0f", time*1000')	$*" >> ${JSON.stringify(shipLog)}
 exit ${shipCode}
 `);
   chmodSync(shipStub, 0o755);
@@ -180,7 +202,12 @@ exit ${shipCode}
   const parked = existsSync(parkedPath)
     ? readFileSync(parkedPath, 'utf8').trim().split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } })
     : [];
-  const shipped = readFileSync(shipLog, 'utf8').trim().split('\n').filter(Boolean);
+  const shipRows = readFileSync(shipLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => l.split('\t'));
+  const shipped = shipRows.map((r) => r.join(' '));
+  const shipSpans = shipRows.filter((r) => r[1] === 'start').map((st) => {
+    const en = shipRows.find((e) => e[1] === 'end' && e[3] === st[3] && Number(e[2]) >= Number(st[2]));
+    return { args: st[3] ?? '', from: Number(st[2]), to: en ? Number(en[2]) : Number(st[2]) + 300 };
+  });
 
   // Max overlap across [start,end] intervals — the concurrency actually used.
   const spans = starts.map((s) => {
@@ -192,7 +219,7 @@ exit ${shipCode}
     const n = spans.filter((b) => b.from < a.to && a.from < b.to).length;
     if (n > peak) peak = n;
   }
-  return { stdout, status, starts, ends, spans, peak, parked, shipped, branches };
+  return { stdout, status, starts, ends, spans, peak, parked, shipped, branches, shipSpans };
 }
 
 // ------------------------------------------------------------- rules 1 and 2
@@ -302,7 +329,16 @@ exit ${shipCode}
 // ------------------------------------------------------------------ rule 12
 {
   // 1002 and 1003 fail and halt the line; 1001 is slow and succeeds after.
-  const r = drain({ items: ['1001', '1002', '1003', '1004'], codes: { 1002: 1, 1003: 1 }, jobs: 2 });
+  // The failures that establish HALT are SLOW; the later item that must not
+  // ship is FAST. Without the launch-order barrier the fast one is applied
+  // first and merges before the line has stopped.
+  const r = drain({ items: ['1001', '1002', '1003', '1004'], codes: { 1002: 1, 1003: 1 },
+                    jobs: 2, slow: { 1002: 3, 1003: 3, 1004: 0.1 } });
+  // A 30x margin, not 16x. The first run of this case failed on a loaded
+  // machine — two other agents were mid-delegation — and passed five times in
+  // a row once they finished. A race check whose verdict depends on system
+  // load is a flake, and a flaky gate gets ignored, which is worse than not
+  // having it.
   const halted = /halt/i.test(r.stdout);
   if (halted) {
     check(!r.shipped.some((l) => l.includes('1004')),
@@ -318,6 +354,24 @@ exit ${shipCode}
   const tries = r.starts.filter((s) => s[1] === '1101').length;
   check(tries >= 2,
     `rule 13: with -n 1, item 1101 failed and was never retried (${tries} attempt). -n caps how many ITEMS are started, not how many attempts one item gets — the retry is part of working the item, not a second item`);
+}
+
+// ------------------------------------------------------------ rules 14 & 15
+{
+  const r = drain({ items: ['1201', '1202', '1203', '1204'], codes: {}, jobs: 2 });
+  check(r.shipSpans.length === 4,
+    `rule 14: four items succeeded and ${r.shipSpans.length} were shipped. Nothing in rules 1-13 required the ship command to be called at all — an implementation that marked items done and merged nothing satisfied every one of them. A drain that does not merge is not a drain`);
+  const missingFlags = r.shipSpans.filter((s) => !/-m\b/.test(s.args) || !/-R\b/.test(s.args));
+  check(missingFlags.length === 0,
+    `rule 14: ${missingFlags.length} ship invocation(s) lacked -m or -R. -m is the auto-merge this tool exists for; -R refuses to merge a PR with no checks at all, which is the last thing standing between an unattended run and merging something CI never saw. First: ${JSON.stringify(missingFlags[0]?.args ?? '')}`);
+
+  let overlap = 0;
+  for (const a of r.shipSpans) {
+    const n = r.shipSpans.filter((b) => b.from < a.to && a.from < b.to).length;
+    if (n > overlap) overlap = n;
+  }
+  check(overlap <= 1,
+    `rule 15: ${overlap} ship commands overlapped. Merges must serialise so CI for the next item runs against a main containing the last — parallel merges are how item 7 gets tested against a main that does not yet have item 3 in it`);
 }
 
 console.log(`verify-drain: ${checks} checks passed`);

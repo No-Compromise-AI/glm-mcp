@@ -164,9 +164,37 @@ run_agent() { # $1 = prompt, $2 = log path
   # than burn the item. Read from the log because the pipeline above consumed
   # stdout, and take the LAST 4000 characters — the refusal arrives at the end,
   # and a whole stream-json log would match the words in the task text itself.
-  if glm_is_exhausted "$(tail -c 4000 "$2" 2>/dev/null)"; then
+  # Scoped to the run's OWN outcome, not its prose. The first version scanned
+  # the raw tail of the stream, so an agent that SUCCEEDED at a task about rate
+  # limiting — "Implemented rate-limit handling; all tests pass" — matched the
+  # detector and was reported as throttled. Since a throttled item is requeued,
+  # that task could never finish: it retried forever, and the task most likely
+  # to trip it was building the drain itself.
+  #
+  # A run that produced a successful result was not throttled, whatever words
+  # are in it. So the question is asked only of a run that FAILED, and only of
+  # its error text.
+  ERRTEXT="$(GLM_LOGF="$2" python3 - <<'PYEOF'
+import json, os
+res = None
+try:
+    for line in open(os.environ["GLM_LOGF"]):
+        if line.startswith("{") and '"type":"result"' in line:
+            try: res = json.loads(line)
+            except Exception: pass
+except Exception: pass
+# No result event at all means the run died before finishing — its tail is the
+# only evidence there is, so fall back to it.
+if res is None:
+    try: print(open(os.environ["GLM_LOGF"]).read()[-4000:])
+    except Exception: pass
+elif res.get("is_error") or res.get("subtype") not in (None, "success"):
+    print(str(res.get("result") or res.get("error") or "")[:4000])
+PYEOF
+)"
+  if [[ -n "$ERRTEXT" ]] && glm_is_exhausted "$ERRTEXT"; then
     RATE_LIMITED=1
-    RETRY_AFTER="$(glm_retry_after "$(tail -c 4000 "$2" 2>/dev/null)")"
+    RETRY_AFTER="$(glm_retry_after "$ERRTEXT")"
   fi
 }
 
@@ -252,7 +280,13 @@ Report at the end: which findings you reproduced and fixed, and which you refute
     do_verify
     "$HERE/glm-review" -C "$DIR" -b "$BASE" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>>"$REVERR"
     rc=$?
-    case $rc in 0) REVIEW_VERDICT="pass" ;; 1) REVIEW_VERDICT="changes_required" ;; *) REVIEW_VERDICT="error" ;; esac
+    # Same mapping as the first review, exit 3 included. Omitting it here turned
+    # "every reviewer was out of capacity" into "error", which glm-task reports as
+    # exit 2 = UNREVIEWED — and a caller parks that permanently. Capacity is a wait,
+    # not a verdict, and the same fact must not change meaning because it happened
+    # after a fix round rather than before one.
+    case $rc in 0) REVIEW_VERDICT="pass" ;; 1) REVIEW_VERDICT="changes_required" ;;
+               3) REVIEW_VERDICT="no_capacity" ;; *) REVIEW_VERDICT="error" ;; esac
     echo "glm-task: review=$REVIEW_VERDICT (after round $ROUNDS)" >&2
   done
 fi

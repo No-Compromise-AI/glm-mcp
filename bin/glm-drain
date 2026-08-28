@@ -118,8 +118,8 @@ park() { # $1 id  $2 reason  $3 session  $4 worktree  $5 question
 # reviewer, with the epoch second each becomes ready at. QCOUNT is 1 while an
 # item has never been launched and 0 once it has: -n caps ITEMS, not attempts,
 # and the difference is exactly this bit.
-QUEUE=(); QSPEC=(); QRU=(); QRH=(); QCOUNT=()
-WID=(); WSPEC=(); WRU=(); WRH=(); WREADY=()
+QUEUE=(); QSPEC=(); QRU=(); QRH=(); QCOUNT=(); WSESS=(); WWT=()
+WID=(); WSPEC=(); WRU=(); WRH=(); WREADY=(); WSESS=(); WWT=()
 ALL_IDS=(); ALL_SPECS=()
 
 add_item() { # $1 id  $2 spec
@@ -141,12 +141,19 @@ spec_of() { # $1 id -> the item's spec on stdout
   done
   printf 'drain item %s\n' "$1"
 }
-wait_item() { # $1 id  $2 spec  $3 ru  $4 rh  $5 ready-at (epoch secs)
+# An item that has run once already has a session and a worktree, and they must
+# survive the wait: if the line halts while it is queued for a retry, the parked
+# entry is all anyone gets, and a park without them cannot be resumed by
+# glm-answer. That is the parking requirement, so the resume fields travel with
+# the item rather than being reconstructed later.
+wait_item() { # $1 id  $2 spec  $3 ru  $4 rh  $5 ready-at  $6 session  $7 worktree
   WID=(${WID[@]+"${WID[@]}"} "$1")
   WSPEC=(${WSPEC[@]+"${WSPEC[@]}"} "$2")
   WRU=(${WRU[@]+"${WRU[@]}"} "$3")
   WRH=(${WRH[@]+"${WRH[@]}"} "$4")
   WREADY=(${WREADY[@]+"${WREADY[@]}"} "$5")
+  WSESS=(${WSESS[@]+"${WSESS[@]}"} "${6:-}")
+  WWT=(${WWT[@]+"${WWT[@]}"} "${7:-}")
 }
 
 # One item's spec. Raw ids are opaque by design — the drain does not know what
@@ -240,31 +247,58 @@ ship_item() { # $1 id  $2 worktree  $3 branch
 # hold new launches until the backoff expires, then retry the item. Backing off
 # and immediately widening again is the same evasion done more slowly, so the
 # drop is permanent — the queue still drains, one item at a time.
-throttle() { # $1 id  $2 ru the retry keeps  $3 rh  $4 asked-secs  $5 why
+throttle() { # $1 id  $2 ru  $3 rh  $4 asked-secs  $5 why  $6 session  $7 worktree
   if [[ "$JOBS" != "1" ]]; then
     echo "glm-drain: $5 — concurrency pinned to 1 for the rest of the run" >&2
   fi
   JOBS=1
   local until=$((NOW + $(backoff_wait "$3" "$4")))
   (( until > HOLD_UNTIL )) && HOLD_UNTIL=$until
-  wait_item "$1" "$(spec_of "$1")" "$2" "$(($3 + 1))" "$HOLD_UNTIL"
+  wait_item "$1" "$(spec_of "$1")" "$2" "$(($3 + 1))" "$HOLD_UNTIL" "${6:-}" "${7:-}"
 }
 
-RUNNING=0; STARTED=0; RSEQ=0; HOLD_UNTIL=0; NOW=$(date +%s)
+RUNNING=0; STARTED=0; RSEQ=0; NEXTRES=1; HOLD_UNTIL=0; NOW=$(date +%s)
 
 # ---- the loop -------------------------------------------------------------
 while :; do
   NOW=$(date +%s)
 
   # Collect results first — a freed slot should be refillable in the same pass.
-  # Result files are named by launch sequence and the glob walks them in order,
-  # so results are applied in the order their work was launched: an older
-  # item's halt is always seen before a younger item's ship, never after.
-  for res in "$RESDIR"/res-*; do
-    [[ -e "$res" ]] || continue
+  # Results are applied in LAUNCH ORDER, and that is a barrier rather than a
+  # sort. Globbing res-* sorts only the files that happen to exist yet, so a
+  # younger item that finished fast was applied before an older one that was
+  # still running — and could therefore SHIP before the older item's failure
+  # established HALT. The stop-the-line boundary is only as good as the order
+  # results are read in.
+  #
+  # So: consume res-N only when N is the sequence we are waiting for. A missing
+  # earlier result blocks the younger ones behind it, which is the point.
+  #
+  # The stall guard matters as much as the barrier. If a worker died without
+  # writing its result, waiting for that sequence forever would hang the drain
+  # with nothing running — so when no background job remains and the expected
+  # file has not appeared, step the pointer to the lowest sequence that HAS
+  # appeared rather than waiting for one that never will.
+  if [[ ! -e "$RESDIR/res-$(printf '%06d' "$NEXTRES")" ]] && [[ -z "$(jobs -pr)" ]]; then
+    _lowest=""
+    for _f in "$RESDIR"/res-*; do
+      [[ -e "$_f" ]] || continue
+      _lowest="${_f##*/res-}"; break
+    done
+    if [[ -n "$_lowest" ]]; then
+      echo "glm-drain: no result for sequence $NEXTRES and nothing running — skipping to $((10#$_lowest))" >&2
+      NEXTRES=$((10#$_lowest))
+    fi
+  fi
+  while :; do
+    res="$RESDIR/res-$(printf '%06d' "$NEXTRES")"
+    [[ -e "$res" ]] || break
     IFS='|' read -r id ru rh rc session worktree branch question asked < "$res"
-    [[ -n "$id" ]] || continue    # mid-write; picked up on the next poll
+    # Mid-write: BREAK, not continue. In the old for-loop continue moved to the
+    # next file; in this barrier it would retry the same one forever.
+    [[ -n "$id" ]] || break
     rm -f "$res"
+    NEXTRES=$((NEXTRES + 1))
     RUNNING=$((RUNNING - 1))
     echo "glm-drain: item $id -> exit $rc" >&2
 
@@ -329,7 +363,7 @@ while :; do
           ;;
       5)  # RATE LIMITED. The attempt is not consumed: throttling says nothing
           # about the change, so the retry does not burn the item's one retry.
-          throttle "$id" "$ru" "$rh" "$asked" "rate limited on item $id (attempt not consumed)"
+          throttle "$id" "$ru" "$rh" "$asked" "rate limited on item $id (attempt not consumed)" "$session" "$worktree"
           ;;
       *)  # An exit code the contract does not define — glm-task crashed or was
           # killed mid-run, and the run produced no information about the
@@ -354,16 +388,16 @@ while :; do
         park "${QUEUE[$i]}" halted "" "" "$HALT"
       done
       for ((i = 0; i < ${#WID[@]}; i++)); do
-        park "${WID[$i]}" halted "" "" "$HALT"
+        park "${WID[$i]}" halted "${WSESS[$i]:-}" "${WWT[$i]:-}" "$HALT"
       done
       QUEUE=(); QSPEC=(); QRU=(); QRH=(); QCOUNT=()
-      WID=(); WSPEC=(); WRU=(); WRH=(); WREADY=()
+      WID=(); WSPEC=(); WRU=(); WRH=(); WREADY=(); WSESS=(); WWT=()
     fi
   done
 
   # Items whose backoff has expired go back to the front of the ready queue,
   # ahead of work never tried.
-  _k_id=(); _k_spec=(); _k_ru=(); _k_rh=(); _k_ready=()
+  _k_id=(); _k_spec=(); _k_ru=(); _k_rh=(); _k_ready=(); _k_sess=(); _k_wt=()
   for ((i = 0; i < ${#WID[@]}; i++)); do
     if (( ${WREADY[$i]} <= NOW )); then
       # Everything in WAIT was launched before (that is how it earned a
@@ -384,6 +418,7 @@ while :; do
   WID=(${_k_id[@]+"${_k_id[@]}"}); WSPEC=(${_k_spec[@]+"${_k_spec[@]}"})
   WRU=(${_k_ru[@]+"${_k_ru[@]}"}); WRH=(${_k_rh[@]+"${_k_rh[@]}"})
   WREADY=(${_k_ready[@]+"${_k_ready[@]}"})
+  WSESS=(${_k_sess[@]+"${_k_sess[@]}"}); WWT=(${_k_wt[@]+"${_k_wt[@]}"})
 
   # Fill slots. Everything that says "don't start more" is checked here, in one
   # place, so no worker can ever widen past what the run has been told. -n caps
@@ -417,7 +452,7 @@ while :; do
       SKIPPED=$((SKIPPED + ${#QUEUE[@]} + ${#WID[@]}))
       echo "glm-drain: reached -T — skipping ${#QUEUE[@]} queued and ${#WID[@]} waiting items" >&2
       QUEUE=(); QSPEC=(); QRU=(); QRH=(); QCOUNT=()
-      WID=(); WSPEC=(); WRU=(); WRH=(); WREADY=()
+      WID=(); WSPEC=(); WRU=(); WRH=(); WREADY=(); WSESS=(); WWT=()
       continue
     fi
     if (( MAXITEMS > 0 && STARTED >= MAXITEMS )); then

@@ -52,12 +52,40 @@ is_delegation_worktree() {
   case "$(basename "$1")" in glm-wt-*) return 0 ;; *) return 1 ;; esac
 }
 
-is_finished() { # $1 = ref, $2 = branch
+# Finished means: nothing would be lost by deleting this. Three questions, and
+# a no to any of them keeps the worktree.
+#
+# The dirty check is the one that matters most. The first version asked only
+# whether a PR with this branch name had ever merged — so a worktree with
+# uncommitted edits, or with commits added AFTER that PR merged, was force-
+# removed and its branch force-deleted on the strength of a name match. That
+# loses work irreversibly, which is the one thing a garbage collector must
+# never do.
+is_finished() { # $1 = ref, $2 = branch, $3 = worktree
+  # 1. Anything uncommitted, untracked included, and it is not finished.
+  if [[ -n "$(git -C "$3" status --porcelain 2>/dev/null)" ]]; then
+    KEEP_REASON="uncommitted changes"
+    return 1
+  fi
+  # 2. Merged by fast-forward or rebase: the tip is reachable from main.
   git -C "$DIR" merge-base --is-ancestor "$1" "$MAIN" 2>/dev/null && return 0
-  [[ $ASK_GH -eq 1 ]] || return 1
-  command -v gh >/dev/null 2>&1 || return 1
-  [[ -n "$(gh pr list --repo "$(git -C "$DIR" remote get-url origin 2>/dev/null)" \
-             --head "$2" --state merged --limit 1 --json number --jq '.[].number' 2>/dev/null)" ]]
+  # 3. Squash-merged: no shared commit, so ask GitHub — but compare the SHA the
+  #    PR actually merged against the tip that is here NOW. A name match alone
+  #    says nothing about commits made since.
+  [[ $ASK_GH -eq 1 ]] || { KEEP_REASON="not merged"; return 1; }
+  command -v gh >/dev/null 2>&1 || { KEEP_REASON="not merged (gh unavailable)"; return 1; }
+  local merged_sha here_sha
+  merged_sha="$(gh pr list --repo "$(git -C "$DIR" remote get-url origin 2>/dev/null)" \
+                  --head "$2" --state merged --limit 1 --json headRefOid \
+                  --jq '.[].headRefOid' 2>/dev/null)"
+  here_sha="$(git -C "$DIR" rev-parse "$1" 2>/dev/null)"
+  if [[ -n "$merged_sha" && "$merged_sha" == "$here_sha" ]]; then return 0; fi
+  if [[ -n "$merged_sha" ]]; then
+    KEEP_REASON="a PR for this branch merged $(printf '%.8s' "$merged_sha"), but the tree is at $(printf '%.8s' "$here_sha") — there is work here that never shipped"
+  else
+    KEEP_REASON="not merged"
+  fi
+  return 1
 }
 
 REMOVED=0; KEPT=0; SKIPPED=0
@@ -72,7 +100,8 @@ for LINE in $(git -C "$DIR" worktree list --porcelain | awk '
     SKIPPED=$((SKIPPED + 1)); IFS=$'\n'; continue
   fi
 
-  if is_finished "$REF" "$BR"; then
+  KEEP_REASON="not merged"
+  if is_finished "$REF" "$BR" "$WT"; then
     if [[ $DRY -eq 1 ]]; then
       echo "  would remove  $WT  [$BR]"
     elif git -C "$DIR" worktree remove "$WT" --force 2>/dev/null; then
@@ -83,7 +112,7 @@ for LINE in $(git -C "$DIR" worktree list --porcelain | awk '
       echo "  could not remove  $WT  [$BR]" >&2
     fi
   else
-    echo "  kept     $WT  [$BR] — not merged${ASK_GH:+}"
+    echo "  kept     $WT  [$BR] — $KEEP_REASON"
     KEPT=$((KEPT + 1))
   fi
   IFS=$'\n'
