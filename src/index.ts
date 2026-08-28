@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import {
@@ -16,6 +18,7 @@ import {
   type AskResult,
   type Reasoning,
 } from "./glm.js";
+import { DEFAULT_PROGRESS_MS, envLimit } from "./limits.js";
 import { buildReviewPrompt, minSubstance, substanceOf, verdictOf } from "./review.js";
 
 // Read rather than repeated: a literal here drifts from package.json on every
@@ -47,6 +50,77 @@ const usageFooter = (result: AskResult): string =>
   ]
     .filter(Boolean)
     .join(" · ");
+
+/**
+ * The heartbeat's cadence (#43): GLM_MCP_PROGRESS_MS, or five seconds. An
+ * unparsable value falls back the way every environment limit does (#24) —
+ * Number("abc") is NaN, and NaN as an interval is not a slow heartbeat but
+ * none at all, because every scheduling comparison against it is false.
+ */
+function progressIntervalMs(): number {
+  return envLimit("GLM_MCP_PROGRESS_MS", DEFAULT_PROGRESS_MS);
+}
+
+/**
+ * Beat `notifications/progress` to the client that asked for them, while a
+ * call to GLM is in flight (#43). GLM-5.3 at reasoning "max" over a near-full
+ * context window runs for many minutes, and a caller that cannot tell
+ * "working" from "hung" kills the call — or the session — while the model is
+ * still working, and a killed call delivers nothing at all, because nothing
+ * was ever delivered. The heartbeat is what the caller reads in place of the
+ * silence.
+ *
+ * The TOKEN is the client's own ask, and the whole ask: MCP has a client say
+ * it wants progress by sending `_meta.progressToken` on the request, and
+ * unsolicited progress is a protocol violation rather than a courtesy. No
+ * token returns a no-op stop — the call proceeds exactly as before and
+ * nothing is sent to a client that stayed silent.
+ *
+ * It is a heartbeat, not a stream and not an announcement: one notification
+ * per {@link progressIntervalMs} while the call lasts. A single beat at the
+ * start would tell a caller the request was accepted, not that it is still
+ * alive — the second beat is what distinguishes "working" from "hung" — and
+ * a beat per token would hand the transport a stream to absorb, in the name
+ * of the quiet the notification exists to buy. What a time-based heartbeat
+ * knows is time, so `progress` is milliseconds elapsed and `total` is
+ * omitted: a fraction of an unknown denominator is a number pretending to be
+ * information.
+ *
+ * Tokens-so-far would be the honest progress signal, and it needs streaming —
+ * deliberately not this change. The issue names it a later upgrade, and the
+ * request path it would rework is the one #51's prefix caching and #52's
+ * threads are shaped around; a heartbeat sends nothing to z.ai that was not
+ * already being sent.
+ *
+ * The returned stop is the contract's other half: a heartbeat that outlives
+ * its own call is a leak — invisible on one call, and on a busy server every
+ * finished call still beating. Callers stop it in a `finally`, so success,
+ * refusal and failure all silence it; the error path most of all, because
+ * the happy path is the one everybody tests and the orphan hides in the one
+ * nobody does.
+ */
+function heartbeat(
+  extra: RequestHandlerExtra<ServerRequest, ServerNotification>,
+): () => void {
+  const token = extra._meta?.progressToken;
+  if (token === undefined) return () => {};
+  const startedAt = Date.now();
+  const timer = setInterval(() => {
+    // A heartbeat must never kill the call it reports on. The SDK already
+    // no-ops a notification for an aborted request; this catch is for the
+    // transport's own refusal (the client hung up mid-call), which arrives
+    // as a rejection. The call itself fails — or lands — on its own terms.
+    void extra.sendNotification({
+      method: "notifications/progress",
+      params: {
+        progressToken: token,
+        progress: Date.now() - startedAt,
+        message: "GLM is still working",
+      },
+    }).catch(() => {});
+  }, progressIntervalMs());
+  return () => clearInterval(timer);
+}
 
 server.registerTool(
   "glm_ask",
@@ -172,7 +246,11 @@ server.registerTool(
         ),
     },
   },
-  async ({ prompt, files, cwd, model, reasoning, system, max_tokens, messages }) => {
+  async ({ prompt, files, cwd, model, reasoning, system, max_tokens, messages }, extra) => {
+    // #43: armed before the first byte of work, silenced by the finally on
+    // every exit — success, refusal and failure alike. A no-op for a client
+    // that sent no progress token, so the silent majority notices nothing.
+    const stop = heartbeat(extra);
     try {
       let finalPrompt = prompt;
       const notes: string[] = [];
@@ -262,6 +340,8 @@ server.registerTool(
         isError: true,
         content: [{ type: "text" as const, text: `GLM request failed.\n\n${explainError(e)}` }],
       };
+    } finally {
+      stop();
     }
   },
 );
@@ -377,7 +457,13 @@ server.registerTool(
         ),
     },
   },
-  async ({ diff, files, spec, cwd, model, reasoning, max_tokens }) => {
+  async ({ diff, files, spec, cwd, model, reasoning, max_tokens }, extra) => {
+    // #43, and the same heartbeat glm_ask beats: glm_review makes model calls
+    // of the same shape — 'high' reasoning over a large diff is a minutes-long
+    // call too, and a reviewer's caller stares at the same black box. Armed
+    // before the refusals below and silenced by the finally whatever the
+    // outcome, so a review refused before GLM was ever asked never beats.
+    const stop = heartbeat(extra);
     try {
       // The refusal comes before anything else, and before GLM is ever asked
       // (#65): with neither a diff nor files there is no material in front of
@@ -555,6 +641,8 @@ server.registerTool(
         isError: true,
         content: [{ type: "text" as const, text: `GLM request failed.\n\n${explainError(e)}` }],
       };
+    } finally {
+      stop();
     }
   },
 );

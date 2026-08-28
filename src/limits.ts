@@ -27,6 +27,11 @@ export const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024;
 // The default char cap lives in glm.ts as of #35: it is derived from the
 // context window there, next to the output table it reserves against.
 export const DEFAULT_TIMEOUT_MS = 600_000;
+// The default heartbeat cadence (#43): five seconds says "still alive" often
+// enough to keep a caller from killing a call that is working, and rarely
+// enough that a ten-minute reasoning run produces a notification stream a
+// transport has to absorb rather than a trickle.
+export const DEFAULT_PROGRESS_MS = 5_000;
 export const DEFAULT_MAX_DEPTH = 24;
 export const DEFAULT_MAX_ENTRIES = 200_000;
 export const DEFAULT_GLOB_TIMEOUT_MS = 10_000;
