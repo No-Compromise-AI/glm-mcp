@@ -248,7 +248,7 @@ fi
 GLM_LOG="$LOG" GLM_LEDGER="$LEDGER" GLM_DIR="$DIR" GLM_TASK_TEXT="$TASK" \
 GLM_VERIFY="$VERIFY" GLM_VSTATUS="${VSTATUS:-skipped}" GLM_VRC="${VRC:-}" \
 GLM_REVIEWER="$REVIEWER" GLM_RVERDICT="$REVIEW_VERDICT" GLM_ROUNDS="$ROUNDS" \
-GLM_NOTES_F="$NOTES" GLM_REVF="$REVF" GLM_BASE="$BASE" python3 - <<'PY'
+GLM_NOTES_F="$NOTES" GLM_REVF="$REVF" GLM_BASE="$BASE" GLM_BRANCH="${BRANCH:-}" python3 - <<'PY'
 import json, os, datetime
 res={}
 try:
@@ -295,6 +295,15 @@ with open(os.environ["GLM_LEDGER"],"a") as f:
     try: f.write(json.dumps(rec)+"\n"); f.flush()
     finally: fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 print(f"glm-task: recorded -> {os.environ['GLM_LEDGER']}")
+# One machine-readable line with everything a caller needs to resume this run:
+# glm-answer takes a session id and works inside the directory the agent used.
+# Without this a caller has to re-parse the ledger, which is unreliable when
+# several runs are in flight at once — the case the drain is built for.
+import sys as _sys
+_sys.stderr.write(
+    "glm-task: run dir=%s session=%s branch=%s\n"
+    % (os.environ.get("GLM_DIR", ""), res.get("session_id") or "", os.environ.get("GLM_BRANCH", ""))
+)
 PY
 
 # Throttled, not failed. Checked before everything below because a caller that

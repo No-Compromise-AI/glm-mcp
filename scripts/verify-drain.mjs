@@ -84,9 +84,15 @@ code=$(${JSON.stringify(join(dir, 'code.sh'))} "$item" "$n")
 sleep 0.4
 end=$(perl -MTime::HiRes=time -e 'printf "%.0f", time*1000')
 echo "END	$item	$end	$code" >> ${JSON.stringify(log)}
+# What a real glm-task emits: the isolated worktree on the way in, and one
+# machine-readable run line on the way out carrying the session id. A caller
+# parks from these two, so the stub must produce them or the gate would demand
+# something no correct implementation could supply.
 if [ "$code" = "4" ]; then
   echo '{"level":"blocked","msg":"Which database should this use?"}' >&2
 fi
+echo "glm-task: isolated worktree=/tmp/glm-wt-stub-$item branch=glm/item-$item" >&2
+echo "glm-task: run dir=/tmp/glm-wt-stub-$item session=sess-$item-$n branch=glm/item-$item" >&2
 exit "$code"
 `);
   chmodSync(stub, 0o755);
