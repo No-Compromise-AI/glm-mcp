@@ -30,6 +30,15 @@
 //      documenting nothing. It is the same principle glm_review enforces on its
 //      own reviewers — a heading with nothing under it is a rubber stamp.
 //   4. Every GLM_* environment variable the SOURCE reads appears in the README.
+//   5. Every command in bin/ is named in the README. This gate was written to
+//      stop an undocumented tool shipping — and then six undocumented commands
+//      shipped straight past it, because it only ever read src/. A gate that
+//      guards one directory while the project grows another is not a guard, it
+//      is a habit.
+//   6. Every GLM_* knob bin/ reads that a USER could set appears in the README.
+//      Internal plumbing — the variables passed into a heredoc to hand data to
+//      python — is excluded by name, and that list is short and explicit so
+//      exclusions have to be argued for rather than assumed.
 //      A knob nobody can discover is a knob that does not exist, and this is
 //      exactly how GLM_REVIEW_MIN_SUBSTANCE — the floor the whole review tool
 //      rests on — went unmentioned.
@@ -120,4 +129,33 @@ const undocumented = [...read].filter((v) => !README.includes(v)).sort();
 check(undocumented.length === 0,
   `rule 4: the source reads ${undocumented.join(', ')} and the README never mentions ${undocumented.length > 1 ? 'them' : 'it'}. A knob nobody can discover is a knob that does not exist`);
 
-console.log(`verify-docs: ${checks} checks passed over ${tools.length} tools (${tools.map((t) => t.name).join(', ')}) and ${read.size} environment variables`);
+// ------------------------------------------------------------- rules 5 & 6
+// The shell family. Not shipped on npm, but it lives here and is the other half
+// of the toolchain, so the README is equally its interface.
+const binDir = new URL('../bin/', import.meta.url);
+const commands = readdirSync(binDir).filter((f) => !f.startsWith('_') && !f.endsWith('.sh'));
+if (commands.length === 0) fail('rule 5: found no commands in bin/ — this gate can no longer read what it must check');
+
+const undocumentedCmds = commands.filter((c) => !README.includes(c)).sort();
+check(undocumentedCmds.length === 0,
+  `rule 5: bin/ contains ${undocumentedCmds.join(', ')} and the README never names ${undocumentedCmds.length > 1 ? 'them' : 'it'}. This gate exists because an undocumented tool shipped once already; guarding only src/ let six more through`);
+
+// Plumbing, not knobs: these are set to hand values into a heredoc, never by a
+// user. Named individually so that excluding one is a decision, not a pattern
+// that quietly swallows the next real knob.
+const PLUMBING = new Set([
+  'GLM_BASE', 'GLM_BRANCH', 'GLM_DIR', 'GLM_FULL', 'GLM_LEDGER', 'GLM_LOG', 'GLM_LOGF',
+  'GLM_NOTES_F', 'GLM_REVERR', 'GLM_REVF', 'GLM_ROUNDS', 'GLM_RVERDICT', 'GLM_TASK_TEXT',
+  'GLM_VERIFY', 'GLM_VRC', 'GLM_VSTATUS',
+]);
+const binVars = new Set();
+for (const f of readdirSync(binDir)) {
+  const text = readFileSync(new URL(f, binDir), 'utf8');
+  for (const m of text.matchAll(/\bGLM_[A-Z0-9_]+/g)) binVars.add(m[0]);
+}
+const knobs = [...binVars].filter((v) => !PLUMBING.has(v)).sort();
+const undocumentedKnobs = knobs.filter((v) => !README.includes(v));
+check(undocumentedKnobs.length === 0,
+  `rule 6: bin/ reads ${undocumentedKnobs.join(', ')} and the README never mentions ${undocumentedKnobs.length > 1 ? 'them' : 'it'}. A knob nobody can discover is a knob that does not exist`);
+
+console.log(`verify-docs: ${checks} checks passed over ${tools.length} tools (${tools.map((t) => t.name).join(', ')}) and ${read.size} server + ${knobs.length} shell environment variables`);

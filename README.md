@@ -271,7 +271,7 @@ them is the fastest way to be confused by it:
 | | what it is | what GLM is |
 | --- | --- | --- |
 | the MCP server — `glm_ask`, `glm_review`, `glm_models` | a server another agent calls mid-task | **a tool** the agent consults, keeping the wheel |
-| `bin/` — `claude-glm`, `glm-task`, `glm-review`, `glm-ship`, and four more | shell around the Claude Code CLI | **the agent**, doing the work in the repository |
+| `bin/` — ten commands, below | shell around the Claude Code CLI | **the agent**, doing the work in the repository |
 
 `bin/claude-glm` points the Claude Code CLI at z.ai, so GLM drives a session. `bin/glm-task`
 delegates a task to that session, verifies it independently, has a *different vendor's* model
@@ -279,6 +279,64 @@ review the result against the spec, and records the outcome. Reviewer selection 
 agent you are sitting in — `GLM_HOST` — so the host driving a delegation is never its own
 reviewer: from Claude that is codex + agy, from Codex claude + agy, from Antigravity codex +
 claude. `-r all` asks all three.
+
+### The commands
+
+| | |
+| --- | --- |
+| `claude-glm` | points the Claude Code CLI at z.ai, so GLM drives the session. Everything else is built on this |
+| `glm-task` | delegate one task: run the agent, verify independently, have a different vendor's model review it against the spec, one fix round, record the outcome |
+| `glm-drain` | work a list of GitHub issues unattended — `glm-task` per item, `glm-ship` for what passes, parking for what needs you |
+| `glm-review` | review a change against the spec it was meant to implement, with a chosen reviewer or `auto` |
+| `glm-ship` | take a branch to merged-and-verified: PR, auto-merge, watch checks |
+| `glm-answer` | resume a run that stopped to ask something, with your decision |
+| `glm-notes` | what delegated runs have raised for you, with the resume command for each |
+| `glm-stats` | hit rate, turns and duration across recorded runs |
+| `glm-why` | a run's visible reasoning and tool trace |
+| `glm-gc` | remove finished delegation worktrees. Only ever touches `glm-wt-*`, and never anything with uncommitted work |
+
+### Draining a backlog unattended
+
+```bash
+glm-drain -i 65,67,71 -v "npm test"
+```
+
+Each issue's title and body become the spec. What passes review is shipped; what does not is
+**parked** with its session id and worktree so `glm-answer` can resume it. The drain never
+attempts to answer a blocked item itself — a wrong guess made at 3am becomes a merged commit.
+
+Two things it will not do, both deliberate. It **refuses** `-j` above 4 rather than silently
+clamping, because an operator who believes they are running nine wide and is actually running
+four has been told something untrue. And on any rate-limit signal it drops to one worker for
+the rest of the run and never widens again — backing off and immediately re-widening is the
+same evasion done more slowly. z.ai publishes no concurrency limit and returns no rate-limit
+headers, so staying conservative and reacting to pressure is the whole of what can honestly be
+promised.
+
+Because merges are automatic: an unreviewed item is never shipped, shipping is serialised so
+each item's CI runs against a main containing the last, and consecutive failures stop the line
+rather than letting a broken main become the base for the rest of the night.
+
+### Knobs
+
+| | | |
+| --- | --- | --- |
+| which agent is driving, so it is never its own reviewer | `GLM_HOST` | detected for Claude; set it in Codex and Antigravity |
+| default reviewer spec | `GLM_REVIEWER` | `auto` |
+| the reviewer pool `auto` and `all` draw from | `GLM_REVIEWER_POOL` | `codex claude agy` |
+| where `auto` lands when the host is unknown | `GLM_AUTO_FALLBACK` | `codex` |
+| model `agy` reviews with | `GLM_AGY_MODEL` | `claude-opus-4-6-thinking` |
+| reviewer deadline, and liveness tick | `GLM_REVIEW_TIMEOUT` / `GLM_REVIEW_HEARTBEAT` | 900s / 60s |
+| largest diff sent to a reviewer | `GLM_REVIEW_MAX_DIFF` | |
+| tool allowlist for the delegated agent | `GLM_TASK_TOOLS` | |
+| outcome ledger, and log path | `GLM_TASK_LEDGER` / `GLM_TASK_LOG` | `~/.claude-glm/outcomes.jsonl` |
+| where `-W` worktrees are made | `GLM_WORKTREE_ROOT` | `$TMPDIR` |
+| where a run writes what it wants you to know | `GLM_NOTES` | a per-run file in `$TMPDIR` |
+| note levels that raise a desktop notification | `GLM_NOTIFY_LEVELS` | `blocked` |
+| grace before concluding a PR has no CI | `GLM_SHIP_CHECK_GRACE` | 1500s — measured; GitHub can take 2.5–20 min to create a run |
+| drain: parked queue, first backoff step, halt threshold | `GLM_DRAIN_STATE_DIR` / `GLM_DRAIN_BACKOFF_BASE` / `GLM_DRAIN_MAX_FAILS` | `~/.claude-glm` / 60s / 2 |
+| drain: skip GitHub, treat items as opaque ids | `GLM_DRAIN_OFFLINE` | |
+| drain: override the commands it drives | `GLM_TASK_CMD` / `GLM_SHIP_CMD` | the siblings in `bin/` |
 
 **These are not in the published npm package.** This package's promise is the server; the
 scripts drive a CLI an npm consumer will not have. They are here because they are the other
