@@ -170,15 +170,35 @@ try {
 
     // Measured at exactly the cap the README names, through the same
     // buildFileContext the server uses.
-    const probe = execFileSync(process.execPath, ['--input-type=module', '-e', `
-import { buildFileContext } from ${JSON.stringify(pathToFileURL(new URL('../dist/glm.js', import.meta.url).pathname).href)};
-process.env.GLM_MCP_ROOTS = ${JSON.stringify(ROOT)};
-const c = buildFileContext(['src/**/*.ts'], ${JSON.stringify(ROOT)}, 'glm-5.3');
-const headers = c.text.match(/^--- .*? ---$/gm) ?? [];
-const truncated = c.text.match(/^--- .*? \(truncated\) ---$/gm) ?? [];
-process.stdout.write(JSON.stringify({ headers: headers.length, truncated: truncated.length }));
-`], { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024,
-      env: { ...process.env, GLM_MCP_ROOTS: ROOT, GLM_MCP_MAX_FILE_CHARS: String(onDisk) } });
+    // The child counts headers WITHOUT a regex. An earlier version matched
+    // /^--- .*? \(truncated\) ---$/ built inside a template literal, and a
+    // template literal drops the backslashes: the child compiled (truncated)
+    // as a capture group, never matched a real header, and reported zero
+    // truncated files — which made this rule accept a wrong README and reject
+    // the right one. String comparison cannot be mis-escaped.
+    const childSrc = [
+      `import { buildFileContext } from ${JSON.stringify(new URL('../dist/glm.js', import.meta.url).href)};`,
+      `const c = buildFileContext(['src/**/*.ts'], ${JSON.stringify(ROOT)}, 'glm-5.3');`,
+      // The newline is emitted via JSON.stringify rather than written as an
+      // escape: inside this template literal a literal \n would become a real
+      // newline and break the child's string literal — the same escaping trap
+      // that made the (truncated) regex silently useless a moment ago.
+      `const lines = c.text.split(${JSON.stringify('\n')}).filter((l) => l.startsWith('--- ') && l.endsWith(' ---'));`,
+      `const truncated = lines.filter((l) => l.includes('(truncated)')).length;`,
+      `process.stdout.write(JSON.stringify({ headers: lines.length, truncated }));`,
+    ].join('\n');
+
+    // Ambient GLM_MCP_* settings would silently change what this measures — an
+    // operator with GLM_MCP_MAX_FILE_BYTES set in their shell would see an
+    // accurate README rejected. Only the two conditions this probe intends are
+    // passed through, the same way the other gates here do it.
+    const probeEnv = { ...process.env };
+    for (const k of Object.keys(probeEnv)) if (/^(GLM_MCP_|ZAI_)/.test(k)) delete probeEnv[k];
+    probeEnv.GLM_MCP_ROOTS = ROOT;
+    probeEnv.GLM_MCP_MAX_FILE_CHARS = String(onDisk);
+
+    const probe = execFileSync(process.execPath, ['--input-type=module', '-e', childSrc],
+      { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, env: probeEnv });
     const { headers, truncated } = JSON.parse(probe);
     const complete = headers - truncated;
     const cutAt = complete + 1;
