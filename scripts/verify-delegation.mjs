@@ -145,6 +145,7 @@ function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do
     { encoding: 'utf8' });
   git('init', '-q', '.');
   git('commit', '-q', '--allow-empty', '-m', 'base');
+  const baseHead = spawnSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
 
   const ledger = join(dir, 'ledger.jsonl');
   const args = ['-C', repo, '-r', reviewer ? 'codex' : 'none'];
@@ -170,9 +171,10 @@ function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do
     if (lines.length) row = JSON.parse(lines[lines.length - 1]);
   }
   const head = spawnSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  const added = Number(spawnSync('git', ['-C', repo, 'rev-list', '--count', `${baseHead}..HEAD`], { encoding: 'utf8' }).stdout.trim() || '0');
   const dirty = spawnSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' }).stdout.trim();
   const reviewed = existsSync(reviewCalls);
-  return { status: r.status, out: `${r.stdout}${r.stderr}`, row, dir, head, dirty, reviewed };
+  return { status: r.status, out: `${r.stdout}${r.stderr}`, row, dir, head, added, dirty, reviewed };
 }
 
 // ---------------------------------------------------------------------------
@@ -375,12 +377,18 @@ check(unc.row?.verify === 'pass',
 
 // Rule 11 — it says WHY, and names what was left behind, so the human can
 // recover the work rather than re-running the task.
-check(/uncommitted/i.test(unc.out) || /uncommitted/i.test(String(unc.row?.worker_reason ?? '')),
-  'rule 11: the run must say the agent left work UNCOMMITTED. "Nothing was committed" and ' +
-  `"the agent did nothing" are different facts with different fixes. Said:\n${unc.out.slice(-800)}`);
-check(/feature\.txt/.test(unc.out) || /feature\.txt/.test(String(unc.row?.worker_reason ?? '')),
-  'rule 11: it must name the files left uncommitted — they are about to be destroyed with the ' +
-  'worktree, and naming them is the difference between recoverable and lost.');
+// Asserted on worker_reason ALONE, never on the run's output. The first draft
+// allowed either, and the filename check could not fail: glm-task echoes its own
+// verify command, so `-v "test -f feature.txt"` put "feature.txt" on stderr no
+// matter what the reason said. The reason is also the durable artifact — the
+// output scrolls past, the ledger row is what gets read afterwards.
+const uncReason = String(unc.row?.worker_reason ?? '');
+check(/uncommitted/i.test(uncReason),
+  'rule 11: the recorded reason must say the agent left work UNCOMMITTED. "Nothing was committed" ' +
+  `and "the agent did nothing" are different facts with different fixes. Reason: ${JSON.stringify(uncReason)}`);
+check(/feature\.txt/.test(uncReason),
+  'rule 11: the reason must NAME the files left uncommitted — they are about to be destroyed with ' +
+  `the worktree, and naming them is the difference between recoverable and lost. Reason: ${JSON.stringify(uncReason)}`);
 
 // Rule 12 — an agent that produced nothing at all is ALSO not a success, and
 // must not be reported in the same words as one that forgot to commit.
@@ -402,7 +410,7 @@ check(unrev.reviewed === false,
 // Rule 14 — FORBID THE WRONG FIX. glm-task must refuse, never tidy up.
 // Committing on the agent's behalf fabricates authorship and a message, and
 // commits whatever else happened to be in the tree.
-check(unc.head === none.head,
+check(unc.added === 0,
   'rule 14: glm-task COMMITTED the agent\'s uncommitted work itself. That invents an author and a ' +
   'commit message, and sweeps in whatever else was in the tree. The fix for "nothing was committed" ' +
   'is to refuse and say so, not to commit it.');
@@ -413,6 +421,10 @@ check(/feature\.txt/.test(unc.dirty),
 // Rule 15 — CONTROL for 10-14: an agent that commits is unaffected by any of
 // it, and its reviewer still runs. Forbids "refuse everything".
 const good = delegate({ code: 0, stdout: resultLine({}), writes: 'work', commit: true, reviewer: true });
+// This half deliberately overlaps rule 4 — a mutation that refuses everything
+// trips rule 4 first, so treat the reviewer assertion below as the load-bearing
+// one. Kept because it is the same claim stated where a reader of rules 10-15
+// will look for it.
 check(good.status === 0,
   `rule 15: an agent that committed its work must still exit 0; got ${good.status}`);
 check(good.reviewed === true,
