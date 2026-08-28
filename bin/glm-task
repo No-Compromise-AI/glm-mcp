@@ -28,6 +28,7 @@ while [[ -L "$__self" ]]; do
 done
 HERE="$(cd -P "$(dirname -- "$__self")" && pwd)"
 . "$HERE/_glm-hosts.sh"
+. "$HERE/_glm-capacity.sh"
 
 DIR="$PWD"; VERIFY=""; TOOLS_OVERRIDE=""; REVIEWER="${GLM_REVIEWER:-auto}"; FIXES=1
 ISOLATE=0; BRANCH=""
@@ -151,6 +152,15 @@ run_agent() { # $1 = prompt, $2 = log path
     --permission-mode acceptEdits --allowedTools "${TOOLS[@]}" \
     --add-dir "$(dirname "$NOTES")" \
     --output-format stream-json --verbose 2>&1 | tee "$2" | trace
+  # Throttling is not failure. If z.ai refused on capacity, the run produced no
+  # information about the change: a caller must be able to wait and retry rather
+  # than burn the item. Read from the log because the pipeline above consumed
+  # stdout, and take the LAST 4000 characters — the refusal arrives at the end,
+  # and a whole stream-json log would match the words in the task text itself.
+  if glm_is_exhausted "$(tail -c 4000 "$2" 2>/dev/null)"; then
+    RATE_LIMITED=1
+    RETRY_AFTER="$(glm_retry_after "$(tail -c 4000 "$2" 2>/dev/null)")"
+  fi
 }
 
 do_verify() {
@@ -286,6 +296,14 @@ with open(os.environ["GLM_LEDGER"],"a") as f:
     finally: fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 print(f"glm-task: recorded -> {os.environ['GLM_LEDGER']}")
 PY
+
+# Throttled, not failed. Checked before everything below because a caller that
+# retries later gets the work done, while one that reads this as a failure marks
+# an item broken that was never actually attempted.
+if [[ "${RATE_LIMITED:-0}" == "1" ]]; then
+  echo "glm-task: z.ai refused on capacity — this run was NOT attempted, retry later.${RETRY_AFTER:+ It asked for ${RETRY_AFTER}s.}" >&2
+  exit 5
+fi
 
 # A blocked agent stopped without finishing. A weak verify command can pass over
 # unimplemented work, so blocked must never report success.

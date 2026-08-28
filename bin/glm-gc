@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Remove finished DELEGATION worktrees. Nothing else, ever.
+#
+#   glm-gc [-C dir] [-n] [-a]
+#
+#   -C <dir>  the repository (default: cwd)
+#   -n        say what would go, remove nothing
+#   -a        also consider worktrees whose PR is merged (needs gh; one API call
+#             per candidate). Without it, only branches merged by fast-forward
+#             or rebase are collected.
+#
+# glm-task deliberately does not clean up after itself: its worktree IS its
+# output, and the caller usually still needs it — to ship the branch, to inspect
+# a failure, or for glm-answer to resume a blocked session in the directory it
+# was working in. Collection is a separate decision, made by whoever knows the
+# work landed. Without it they accumulate without bound: fifteen had built up
+# before this existed, and a drain adds one per item.
+#
+# TWO SAFETY RULES, and the first is the one that matters.
+#
+# 1. Only paths that LOOK LIKE a delegation worktree are ever candidates —
+#    `glm-wt-*`, the name glm-task gives them. Everything else is untouchable
+#    whatever its merge state. The first draft of this script used merge state
+#    alone and would have deleted ~/z.ai/glm-tools, which is what ~/.local/bin
+#    points at: every glm-* command on the machine, gone, to tidy a directory.
+#    A garbage collector that can reach outside its own garbage is not one.
+#
+# 2. Among those, only finished ones. Note that "merged" is subtle here: this
+#    repository squash-merges, so a merged branch's commits are NOT ancestors of
+#    main and `--is-ancestor` says no. That is why -a exists, and why the
+#    ancestor test alone silently collects nothing on a squash-merge repo.
+set -uo pipefail
+
+DIR="$PWD"; DRY=0; ASK_GH=0
+while getopts "C:nah" opt; do
+  case "$opt" in
+    C) DIR="$OPTARG" ;; n) DRY=1 ;; a) ASK_GH=1 ;;
+    h) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -28; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+
+git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1 || { echo "glm-gc: $DIR is not a git repository" >&2; exit 2; }
+git -C "$DIR" fetch -q origin 2>/dev/null || true
+
+MAIN="origin/main"
+git -C "$DIR" rev-parse --verify -q "$MAIN" >/dev/null || MAIN="origin/master"
+
+# Rule 1. A delegation worktree is one glm-task made, and glm-task names them
+# `glm-wt-<stamp>-<pid>`. Anything else is not this script's business.
+is_delegation_worktree() {
+  case "$(basename "$1")" in glm-wt-*) return 0 ;; *) return 1 ;; esac
+}
+
+is_finished() { # $1 = ref, $2 = branch
+  git -C "$DIR" merge-base --is-ancestor "$1" "$MAIN" 2>/dev/null && return 0
+  [[ $ASK_GH -eq 1 ]] || return 1
+  command -v gh >/dev/null 2>&1 || return 1
+  [[ -n "$(gh pr list --repo "$(git -C "$DIR" remote get-url origin 2>/dev/null)" \
+             --head "$2" --state merged --limit 1 --json number --jq '.[].number' 2>/dev/null)" ]]
+}
+
+REMOVED=0; KEPT=0; SKIPPED=0
+OLDIFS="$IFS"; IFS=$'\n'
+for LINE in $(git -C "$DIR" worktree list --porcelain | awk '
+    /^worktree /  { wt = substr($0, 10) }
+    /^branch /    { print wt "\t" substr($0, 8) }'); do
+  IFS="$OLDIFS"
+  WT="${LINE%%$'\t'*}"; REF="${LINE##*$'\t'}"; BR="${REF#refs/heads/}"
+
+  if ! is_delegation_worktree "$WT"; then
+    SKIPPED=$((SKIPPED + 1)); IFS=$'\n'; continue
+  fi
+
+  if is_finished "$REF" "$BR"; then
+    if [[ $DRY -eq 1 ]]; then
+      echo "  would remove  $WT  [$BR]"
+    elif git -C "$DIR" worktree remove "$WT" --force 2>/dev/null; then
+      git -C "$DIR" branch -D "$BR" >/dev/null 2>&1
+      echo "  removed  $WT  [$BR]"
+      REMOVED=$((REMOVED + 1))
+    else
+      echo "  could not remove  $WT  [$BR]" >&2
+    fi
+  else
+    echo "  kept     $WT  [$BR] — not merged${ASK_GH:+}"
+    KEPT=$((KEPT + 1))
+  fi
+  IFS=$'\n'
+done
+IFS="$OLDIFS"
+
+git -C "$DIR" worktree prune 2>/dev/null
+if [[ $DRY -eq 1 ]]; then
+  echo "glm-gc: dry run — $SKIPPED non-delegation worktree(s) were never candidates"
+else
+  echo "glm-gc: removed $REMOVED, kept $KEPT unmerged, ignored $SKIPPED that are not delegation worktrees"
+fi
+exit 0

@@ -21,6 +21,7 @@ while [[ -L "$__self" ]]; do
 done
 HERE="$(cd -P "$(dirname -- "$__self")" && pwd)"
 . "$HERE/_glm-hosts.sh"
+. "$HERE/_glm-capacity.sh"
 
 DIR="$PWD"; BASE=""; SPEC=""; HEADREF="HEAD"; REVIEWERS="${GLM_REVIEWER:-auto}"
 while getopts "C:b:s:r:H:h" opt; do
@@ -98,12 +99,6 @@ run_one() { # $1 = reviewer name -> stdout is its raw output
 ANY_CHANGES=0; ANY_OK=0
 declare -a EXHAUSTED=() TRIED=() USED=()
 
-# Capacity exhaustion has to be distinguished from a normal failure: an unavailable
-# reviewer must never be reported as a clean review.
-is_exhausted() {
-  printf '%s' "$1" | grep -qiE \
-    'rate.?limit|quota (exceeded|reached)|usage limit|out of (credits|capacity|tokens)|too many requests|http 429|status 429|insufficient (balance|credits|quota)|plan limit|limit reached|try again (later|in [0-9])'
-}
 
 REVIEW_TIMEOUT="${GLM_REVIEW_TIMEOUT:-900}"
 HEARTBEAT="${GLM_REVIEW_HEARTBEAT:-60}"
@@ -161,7 +156,7 @@ attempt() { # $1 = reviewer. echoes findings; sets LAST_STATUS to ok|exhausted|e
     LAST_STATUS="error"; return
   fi
   V="$(printf '%s\n' "$OUT" | grep -oE '^VERDICT: (PASS|CHANGES_REQUIRED)$' | tail -1)"
-  if [[ -z "$V" ]] && is_exhausted "$OUT"; then
+  if [[ -z "$V" ]] && glm_is_exhausted "$OUT"; then
     EXHAUSTED+=("$R")
     echo "glm-review: $R is OUT OF CAPACITY — not reviewed by it." >&2
     LAST_STATUS="exhausted"; return
