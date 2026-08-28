@@ -40,6 +40,27 @@
 //      rather than silently clamped — the operator learns their number was not
 //      honoured, instead of believing it was.
 //
+//   9.  A ship that returns glm-ship's REAL merged-but-unverified code (5) is
+//       not counted as a failure. glm-ship exits 5 when given no -V; a driver
+//       that reads that as failure merges every item and then halts the line
+//       believing it failed.
+//   10. Every attempt at an item gets its OWN branch. glm-task creates its
+//       worktree with `git worktree add -b`, which cannot reuse a branch name,
+//       so a retry on the same branch fails before the agent ever runs.
+//   11. When the provider names a wait, THAT wait is honoured, not the shorter
+//       configured base.
+//   12. Once the line has halted, nothing further is shipped — including an
+//       in-flight item that succeeds after the halt.
+//   13. -n caps how many ITEMS are started, never how many attempts an item
+//       gets. A retry the spec requires must not be eaten by the item cap.
+//
+// Rules 9-13 came from review, after this gate passed an implementation that
+// would have failed on its first real run. They are all CONTRACT rules — the
+// stub returns whatever it is told, so nothing here could see where the driver
+// disagreed with the real glm-task and glm-ship until the stub was taught to
+// speak their actual dialect. That is the lesson: a stub makes a gate fast and
+// free, and blind to exactly the mismatches it is standing in for.
+//
 // Rules 5, 6, 7 and 8 exist to forbid the wrong fixes: "scale" must not come to
 // mean unbounded, "drain" must not come to mean merge-whatever-finished, and a
 // stuck night must not merge its way through a broken main.
@@ -63,7 +84,7 @@ const check = (ok, msg) => { checks++; if (!ok) fail(msg); };
  * from `codes` — a map of item id to either a code, or an array of codes
  * consumed one per attempt (so a requeue can succeed the second time).
  */
-function drain({ items, codes, jobs = 2, extraArgs = [], shipCode = 0 }) {
+function drain({ items, codes, jobs = 2, extraArgs = [], shipCode = 0, asked = 0 }) {
   const dir = mkdtempSync(join(tmpdir(), 'glm-drain-gate-'));
   const state = join(dir, 'state'); mkdirSync(state, { recursive: true });
   const log = join(dir, 'calls.tsv');
@@ -75,7 +96,13 @@ function drain({ items, codes, jobs = 2, extraArgs = [], shipCode = 0 }) {
   // only honest way to check it.
   const stub = join(dir, 'glm-task');
   writeFileSync(stub, `#!/usr/bin/env bash
-item=""; for a in "$@"; do case "$a" in ITEM=*) item="\${a#ITEM=}" ;; esac; done
+item=""; BRANCH_ARG=""; prev=""
+for a in "$@"; do
+  case "$a" in ITEM=*) item="\${a#ITEM=}" ;; esac
+  [ "$prev" = "-b" ] && BRANCH_ARG="$a"
+  prev="$a"
+done
+echo "BRANCH\t$item\t$BRANCH_ARG" >> ${JSON.stringify(log)}
 [ -z "$item" ] && item="$(echo "$*" | grep -oE 'issue[ -]?[0-9]+' | head -1)"
 start=$(perl -MTime::HiRes=time -e 'printf "%.0f", time*1000')
 n=$(grep -c "^START	$item	" ${JSON.stringify(log)} 2>/dev/null || echo 0)
@@ -91,8 +118,11 @@ echo "END	$item	$end	$code" >> ${JSON.stringify(log)}
 if [ "$code" = "4" ]; then
   echo '{"level":"blocked","msg":"Which database should this use?"}' >&2
 fi
-echo "glm-task: isolated worktree=/tmp/glm-wt-stub-$item branch=glm/item-$item" >&2
-echo "glm-task: run dir=/tmp/glm-wt-stub-$item session=sess-$item-$n branch=glm/item-$item" >&2
+if [ "$code" = "5" ]; then
+  echo "glm-task: z.ai refused on capacity — this run was NOT attempted, retry later.\${ASKED_SUFFIX}" >&2
+fi
+echo "glm-task: isolated worktree=/tmp/glm-wt-stub-$item branch=$BRANCH_ARG" >&2
+echo "glm-task: run dir=/tmp/glm-wt-stub-$item session=sess-$item-$n branch=$BRANCH_ARG" >&2
 exit "$code"
 `);
   chmodSync(stub, 0o755);
@@ -130,6 +160,7 @@ exit ${shipCode}
         GLM_DRAIN_STATE_DIR: state,
         GLM_DRAIN_BACKOFF_BASE: '1',   // seconds; production default is 60
         GLM_DRAIN_OFFLINE: '1',        // no gh, no network: items are ids only
+        ASKED_SUFFIX: asked ? ` It asked for ${asked}s.` : '',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -139,6 +170,7 @@ exit ${shipCode}
   }
 
   const rows = readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => l.split('\t'));
+  const branches = rows.filter((r) => r[0] === 'BRANCH');
   const starts = rows.filter((r) => r[0] === 'START');
   const ends = rows.filter((r) => r[0] === 'END');
   const parkedPath = join(state, 'parked.jsonl');
@@ -157,7 +189,7 @@ exit ${shipCode}
     const n = spans.filter((b) => b.from < a.to && a.from < b.to).length;
     if (n > peak) peak = n;
   }
-  return { stdout, status, starts, ends, spans, peak, parked, shipped };
+  return { stdout, status, starts, ends, spans, peak, parked, shipped, branches };
 }
 
 // ------------------------------------------------------------- rules 1 and 2
@@ -230,6 +262,59 @@ exit ${shipCode}
   const over = drain({ items: ['601'], codes: {}, jobs: 9 });
   check(over.status !== 0 && /refus|ceiling|maximum|too (high|many)/i.test(over.stdout),
     `rule 8: -j 9 was accepted. Above the ceiling it must be REFUSED, not silently clamped — an operator who believes they are running 9 wide and is actually running 4 has been told something untrue. Exit ${over.status}, output: ${JSON.stringify(over.stdout.slice(0, 200))}`);
+}
+
+// ------------------------------------------------------------------- rule 9
+{
+  // glm-ship's real behaviour with no -V: it merges, then exits 5 saying the
+  // change is unverified. Two of those must not stop the line.
+  const r = drain({ items: ['701', '702', '703'], codes: {}, shipCode: 5, jobs: 1 });
+  const attempted = new Set(r.starts.map((s) => s[1])).size;
+  check(attempted === 3,
+    `rule 9: with glm-ship returning 5 (merged, unverified — what it really does when given no -V), the drain reached only ${attempted} of 3 items. Every item merged and the line halted believing they failed. Either pass -V, or treat 5 as merged-but-unverified; it is not failure`);
+}
+
+// ------------------------------------------------------------------ rule 10
+{
+  const r = drain({ items: ['801'], codes: { 801: [1, 0] }, jobs: 1 });
+  const used = r.branches.filter((b) => b[1] === '801').map((b) => b[2]);
+  check(used.length < 2 || new Set(used).size === used.length,
+    `rule 10: item 801 was retried on the same branch (${used.join(', ')}). glm-task creates its worktree with 'git worktree add -b', which cannot reuse a branch name — the retry fails before the agent runs, and a required retry becomes an unrecoverable park`);
+}
+
+// ------------------------------------------------------------------ rule 11
+{
+  const r = drain({ items: ['901'], codes: { 901: [5, 0] }, jobs: 1, asked: 4 });
+  const tries = r.starts.filter((s) => s[1] === '901').map((s) => Number(s[2]));
+  const firstEnd = r.ends.find((e) => e[1] === '901');
+  if (tries.length >= 2 && firstEnd) {
+    const gap = tries[1] - Number(firstEnd[2]);
+    check(gap >= 3500,
+      `rule 11: z.ai asked for 4s and the retry came after ${gap}ms, with the configured base at 1s. When the provider names a wait, that number is the one to honour — using the shorter local default is not cooperating with it`);
+  } else {
+    check(false, 'rule 11: the rate-limited item was never retried, so the requested wait could not be checked');
+  }
+}
+
+// ------------------------------------------------------------------ rule 12
+{
+  // 1002 and 1003 fail and halt the line; 1001 is slow and succeeds after.
+  const r = drain({ items: ['1001', '1002', '1003', '1004'], codes: { 1002: 1, 1003: 1 }, jobs: 2 });
+  const halted = /halt/i.test(r.stdout);
+  if (halted) {
+    check(!r.shipped.some((l) => l.includes('1004')),
+      `rule 12: the line halted and item 1004 was shipped anyway. "Park everything remaining" has to include work already in flight, or the stop-the-line boundary leaks the very merges it exists to prevent. Ship log: ${JSON.stringify(r.shipped).slice(0, 200)}`);
+  } else {
+    check(false, `rule 12: two consecutive failures did not halt the line (rule 7 covers this too). Output: ${JSON.stringify(r.stdout.slice(0, 200))}`);
+  }
+}
+
+// ------------------------------------------------------------------ rule 13
+{
+  const r = drain({ items: ['1101', '1102'], codes: { 1101: [1, 0] }, jobs: 1, extraArgs: ['-n', '1'] });
+  const tries = r.starts.filter((s) => s[1] === '1101').length;
+  check(tries >= 2,
+    `rule 13: with -n 1, item 1101 failed and was never retried (${tries} attempt). -n caps how many ITEMS are started, not how many attempts one item gets — the retry is part of working the item, not a second item`);
 }
 
 console.log(`verify-drain: ${checks} checks passed`);
