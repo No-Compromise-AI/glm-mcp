@@ -33,6 +33,7 @@
     "verify:window": "node scripts/verify-window.mjs",
     "verify:lines": "node scripts/verify-lines.mjs",
     "verify:thread": "node scripts/verify-thread.mjs",
+    "verify:progress": "node scripts/verify-progress.mjs",
     "verify:api": "node scripts/verify-api.mjs",
     "verify:capacity": "node scripts/verify-capacity.mjs",
     "verify:disclosure": "node scripts/verify-disclosure.mjs",

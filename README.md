@@ -152,6 +152,13 @@ Two things it is genuinely good at:
 | `system` | string | — | optional system prompt |
 | `max_tokens` | number | the model's own default (65,536 for GLM-5.3) | hard ceiling on output; see Reasoning |
 
+**A long call reports that it is alive.** GLM-5.3 at `reasoning: "max"` over a
+near-full context window can run for many minutes, and silence for that long
+is indistinguishable from a hang — so if your client passes an MCP progress
+token, the server sends a progress notification every `GLM_MCP_PROGRESS_MS`
+(five seconds by default) while the call is in flight. No token, no
+notifications. The answer itself is unchanged by any of this.
+
 #### Pushing back on an answer
 
 Every call used to be independent, and the natural second-opinion flow is disagreement —
@@ -229,6 +236,11 @@ reply the output cap severed is refused too, whatever verdict it had already wri
 Pass `spec` where you can. Review against intent is what catches silent scope-narrowing —
 an agent quietly implementing less than was asked while every test still passes — and no
 amount of reading the diff finds that on its own.
+
+Reviews get the same heartbeat `glm_ask` gets: a progress notification every
+`GLM_MCP_PROGRESS_MS` while the reviewer works, sent only to a client that
+passed a progress token. A review is the same minutes-long model call, and its
+caller stares at the same black box without one.
 
 **This server never runs `git`.** The diff comes from the caller. The trust boundary here is
 built around reading files (see [Path confinement](#path-confinement)), and executing a
@@ -425,6 +437,7 @@ variable that set it — nothing is ever silently truncated or silently dropped.
 | Wall-clock budget for glob expansion | `GLM_MCP_GLOB_TIMEOUT_MS` | 10,000 |
 | Total `{a,b}` brace expansions | `GLM_MCP_MAX_BRACE_EXPANSIONS` | 1,024 |
 | Request timeout, the whole call — all retries included | `GLM_MCP_TIMEOUT_MS` | 600,000 |
+| Heartbeat interval for progress notifications on a long call | `GLM_MCP_PROGRESS_MS` | 5,000 |
 | Least analysis a `glm_review` verdict may stand on, in characters of the reply beside the verdict line | `GLM_REVIEW_MIN_SUBSTANCE` | 200 |
 
 The character budget is **derived, per model**, not chosen: the context window
@@ -474,6 +487,17 @@ the normal case, so the budget is never divided to reserve room for retries
 that may never happen. One residual: the SDK's backoff sleep between attempts
 is not abort-aware, so a deadline that fires during a backoff wait overshoots
 by up to that sleep — bounded by whatever `retry-after` the server sent.
+
+A call that long is otherwise a black box, so `glm_ask` and `glm_review` send
+**MCP progress notifications** while the model works — one every
+`GLM_MCP_PROGRESS_MS` (five seconds by default), each carrying the time
+elapsed, and only to a client that asked by passing a progress token with the
+request. Unsolicited progress is a protocol violation rather than a courtesy;
+a client that sends no token gets none. The heartbeat is time-based, not
+token-based: what it tells you is that the call is still alive, which is what
+you cannot otherwise tell — tokens-so-far would need the request switched to
+streaming. It stops when the call ends, however it ends, and it changes
+nothing about the answer: same text, same usage footer, same notes.
 
 - Only regular files are read. A FIFO, device or socket is refused rather than
   blocking the server on a read that may never return.
