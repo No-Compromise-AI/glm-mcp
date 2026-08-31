@@ -50,9 +50,12 @@ export const DEFAULT_MODEL = "glm-5.3";
  * fact about the model, carried per row because an id cannot be evidence:
  * the `v` names the 4.5/4.6 vision family, but glm-5.3-flash is natively
  * multimodal and its name says nothing of it, while glm-4.6's own docs say
- * text only, so it is not marked. ask() sends text only, so every declared
- * row's role says the image half goes unused where the choice is made; a
- * model whose modality nobody recorded is not claimed either way.
+ * text only, so it is not marked. Since #56 ask() CAN send images, so a
+ * declared row's role says the modality is usable where the choice is made —
+ * these strings are what glm_models hands a caller, and until that change every
+ * one of them said the image half went unused, which stayed on the page for
+ * exactly as long as it took someone to make it false. A model whose modality
+ * nobody recorded is not claimed either way.
  */
 const OUTPUT_LIMITS = new Map<
   string,
@@ -63,12 +66,12 @@ const OUTPUT_LIMITS = new Map<
   // Natively multimodal with no `v` in its name — the row glm-5.3-flash is why
   // modality is declared rather than inferred from the id (#45). It also cannot
   // run with reasoning off, silently — see THINKING_REQUIRED below.
-  ["glm-5.3-flash", { def: 65_536, max: 131_072, context: 1_048_576, role: "the flagship generation's fast tier, for bulk mechanical work; natively multimodal, but this server sends text only, so its image modality goes unused; it always reasons, so reasoning 'none' is raised to 'low'", vision: true }],
+  ["glm-5.3-flash", { def: 65_536, max: 131_072, context: 1_048_576, role: "the flagship generation's fast tier, for bulk mechanical work; natively multimodal — pass images with the `images` parameter; it always reasons, so reasoning 'none' is raised to 'low'", vision: true }],
   ["glm-5.2", { def: 65_536, max: 131_072, role: "the previous generation of the frontier line" }],
   ["glm-5.1", { def: 65_536, max: 131_072, role: "an earlier generation of the frontier line" }],
   ["glm-5", { def: 65_536, max: 131_072, role: "the first of the 5 generation" }],
   ["glm-5-turbo", { def: 65_536, max: 131_072, role: "a lower-latency tier of the 5 family" }],
-  ["glm-5v-turbo", { def: 65_536, max: 131_072, role: "vision model; this server sends text only, so its image modality goes unused", vision: true }],
+  ["glm-5v-turbo", { def: 65_536, max: 131_072, role: "vision model; pass images with the `images` parameter", vision: true }],
   // These two CAN run with reasoning off — and the role must keep saying it as
   // a choice, never as behaviour: glm_ask defaults an omitted reasoning to
   // "low", so they reason with 2,048 thinking tokens until the caller selects
@@ -87,11 +90,11 @@ const OUTPUT_LIMITS = new Map<
   // The 4.6 vision family: a quarter of the ceiling above. Same 128K window as
   // glm-4.5 (#59) with a quarter of the default output, so more of that window
   // is left for input.
-  ["glm-4.6v", { def: 16_384, max: 32_768, context: 128_000, role: "vision model; this server sends text only, so its image modality goes unused", vision: true }],
-  ["glm-4.6v-flash", { def: 16_384, max: 32_768, role: "fast-tier vision model; this server sends text only, so its image modality goes unused", vision: true }],
-  ["glm-4.6v-flashx", { def: 16_384, max: 32_768, role: "fast-tier vision model; this server sends text only, so its image modality goes unused", vision: true }],
+  ["glm-4.6v", { def: 16_384, max: 32_768, context: 128_000, role: "vision model; pass images with the `images` parameter", vision: true }],
+  ["glm-4.6v-flash", { def: 16_384, max: 32_768, role: "fast-tier vision model; pass images with the `images` parameter", vision: true }],
+  ["glm-4.6v-flashx", { def: 16_384, max: 32_768, role: "fast-tier vision model; pass images with the `images` parameter", vision: true }],
   // The 4.5 vision model and the 128k 4-32b, where the default IS the ceiling.
-  ["glm-4.5v", { def: 16_384, max: 16_384, role: "vision model; this server sends text only, so its image modality goes unused", vision: true }],
+  ["glm-4.5v", { def: 16_384, max: 16_384, role: "vision model; pass images with the `images` parameter", vision: true }],
   ["glm-4-32b-0414-128k", { def: 16_384, max: 16_384, role: "an older 32B build; its default output cap is also its ceiling" }],
 ]);
 

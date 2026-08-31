@@ -325,6 +325,8 @@ confinement, same budget, same per-model ceilings — reached by argv instead of
 
 ```bash
 glm-mcp ask -f 'src/**/*.ts' --reasoning high "where can this invariant break?"
+glm-mcp ask --model glm-4.6v --image screenshot.png "does this match the code?"
+glm-mcp ask --include refreshToken -f 'src/**/*.ts' "where can this leak?"
 glm-mcp models          # ids, with what each one is for
 glm-mcp key             # which of the three sources the key resolves from
 glm-mcp key --print     # the key itself, for a script that needs it
@@ -461,6 +463,45 @@ claude. `-r all` asks all three.
 | `glm-stats` | hit rate, turns and duration across recorded runs |
 | `glm-why` | a run's visible reasoning and tool trace |
 | `glm-gc` | remove finished delegation worktrees. Only ever touches `glm-wt-*`, and never anything with uncommitted work |
+
+### What a delegation reports, and what its exit code means
+
+`glm-task`'s exit code is the whole outcome, and each value means something different. Read
+it; a script that treats non-zero as one thing loses most of what the toolchain knows.
+
+| exit | meaning | what to do |
+| --- | --- | --- |
+| 0 | done, verified, reviewed | ship it |
+| 1 | verify failed, or the reviewer required changes | a change exists and was judged wanting |
+| 2 | the review did not complete — **UNREVIEWED**, not passed | never ship on trust |
+| 3 | every reviewer was out of capacity — also unreviewed | wait for capacity, or decide |
+| 4 | the agent is **BLOCKED** and asked something | answer with `glm-answer <session-id>` |
+| 5 | z.ai refused on capacity — the run was **not attempted** | retry; it says nothing about the change |
+| 6 | **the delegated agent did not complete** | there is nothing to ship — read `worker_reason` |
+
+**Exit 6 is why the other six are worth reading.** Until 2026-08-31 a worker that could not
+start at all made `glm-task` exit **0** with a ledger row of nulls, indistinguishable from a
+run that succeeded — and `glm-drain` ships on a zero exit. It now covers a worker that never
+started, one that died, one whose result says it failed, one whose exit status contradicts its
+own result, and a run that finished and **committed nothing** (`glm-ship` pushes commits, so
+uncommitted work is discarded with the worktree). `worker_reason` says which, and names the
+files when work was left behind.
+
+Each run appends a row to `$GLM_TASK_LEDGER` recording, besides the task and timings:
+`branch` and `issue` (so a run is attributable without re-reading its prose), `worker_ok` and
+`worker_reason`, `verify`/`verify_rc`, the review verdict and findings, and `review_record` —
+who reviewed with which model, and who did not deliver and why.
+
+`glm-ship` reads that record before it merges. **A branch whose own row says no reviewer
+passed it is refused**, naming the verdict; `-U` overrides that and says so loudly. A branch
+with no row at all still ships — it is also the tool you use on work that never went through
+`glm-task` — and says `no review record` rather than staying silent, because "nobody reviewed
+this" and "a reviewer passed it" must not look the same.
+
+It then posts that record to the pull request as a plain comment: the reviewers and their
+models, the exact `base..head` that was read, everyone who did not deliver and why, and a
+warning when HEAD moved after the review. It says in its own first line that it is
+self-reported, not third-party attestation.
 
 ### Draining a backlog unattended
 
@@ -802,16 +843,18 @@ observe `GLM_MCP_TIMEOUT_MS` as a whole-call budget.
 ## Testing
 
 ```bash
-npm test                    # unit tests: globs, key resolution, confinement, limits
-npm run verify:ignore       # acceptance gate: glob ignore semantics
-npm run verify:globs        # acceptance gate: glob path handling
-npm run verify:confinement  # acceptance gate: the path trust boundary
-npm run verify:limits       # acceptance gate: every resource limit actually fires
-npm run smoke               # drives the server over stdio as a real MCP client (needs a key)
+npm test      # unit tests: globs, key resolution, confinement, limits, delegation
+npm run       # every `verify:*` script listed is an acceptance gate
+npm run smoke # drives the server over stdio as a real MCP client (needs a key)
 ```
 
-Everything but `smoke` is hermetic and runs in CI on Node 20, 22 and 24. `smoke` makes live
-API calls, so it is run by hand.
+**Every `verify:*` script in `package.json` is an acceptance gate, and CI runs all of them**
+on Node 20, 22 and 24 — that is what `verify:release` checks, so a gate added without being
+wired into both workflows fails the build. They are listed there rather than here on purpose:
+a partial list in prose reads as a complete one, and this section carried five of them for
+long enough to stop being true.
+
+`smoke` makes live API calls, so it is run by hand; everything else is hermetic.
 
 Each acceptance gate was written before the change it gates and failed against the code it was
 written for, so it asserts the behaviour rather than describing it. They build real fixture
