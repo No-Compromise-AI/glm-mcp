@@ -104,6 +104,11 @@ REVF="${TMPDIR:-/tmp}/glm-review-$STAMP.txt"
 # reason it failed (#74). Kept separate from REVF so progress chatter never
 # reaches the findings the verdict is parsed from.
 REVERR="${TMPDIR:-/tmp}/glm-review-$STAMP.err"
+# glm-review's machine-readable account of who reviewed, with what model, and
+# who did not and why. Kept beside the findings rather than parsed back out of
+# them: the findings are prose written by a model, and a record built by
+# re-reading prose is a record that can be wrong about itself (#82).
+REVREC="${TMPDIR:-/tmp}/glm-review-$STAMP.json"
 mkdir -p "$(dirname "$LEDGER")"
 printf '%s\n' "$TASK" > "$SPECF"
 
@@ -454,7 +459,7 @@ elif [[ "$REVIEWER" != "none" && -n "$BASE" && "$COUNT_OK" == "1" ]]; then
   # -H: judge the branch that will be SHIPPED. The agent can leave the
   # worktree's HEAD elsewhere than the ship branch; reviewing HEAD would
   # approve a diff the ship never pushes.
-  "$HERE/glm-review" -C "$DIR" -b "$BASE" -H "$SHIPREF" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>>"$REVERR"
+  GLM_REVIEW_RECORD="$REVREC" "$HERE/glm-review" -C "$DIR" -b "$BASE" -H "$SHIPREF" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>>"$REVERR"
   rc=$?
   case $rc in 0) REVIEW_VERDICT="pass" ;; 1) REVIEW_VERDICT="changes_required" ;;
              3) REVIEW_VERDICT="no_capacity" ;; *) REVIEW_VERDICT="error" ;; esac
@@ -511,7 +516,7 @@ Report at the end: which findings you reproduced and fixed, and which you refute
       echo "glm-task: nothing committed to the branch after round $ROUNDS — no diff to review" >&2
       break
     fi
-    "$HERE/glm-review" -C "$DIR" -b "$BASE" -H "$SHIPREF" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>>"$REVERR"
+    GLM_REVIEW_RECORD="$REVREC" "$HERE/glm-review" -C "$DIR" -b "$BASE" -H "$SHIPREF" -s "$SPECF" -r "$REVIEWER" > "$REVF" 2>>"$REVERR"
     rc=$?
     # Same mapping as the first review, exit 3 included. Omitting it here turned
     # "every reviewer was out of capacity" into "error", which glm-task reports as
@@ -528,7 +533,8 @@ GLM_LOG="${LASTLOG:-$LOG}" GLM_LEDGER="$LEDGER" GLM_DIR="$DIR" GLM_TASK_TEXT="$T
 GLM_VERIFY="$VERIFY" GLM_VSTATUS="${VSTATUS:-skipped}" GLM_VRC="${VRC:-}" \
 GLM_WORKER_OK="${WORKER_OK:-}" GLM_WORKER_REASON="${WORKER_REASON:-}" \
 GLM_REVIEWER="$REVIEWER" GLM_RVERDICT="$REVIEW_VERDICT" GLM_ROUNDS="$ROUNDS" \
-GLM_NOTES_F="$NOTES" GLM_REVF="$REVF" GLM_REVERR="$REVERR" GLM_BASE="$BASE" GLM_BRANCH="${BRANCH:-}" python3 - <<'PY'
+GLM_NOTES_F="$NOTES" GLM_REVF="$REVF" GLM_REVERR="$REVERR" GLM_BASE="$BASE" GLM_BRANCH="${BRANCH:-}" \
+GLM_REVREC="$REVREC" python3 - <<'PY'
 import json, os, re, datetime
 res={}
 try:
@@ -584,6 +590,13 @@ if notes:
 _rx_issue = re.compile(r"\bissues?\s*#?\s*([0-9]+)\b|\bgh\s+issue\s+view\s+([0-9]+)\b", re.I)
 _m = _rx_issue.search(os.environ["GLM_TASK_TEXT"])
 issue = int(_m.group(1) or _m.group(2)) if _m else None
+# glm-review writes this when it ran at all; absent for a run with no review.
+_review_record = None
+try:
+    with open(os.environ["GLM_REVREC"]) as _f:
+        _review_record = json.load(_f)
+except Exception:
+    pass
 rec={
  "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
  "dir": os.environ["GLM_DIR"], "base": os.environ["GLM_BASE"] or None,
@@ -608,6 +621,9 @@ rec={
  "verify": os.environ["GLM_VSTATUS"],
  "verify_rc": int(os.environ["GLM_VRC"]) if os.environ["GLM_VRC"] else None,
  "reviewer": os.environ["GLM_REVIEWER"], "review": os.environ["GLM_RVERDICT"],
+ # Who actually reviewed, and who was absent. `reviewer` above is what was
+ # ASKED for; this is what happened.
+ "review_record": _review_record,
  "fix_rounds": int(os.environ["GLM_ROUNDS"]), "review_text": review,
  "log": os.environ["GLM_LOG"],
  "notes": notes,
