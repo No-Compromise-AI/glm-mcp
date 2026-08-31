@@ -158,6 +158,45 @@ check(noisy.row.issue === null || noisy.row.issue === undefined,
   'A greedy digit scan is worse than an absent field: absent is honestly unknown, wrong quietly ' +
   'attributes work to an issue nobody touched.');
 
+// Rule 5b — a number naming a PULL REQUEST is not an issue number. GitHub
+// numbers issues and pull requests from one shared sequence, so "#45" in
+// "review PR #45" is a real number for a real thing that is not the issue this
+// run was working. Raised by codex against the first implementation, and both
+// of its cases reproduced exactly.
+//
+// The rule is stated over the PROPERTY rather than the two spellings it was
+// found by, because the first implementation answered the spellings: it kept
+// the bare "#n" pattern and added a guard that suppressed a match when "PR"
+// preceded it. That guard both over- and under-fired — it swallowed the
+// unambiguous "Review PR (issue 50)", and leaked on "Review PRs #45 and #46" —
+// and its tail is unbounded ("backport of #45", "closes #45"). A heuristic that
+// needs a second heuristic to correct it is the wrong shape.
+for (const task of [
+  'Review PRs #45 and #46',
+  'Review PR #45 and #46',
+  'Backport of #45 to the release branch',
+]) {
+  const r = run({ task });
+  check(r.row.issue === null || r.row.issue === undefined,
+    `rule 5b: a task naming only pull requests must record no issue; ${JSON.stringify(task)} ` +
+    `recorded ${JSON.stringify(r.row.issue)}. GitHub shares one number sequence between issues and ` +
+    'PRs, so this is not an unlikely mistake — it is a confidently wrong retro.');
+}
+
+// Rule 4b — and the converse, which is where a PR-suppressing guard goes wrong:
+// an UNAMBIGUOUS issue reference still counts when a pull request is mentioned
+// beside it. Suppressing these was the first implementation's other half.
+for (const [task, want] of [
+  ['Review PR (issue 50)', 50],
+  ['Fix issue 93 and open a PR', 93],
+  ['see the PR for issue #50', 50],
+]) {
+  const r = run({ task });
+  check(Number(r.row.issue) === want,
+    `rule 4b: ${JSON.stringify(task)} names issue ${want} unambiguously and must record it; ` +
+    `got ${JSON.stringify(r.row.issue)}. Refusing every number near the word "PR" loses real issues.`);
+}
+
 // Rule 6 — and it does so without crashing or guessing.
 check(noisy.status === 0,
   `rule 6: a task with no issue reference must still complete normally; glm-task exited ${noisy.status}`);

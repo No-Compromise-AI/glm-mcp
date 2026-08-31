@@ -421,26 +421,21 @@ if notes:
 # and a greedy digit scan would attribute work to an issue nobody touched:
 # absent is honestly unknown, wrong is a quietly false retro. First mention
 # wins when a task names several.
-# Separators a "#n" can sit behind and still name the PR it follows:
-# whitespace plus the punctuation tasks are written with ("PR: #45",
-# "PR (#45)") — but no letters, so "see the PR for issue #50" leaves #50
-# an issue reference and not PR-shaped.
-_rx_pr = re.compile(r"\b(?:pr|pull\s+request)\b[^0-9A-Za-z]*$", re.I)
-_text = os.environ["GLM_TASK_TEXT"]
-_hits = []
-for _rx in (
-    re.compile(r"#([0-9]+)\b", re.I),
-    re.compile(r"\bissue\s+([0-9]+)\b", re.I),
-    re.compile(r"\bgh\s+issue\s+view\s+([0-9]+)\b", re.I),
-):
-    for _m in _rx.finditer(_text):
-        # A number naming a pull request cannot name an issue — GitHub numbers
-        # issues and PRs from one shared sequence — so "review PR #45" is not
-        # issue work however much it looks like a "#n" reference.
-        if _rx_pr.search(_text[:_m.start()]):
-            continue
-        _hits.append((_m.start(), int(_m.group(1))))
-issue = min(_hits)[1] if _hits else None
+# The number is only an issue number when the task SAYS issue. Requiring the
+# word is what makes a pull request number impossible to mistake for one —
+# GitHub numbers issues and PRs from a single sequence, so "#45" alone is a real
+# number for a real thing that may not be this run's issue.
+#
+# The first version matched a bare "#n" and then tried to suppress the ones
+# preceded by "PR". Review found that guard failing in both directions at once:
+# it swallowed the unambiguous "Review PR (issue 50)", and leaked on "Review PRs
+# #45 and #46" — and its tail is unbounded ("backport of #45", "closes #45").
+# A heuristic that needs a second heuristic to correct it is the wrong shape;
+# requiring the word needs no guard at all, and every case the reviewer raised
+# falls out of it.
+_rx_issue = re.compile(r"\bissues?\s*#?\s*([0-9]+)\b|\bgh\s+issue\s+view\s+([0-9]+)\b", re.I)
+_m = _rx_issue.search(os.environ["GLM_TASK_TEXT"])
+issue = int(_m.group(1) or _m.group(2)) if _m else None
 rec={
  "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
  "dir": os.environ["GLM_DIR"], "base": os.environ["GLM_BASE"] or None,
