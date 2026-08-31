@@ -56,6 +56,7 @@
     "verify:cli": "npm run build && node scripts/verify-cli.mjs",
     "verify:filter": "npm run build && node scripts/verify-filter.mjs",
     "verify:vision": "npm run build && node scripts/verify-vision.mjs",
+    "verify:schema": "npm run build && node scripts/verify-schema.mjs",
     "verify:branch": "node scripts/verify-branch.mjs",
     "verify:unreviewed": "node scripts/verify-unreviewed.mjs"
   },
