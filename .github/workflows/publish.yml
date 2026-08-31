@@ -67,6 +67,8 @@ jobs:
       - run: npm run verify:evidence
       - run: npm run verify:assumption
       - run: npm run verify:cli
+      - run: npm run verify:filter
+      - run: npm run verify:vision
       - run: npm run verify:branch
       - run: npm run verify:unreviewed
 

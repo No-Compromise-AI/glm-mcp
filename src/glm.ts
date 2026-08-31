@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { readFileSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { expandGlob, isGlobPattern, patternAnchors } from "./glob.js";
 import { confineRoots, deniedCredentials, insideRoots, realpathish } from "./confine.js";
 import {
@@ -937,12 +937,140 @@ export interface FileContext {
  * callers that resolve a cwd of their own pass it as a string and get the
  * plain no-match, which is the answer their callers asked for.
  */
+/**
+ * The image media types the endpoint accepts. A union rather than `string`, so
+ * adding a format this server cannot actually send is a compile error here
+ * instead of a 400 from the vendor after the round trip.
+ */
+export type ImageMediaType = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+
+/** One image, ready for an Anthropic-shaped content block. */
+export interface ImageAttachment {
+  mediaType: ImageMediaType;
+  base64: string;
+}
+
+/**
+ * The media type, sniffed from the bytes rather than the extension (#56).
+ * A name is what the caller typed; the magic is what the file is, and the
+ * vendor rejects a mismatch after the round trip with a message about neither.
+ */
+function sniffImage(buf: Buffer): ImageMediaType | undefined {
+  if (buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+  if (buf.length >= 6 && buf.subarray(0, 6).toString("latin1").startsWith("GIF8")) return "image/gif";
+  if (buf.length >= 12 && buf.subarray(0, 4).toString("latin1") === "RIFF" && buf.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
+  return undefined;
+}
+
+export interface ImageContext {
+  images: ImageAttachment[];
+  notes: string[];
+  refusedCall: boolean;
+}
+
+/**
+ * Read image attachments under the SAME confinement and the SAME byte limit as
+ * text files (#56). Images are files: a second reader that skipped the roots
+ * would undo the boundary this server is built on, and a second size limit
+ * would be one more number free to drift from the one already there.
+ *
+ * A model that cannot see images is refused rather than quietly sent text —
+ * a caller who attaches a screenshot and gets prose back has no way to tell it
+ * was dropped.
+ */
+export function buildImageContext(
+  paths: string[],
+  cwd: string | undefined,
+  model: string = DEFAULT_MODEL,
+): ImageContext {
+  const notes: string[] = [];
+  if (paths.length === 0) return { images: [], notes, refusedCall: false };
+
+  if (!OUTPUT_LIMITS.get(model)?.vision) {
+    return {
+      images: [],
+      notes: [
+        `refused: ${model} does not accept image input, and ${paths.length} image(s) were attached. ` +
+          `Choose a vision model, or ask without the images — answering with them dropped would ` +
+          `read like an answer that had looked at them.`,
+      ],
+      refusedCall: true,
+    };
+  }
+
+  const roots = confineRoots();
+  const base = cwd ?? process.cwd();
+  const maxBytes = envLimit("GLM_MCP_MAX_FILE_BYTES", DEFAULT_MAX_FILE_BYTES);
+  const images: ImageAttachment[] = [];
+
+  for (const p of paths) {
+    const abs = isAbsolute(p) ? p : join(base, p);
+    let resolved: string;
+    try {
+      resolved = realpathish(abs);
+    } catch {
+      notes.push(`refused (unreadable): ${p}`);
+      continue;
+    }
+    if (roots !== null && !insideRoots(resolved, roots)) {
+      notes.push(`refused (outside the allowed roots): ${p}`);
+      continue;
+    }
+    let raw: Buffer;
+    try {
+      raw = readFileSync(resolved);
+    } catch {
+      notes.push(`refused (unreadable): ${p}`);
+      continue;
+    }
+    if (raw.length > maxBytes) {
+      notes.push(
+        `refused (too large): ${p} is ${raw.length} bytes, over the GLM_MCP_MAX_FILE_BYTES limit of ${maxBytes}`,
+      );
+      continue;
+    }
+    const mediaType = sniffImage(raw);
+    if (mediaType === undefined) {
+      notes.push(
+        `refused (not an image): ${p} is not a PNG, JPEG, GIF or WebP. Guessing a media type earns ` +
+          `a 400 from z.ai after the round trip, about neither the file nor the guess.`,
+      );
+      continue;
+    }
+    images.push({ mediaType, base64: raw.toString("base64") });
+  }
+
+  // Every attachment refused means the caller asked about pictures and none
+  // arrived — the same refusal a text call makes when it reads nothing.
+  return { images, notes, refusedCall: images.length === 0 };
+}
+
+export interface FileContextOptions {
+  /**
+   * Send only the expanded files whose CONTENT contains this string (#56).
+   *
+   * A LITERAL substring, never a regex, and deliberately: a caller-supplied
+   * pattern run over file contents would open the same ReDoS surface this
+   * server already keeps a gate for, in a new place. Matching content rather
+   * than the path is the whole point — filtering on the name would only be a
+   * second, worse glob.
+   *
+   * Applied before the char budget is spent, so a large file that is about to
+   * be discarded cannot crowd out a small one that matches.
+   */
+  include?: string;
+}
+
 export function buildFileContext(
   paths: string[],
   cwd: string | undefined,
   model: string = DEFAULT_MODEL,
   historyChars: number = 0,
+  options: FileContextOptions = {},
 ): FileContext {
+  const include = options.include;
+  let filteredOut = 0;
   // Every note is filed under the argument that produced it, and the notes
   // leave in the order the arguments arrived (#26). Which branch handles an
   // entry — literal or pattern — is decided by whether the file exists, so
@@ -1369,6 +1497,13 @@ export function buildFileContext(
       continue;
     }
     const body = raw.toString("utf8");
+    // #56: the content filter, here — after the decode, so it reads what the
+    // model would read, and BEFORE the cap arithmetic below, so a file about to
+    // be dropped never spends budget the caller wanted for one that matches.
+    if (include !== undefined && !body.includes(include)) {
+      filteredOut++;
+      continue;
+    }
     // The excerpt is cut to the range BEFORE it is numbered (#53), so the
     // numbers it carries are the file's own and nothing outside the range is
     // delivered. A range that selected no line — one past the end of the file,
@@ -1570,10 +1705,28 @@ export function buildFileContext(
     notes.push({ arg: paths.length, msg: NO_CWD_SEARCH_NOTE });
   }
 
+  // #56: what the content filter dropped, said rather than left to be inferred
+  // from a thin answer. Filed under the last argument so it reads after the
+  // per-argument notes it summarises.
+  if (include !== undefined && filteredOut > 0) {
+    notes.push({
+      arg: paths.length,
+      msg: `filtered out ${filteredOut} file(s) whose content does not contain ${JSON.stringify(include)} (--include)`,
+    });
+  }
+
   // The separators were budgeted per chunk above, so joining is the identity:
   // `total` and text.length agree by construction. Notes leave in argument
   // order — see the top of this function.
   notes.sort((a, b) => a.arg - b.arg);
+  // A filter that matched nothing read nothing, and answering the question with
+  // none of the material it was about is a silent failure wearing a success —
+  // the same refusal this function already makes for a cwd outside every root.
+  // Only when the filter is what emptied it: an ordinary no-match is the
+  // caller's own glob, already answered per argument above.
+  if (include !== undefined && chunks.length === 0 && filteredOut > 0) {
+    return { text: "", notes: notes.map((n) => n.msg), refusedCall: true };
+  }
   return { text: chunks.join(""), notes: notes.map((n) => n.msg), refusedCall: false };
 }
 
@@ -1587,6 +1740,13 @@ export type TurnRole = "user" | "assistant";
 
 export interface AskArgs {
   prompt: string;
+  /**
+   * Images to attach to the final user turn (#56). Present, the turn's content
+   * becomes a block array; ABSENT, it stays the plain string it has always
+   * been — every existing caller is on that path and must not be able to tell
+   * this field exists.
+   */
+  images?: ImageAttachment[];
   model: string;
   reasoning: Reasoning;
   system?: string;
@@ -1693,7 +1853,25 @@ export async function ask(args: AskArgs): Promise<AskResult> {
   const body: Anthropic.Messages.MessageCreateParamsNonStreaming = {
     model,
     max_tokens: maxTokens,
-    messages: [...turns, { role: "user", content: prompt }],
+    messages: [
+      ...turns,
+      {
+        role: "user",
+        // #56: blocks only when there is something to put in them. A
+        // one-element array would be equivalent to the vendor and a visible
+        // change to every caller and every recorded request, for nothing.
+        content:
+          (args.images?.length ?? 0) === 0
+            ? prompt
+            : [
+                ...(args.images ?? []).map((img) => ({
+                  type: "image" as const,
+                  source: { type: "base64" as const, media_type: img.mediaType, data: img.base64 },
+                })),
+                { type: "text" as const, text: prompt },
+              ],
+      },
+    ],
   };
   if (system) body.system = system;
 

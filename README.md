@@ -159,6 +159,8 @@ Two things it is genuinely good at:
 | `prompt` | string | — | required |
 | `messages` | `{role, content}[]` | — | the conversation so far, as prior turns this call continues — see below |
 | `files` | string[] | — | files to include as context, each numbered `cat -n` style: literal paths (optionally with an inclusive line range, `src/auth/session.ts:40-120`) and/or globs (`src/**/*.ts`, `*.md`, `{lib,src}/*.ts`) |
+| `include` | string | — | send only the expanded `files` whose **content** contains this literal text (`"refreshToken"`). Matched against what is in each file, never its path, and applied before the character budget, so a large file about to be dropped cannot crowd out a small one that matches. A literal substring, not a regex. If nothing matches, the call is refused rather than answered without the material |
+| `images` | string[] | — | image paths to attach (PNG, JPEG, GIF, WebP), read under the same confinement and the same size limit as `files`. Requires a model that accepts image input; with any other model the call is **refused**, because an answer that silently ignored the images would read exactly like one that had looked at them |
 | `cwd` | string | server cwd | what relative `files` resolve against |
 | `model` | string | `glm-5.3` | any id from `glm_models` |
 | `reasoning` | `none`\|`low`\|`high`\|`max` | `low` | higher is slower |
@@ -270,6 +272,27 @@ accepts images (`glm-4.6v` and siblings, and `glm-5.3-flash`, which is natively
 multimodal though its name says nothing of it) forgoes the modality it was selected
 for; each such id's role says so. An id this server's model table does not know is
 listed bare: it stays z.ai's to describe, exactly as it stays z.ai's to size.
+
+### Narrowing a wide glob by what is in the files
+
+You have to name the files before you know which ones matter — but working that out is part
+of what you are consulting the model for. `include` closes that gap from the cheap end: pass
+a wide glob and let the content decide.
+
+```bash
+glm-mcp ask -f 'src/**/*.ts' --include refreshToken "where can this leak?"
+```
+
+Only files whose **content** contains the literal text are sent. It is matched against what
+is in each file, never its path, so a file merely *named* for the term is dropped like any
+other non-match. It runs before the character budget, so a large file that is about to be
+discarded cannot crowd out a small one that matches — which is also why it cuts latency:
+every file it drops is prefill never paid for. The notes say how many were dropped, and if
+nothing matches, the call is refused rather than answered without the material it was about.
+
+A **literal substring, not a regular expression** — deliberately. A caller-supplied pattern
+run over file contents would open the same ReDoS surface this server already keeps a gate
+for, in a new place. `glm_ask` takes the same parameter over MCP.
 
 ## Asking from a shell
 
