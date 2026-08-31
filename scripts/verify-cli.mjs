@@ -46,7 +46,7 @@
 // stub in this process would never answer it.
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdtempSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -119,7 +119,11 @@ check(seen.length === 1, `rule 4: expected exactly one upstream request, saw ${s
   check(typeof body.model === 'string' && body.model.length > 0,
     `rule 4: the request must name a model; body was ${JSON.stringify(body).slice(0, 300)}`);
   seen.length = 0;
-  await run(['ask', '--reasoning', 'none', 'q']);
+  // glm-5.2, not the default: glm-5.3 is thinking-REQUIRED, where "none" is
+  // deliberately raised to "low". Asserting the disabled block against a model
+  // that cannot produce it would fail correct code — and passing on a model
+  // that always reasons would prove nothing either.
+  await run(['ask', '--model', 'glm-5.2', '--reasoning', 'none', 'q']);
   const none = seen[0] ?? {};
   check(none.thinking && none.thinking.type === 'disabled',
     `rule 4: '--reasoning none' must send an explicit disabled thinking block, as the MCP path does ` +
@@ -178,6 +182,25 @@ check(/root|confin|outside|allowed/i.test(r3.out + r3.err),
   check(kp.out.trim() === 'sk-the-actual-secret',
     `rule 8: 'key --print' must print the key and nothing else, so KEY=$(glm-mcp key --print) works. ` +
     `It printed:\n${JSON.stringify(kp.out)}`);
+}
+
+// Rule 9 — claude-glm asks the server for the key instead of searching again.
+// This is not tidiness. The two copies had ALREADY diverged on a
+// security-relevant decision: glm-mcp requires GLM_MCP_ALLOW_ZCODE_KEY=1 before
+// it will use the key ZCode stores, and the bash copy read that file
+// unconditionally — so the wrapper was using a credential the server refuses
+// without explicit opt-in. Two implementations of one policy, exactly as #55
+// says, and the drift was in the direction that matters.
+{
+  const src = readFileSync(fileURLToPath(new URL('../bin/claude-glm', import.meta.url)), 'utf8');
+  check(/key --print/.test(src),
+    'rule 9: claude-glm must ask the server for the key (`glm-mcp key --print`) rather than ' +
+    'reimplementing the search. The point is one implementation of the policy, not two that agree ' +
+    'on the day they are written.');
+  check(!/zcode\/v2\/config\.json/.test(src),
+    'rule 9: claude-glm still reads the ZCode config itself. That is the copy that had already ' +
+    'diverged — it used a key glm-mcp refuses without GLM_MCP_ALLOW_ZCODE_KEY=1, so the wrapper was ' +
+    'quietly more permissive than the server it wraps.');
 }
 
 upstream.close();

@@ -271,6 +271,36 @@ multimodal though its name says nothing of it) forgoes the modality it was selec
 for; each such id's role says so. An id this server's model table does not know is
 listed bare: it stays z.ai's to describe, exactly as it stays z.ai's to size.
 
+## Asking from a shell
+
+The same package is a one-shot CLI. It is the same code the MCP tools call — same
+confinement, same budget, same per-model ceilings — reached by argv instead of a client:
+
+```bash
+glm-mcp ask -f 'src/**/*.ts' --reasoning high "where can this invariant break?"
+glm-mcp models          # ids, with what each one is for
+glm-mcp key             # which of the three sources the key resolves from
+glm-mcp key --print     # the key itself, for a script that needs it
+```
+
+**stdout is the answer and nothing else** — notes, refusals and the cost line go to stderr —
+so `ANSWER=$(glm-mcp ask ...)` is exactly the answer. With no subcommand the same binary is
+the stdio MCP server it has always been, and unrecognised arguments still start the server,
+because MCP clients pass flags of their own.
+
+Files are read through the same confinement as the server: a path outside `GLM_MCP_ROOTS` is
+refused here exactly as it is over MCP. This is not a second implementation — it is
+`buildFileContext`, which enforces the roots itself.
+
+`glm-mcp key` exists so `bin/claude-glm` stops resolving the key a second time in bash. Those
+two copies had already drifted: this server requires `GLM_MCP_ALLOW_ZCODE_KEY=1` before it will
+use the key ZCode stores, and the shell copy read that file unconditionally, which made the
+wrapper quietly more permissive than the server it wraps. Bare `key` prints the *source*
+rather than the secret, so an accidental invocation is not a leak.
+
+This does **not** replace `claude-glm`. That turns GLM into an agent with tool use and
+editing; this is a single question and a single answer. Different jobs.
+
 ## Writing a spec the loop can hold you to
 
 Two of the worst defects this toolchain has shipped came from a single ambiguous

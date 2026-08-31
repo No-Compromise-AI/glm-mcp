@@ -28,6 +28,21 @@ const { version } = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf8"),
 ) as { version: string };
 
+// The argv path (#55). Checked before the server is built, so a shell caller
+// pays for none of it and, more importantly, so nothing can print to stdout on
+// the way past — stdout is the MCP protocol when no subcommand is given.
+//
+// Only a KNOWN subcommand diverts. Unrecognised argv still starts the server,
+// because MCP clients pass their own flags and a CLI that swallowed them would
+// break every one of those launches.
+{
+  const argv = process.argv.slice(2);
+  const { SUBCOMMANDS, runCli } = await import("./cli.js");
+  if (argv.length > 0 && SUBCOMMANDS.has(argv[0])) {
+    process.exit(await runCli(argv));
+  }
+}
+
 const server = new McpServer({ name: "glm", version });
 
 /**
