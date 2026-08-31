@@ -937,12 +937,31 @@ export interface FileContext {
  * callers that resolve a cwd of their own pass it as a string and get the
  * plain no-match, which is the answer their callers asked for.
  */
+export interface FileContextOptions {
+  /**
+   * Send only the expanded files whose CONTENT contains this string (#56).
+   *
+   * A LITERAL substring, never a regex, and deliberately: a caller-supplied
+   * pattern run over file contents would open the same ReDoS surface this
+   * server already keeps a gate for, in a new place. Matching content rather
+   * than the path is the whole point — filtering on the name would only be a
+   * second, worse glob.
+   *
+   * Applied before the char budget is spent, so a large file that is about to
+   * be discarded cannot crowd out a small one that matches.
+   */
+  include?: string;
+}
+
 export function buildFileContext(
   paths: string[],
   cwd: string | undefined,
   model: string = DEFAULT_MODEL,
   historyChars: number = 0,
+  options: FileContextOptions = {},
 ): FileContext {
+  const include = options.include;
+  let filteredOut = 0;
   // Every note is filed under the argument that produced it, and the notes
   // leave in the order the arguments arrived (#26). Which branch handles an
   // entry — literal or pattern — is decided by whether the file exists, so
@@ -1369,6 +1388,13 @@ export function buildFileContext(
       continue;
     }
     const body = raw.toString("utf8");
+    // #56: the content filter, here — after the decode, so it reads what the
+    // model would read, and BEFORE the cap arithmetic below, so a file about to
+    // be dropped never spends budget the caller wanted for one that matches.
+    if (include !== undefined && !body.includes(include)) {
+      filteredOut++;
+      continue;
+    }
     // The excerpt is cut to the range BEFORE it is numbered (#53), so the
     // numbers it carries are the file's own and nothing outside the range is
     // delivered. A range that selected no line — one past the end of the file,
@@ -1570,10 +1596,28 @@ export function buildFileContext(
     notes.push({ arg: paths.length, msg: NO_CWD_SEARCH_NOTE });
   }
 
+  // #56: what the content filter dropped, said rather than left to be inferred
+  // from a thin answer. Filed under the last argument so it reads after the
+  // per-argument notes it summarises.
+  if (include !== undefined && filteredOut > 0) {
+    notes.push({
+      arg: paths.length,
+      msg: `filtered out ${filteredOut} file(s) whose content does not contain ${JSON.stringify(include)} (--include)`,
+    });
+  }
+
   // The separators were budgeted per chunk above, so joining is the identity:
   // `total` and text.length agree by construction. Notes leave in argument
   // order — see the top of this function.
   notes.sort((a, b) => a.arg - b.arg);
+  // A filter that matched nothing read nothing, and answering the question with
+  // none of the material it was about is a silent failure wearing a success —
+  // the same refusal this function already makes for a cwd outside every root.
+  // Only when the filter is what emptied it: an ordinary no-match is the
+  // caller's own glob, already answered per argument above.
+  if (include !== undefined && chunks.length === 0 && filteredOut > 0) {
+    return { text: "", notes: notes.map((n) => n.msg), refusedCall: true };
+  }
   return { text: chunks.join(""), notes: notes.map((n) => n.msg), refusedCall: false };
 }
 

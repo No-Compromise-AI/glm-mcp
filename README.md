@@ -271,6 +271,27 @@ multimodal though its name says nothing of it) forgoes the modality it was selec
 for; each such id's role says so. An id this server's model table does not know is
 listed bare: it stays z.ai's to describe, exactly as it stays z.ai's to size.
 
+### Narrowing a wide glob by what is in the files
+
+You have to name the files before you know which ones matter — but working that out is part
+of what you are consulting the model for. `include` closes that gap from the cheap end: pass
+a wide glob and let the content decide.
+
+```bash
+glm-mcp ask -f 'src/**/*.ts' --include refreshToken "where can this leak?"
+```
+
+Only files whose **content** contains the literal text are sent. It is matched against what
+is in each file, never its path, so a file merely *named* for the term is dropped like any
+other non-match. It runs before the character budget, so a large file that is about to be
+discarded cannot crowd out a small one that matches — which is also why it cuts latency:
+every file it drops is prefill never paid for. The notes say how many were dropped, and if
+nothing matches, the call is refused rather than answered without the material it was about.
+
+A **literal substring, not a regular expression** — deliberately. A caller-supplied pattern
+run over file contents would open the same ReDoS surface this server already keeps a gate
+for, in a new place. `glm_ask` takes the same parameter over MCP.
+
 ## Asking from a shell
 
 The same package is a one-shot CLI. It is the same code the MCP tools call — same

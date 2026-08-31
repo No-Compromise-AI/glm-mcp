@@ -206,6 +206,20 @@ server.registerTool(
             'carry an inclusive line range ("src/auth/session.ts:40-120") to send just that ' +
             "region, numbered with the file's own line numbers rather than renumbered from 1.",
         ),
+      include: z
+        .string()
+        .optional()
+        .describe(
+          "Optional. Send only the expanded files whose CONTENT contains this " +
+            'literal text (e.g. "refreshToken"). Matched against what is IN each ' +
+            "file, not its path, and applied before the character budget — so a " +
+            "large file that will be dropped cannot crowd out a small one that " +
+            "matches. A LITERAL substring, not a regular expression. Answers the " +
+            "case where you must name the files before knowing which ones matter: " +
+            'pass a wide glob and let this narrow it. The notes say how many were ' +
+            "dropped; if none match, the call is refused rather than answered " +
+            "without the material it was about."
+        ),
       cwd: z
         .string()
         .optional()
@@ -261,7 +275,7 @@ server.registerTool(
         ),
     },
   },
-  async ({ prompt, files, cwd, model, reasoning, system, max_tokens, messages }, extra) => {
+  async ({ prompt, files, cwd, model, reasoning, system, max_tokens, messages, include }, extra) => {
     // #43: armed before the first byte of work, silenced by the finally on
     // every exit — success, refusal and failure alike. A no-op for a client
     // that sent no progress token, so the silent majority notices nothing.
@@ -295,7 +309,7 @@ server.registerTool(
         // to process.cwd() here would erase the one distinction that separates
         // "nothing matched" from "we looked somewhere else"; buildFileContext
         // applies the default this tool advertises either way.
-        const ctx = buildFileContext(files, cwd, chosenModel, historyChars);
+        const ctx = buildFileContext(files, cwd, chosenModel, historyChars, { include });
         notes.push(...ctx.notes);
         // A refused call read nothing. Sending the prompt anyway would answer
         // the question with none of the material it asked about — a silent

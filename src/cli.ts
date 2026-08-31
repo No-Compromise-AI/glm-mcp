@@ -45,6 +45,7 @@ ask options:
   -m, --model <id>        model id (default: ${DEFAULT_MODEL})
   -r, --reasoning <level> none | low | high | max (default: low)
       --cwd <dir>         directory globs resolve against
+      --include <text>    send only files whose CONTENT contains this literal text
       --max-tokens <n>    output cap (default: the model's own published one)
       --system <text>     system prompt
 
@@ -68,6 +69,7 @@ async function cmdAsk(argv: string[]): Promise<number> {
   let cwd: string | undefined;
   let maxTokens: number | undefined;
   let system: string | undefined;
+  let include: string | undefined;
   const rest: string[] = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -84,6 +86,7 @@ async function cmdAsk(argv: string[]): Promise<number> {
         break;
       }
       case "--cwd": cwd = takeValue(argv, i, a); i++; break;
+      case "--include": include = takeValue(argv, i, a); i++; break;
       case "--system": system = takeValue(argv, i, a); i++; break;
       case "--max-tokens": {
         const v = takeValue(argv, i, a); i++;
@@ -103,7 +106,7 @@ async function cmdAsk(argv: string[]): Promise<number> {
 
   let finalPrompt = prompt;
   if (files.length > 0) {
-    const ctx = buildFileContext(files, cwd, model);
+    const ctx = buildFileContext(files, cwd, model, 0, { include });
     // Notes are the operator's channel — which globs matched, what was skipped,
     // which path the roots refused. They belong beside the answer, not in it.
     for (const n of ctx.notes) console.error(`glm-mcp: ${n}`);

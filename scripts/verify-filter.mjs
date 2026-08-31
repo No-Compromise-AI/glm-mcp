@@ -152,7 +152,9 @@ check(/include|filter/i.test(r1.err) && /refreshToken/.test(r1.err),
 // Rule 6 — CONTROL: without the filter, nothing changes.
 {
   seen.length = 0;
-  const r = await run(['ask', '-f', 'auth.ts', 'unrelated.ts', 'q']);
+  // -f is repeatable and takes ONE value each: 'ask -f a.ts b.ts' puts b.ts in
+  // the QUESTION, which is a gate bug that reads exactly like a code bug.
+  const r = await run(['ask', '-f', 'auth.ts', '-f', 'unrelated.ts', 'q']);
   check(r.code === 0, `rule 6: exited ${r.code}`);
   check(sent().includes('rotate') && sent().includes('COLOURS'),
     `rule 6: with no --include every named file must still arrive. Request was:\n${sent().slice(0, 400)}`);
