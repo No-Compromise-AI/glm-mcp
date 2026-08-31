@@ -126,14 +126,36 @@ Levels:
   scope      the spec is wrong, self-contradictory, or impossible as written
   discovery  you found something outside this task they would want to know about
              — a real bug, a security problem, a data-loss risk
-  decision   you proceeded on an assumption that could turn out to be wrong
+  assumption a sentence in this task could be read more than one way, and you picked
+             a reading. Log the sentence and the reading you chose, BEFORE you build
+             on it. Costs nobody anything: it is not shown live and never interrupts.
 
 Do NOT write a note for: progress, what you are about to do, files you edited, tests
 passing, routine choices with an obvious default, or anything they will read in your
 final report anyway.
 
 Default to silence. A note spends their attention. Spend it only when the alternative
-is them finding out too late to act."
+is them finding out too late to act.
+
+`assumption` is EXEMPT from that, and from 'routine choices with an obvious default'.
+It costs no attention — nobody is interrupted and nothing is shown live — so the bar is
+the opposite one: write it whenever a sentence had more than one reading, even when your
+reading seems obvious. Especially then.
+
+Why this level exists, so you can judge what belongs in it. The two worst defects this
+toolchain has shipped both came from one ambiguous sentence in a spec, resolved silently
+and correctly-looking. 'normalise baseURL before comparing' bundled three decisions into
+one clause; the normalisation landed on the value that gets SENT, and a bearer token went
+to the wrong endpoint. Neither was caught by the acceptance gate, because the same person
+wrote the gate and the spec in the same words on the same afternoon.
+
+You will not experience these as forks. By the time you are writing code the sentence has
+already collapsed into one reading, and nothing feels uncertain. So do not wait to feel
+uncertain: when you notice you have READ a sentence a particular way — a pronoun with two
+possible referents, a clause bundling several decisions, a word like 'valid' or
+'normalise' that could scope to one thing or another — write the sentence down and write
+down which way you took it. Three lines of that would have caught the defect above before
+it was committed."
 
 # Concurrency: agents sharing one checkout will commit to whatever branch happens
 # to be current and overwrite each other. A worktree gives each run its own
