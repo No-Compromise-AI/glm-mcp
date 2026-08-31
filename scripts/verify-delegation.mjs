@@ -106,7 +106,9 @@ const resultLine = (o) => JSON.stringify({
  * the real file too; only the worker is substituted, because the worker is the
  * boundary whose failure is under test.
  */
-function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do the thing' } = {}) {
+function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do the thing',
+                    writes = null, commit = false, reviewer = false,
+                    afterWork = '', gitConfig = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'glm-delegation-gate-'));
   const bin = join(dir, 'bin'); mkdirSync(bin);
   for (const f of ['glm-task', '_glm-hosts.sh', '_glm-capacity.sh']) {
@@ -115,23 +117,58 @@ function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do
   }
   // The shim. Two channels, nothing else: what it prints, and how it exits.
   const worker = join(bin, 'glm-worker');
-  writeFileSync(worker, `#!/usr/bin/env bash\n${stdout ? `cat <<'GATEEOF'\n${stdout}\nGATEEOF` : ':'}\nexit ${code}\n`);
+  // `writes` makes the shim do real work in the repo; `commit` makes it commit
+  // that work. The pair is the whole of #93: an agent that edits and forgets to
+  // commit leaves a branch with nothing on it, and glm-ship pushes commits.
+  const work = writes
+    ? `printf '%s' ${JSON.stringify(String(writes))} > "$GATE_REPO/feature.txt"\n` +
+      (commit
+        ? `git -C "$GATE_REPO" -c user.email=a@example.invalid -c user.name=agent add -A >/dev/null\n` +
+          `git -C "$GATE_REPO" -c user.email=a@example.invalid -c user.name=agent commit -qm "the agent's own commit" >/dev/null\n`
+        : '')
+    : '';
+  writeFileSync(worker, `#!/usr/bin/env bash\n${work}${afterWork}${stdout ? `cat <<'GATEEOF'\n${stdout}\nGATEEOF` : ':'}\nexit ${code}\n`);
   chmodSync(worker, 0o755);
+
+  // A reviewer that records the fact it was asked. Rule 13 turns on this file
+  // never appearing: spending a reviewer call on a diff already known to be
+  // empty is how "there was nothing to review" got recorded as "the reviewer
+  // broke" for two rounds running.
+  const reviewCalls = join(dir, 'review-calls.txt');
+  const env = { ...process.env };
+  if (reviewer) {
+    const rv = join(bin, 'glm-review');
+    writeFileSync(rv, `#!/usr/bin/env bash\necho "asked $*" >> ${JSON.stringify(reviewCalls)}\necho "VERDICT: PASS"\nexit 0\n`);
+    chmodSync(rv, 0o755);
+    // glm-task keeps a reviewer only if its CLI resolves, and a CI runner has
+    // none — so provide one. Without this the gate read the DEVELOPER'S
+    // toolchain: rule 15 passed on a laptop with codex installed and failed on
+    // all three Node versions in CI. A gate must not be able to tell whose
+    // machine it is running on. (The stub only satisfies the resolution check;
+    // glm-task invokes "$HERE/glm-review" directly, so the shim above is what
+    // actually runs. Same mechanism test/delegation.test.mjs uses.)
+    writeFileSync(join(bin, 'codex'), '#!/usr/bin/env bash\nexit 0\n');
+    chmodSync(join(bin, 'codex'), 0o755);
+    env.PATH = `${bin}:${process.env.PATH}`;
+  }
 
   const repo = join(dir, 'repo'); mkdirSync(repo);
   const git = (...a) => spawnSync('git', ['-C', repo, '-c', 'user.email=gate@example.invalid', '-c', 'user.name=gate', ...a],
     { encoding: 'utf8' });
   git('init', '-q', '.');
   git('commit', '-q', '--allow-empty', '-m', 'base');
+  if (gitConfig) for (const [k, v] of Object.entries(gitConfig)) git('config', k, v);
+  const baseHead = spawnSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
 
   const ledger = join(dir, 'ledger.jsonl');
-  const args = ['-C', repo, '-r', 'none'];
+  const args = ['-C', repo, '-r', reviewer ? 'codex' : 'none'];
   if (verify !== null) args.push('-v', verify);
   const r = spawnSync('bash', [join(bin, 'glm-task'), ...args, task], {
     encoding: 'utf8', timeout: 120_000,
     env: {
-      ...process.env,
+      ...env,
       HOME: dir,                              // never touch the real ~/.claude-glm
+      GATE_REPO: repo,
       GLM_TASK_LEDGER: ledger,
       GLM_TASK_LOG: join(dir, 'run.jsonl'),
       GLM_NOTES: join(dir, 'notes.jsonl'),
@@ -146,7 +183,11 @@ function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do
     const lines = readFileSync(ledger, 'utf8').trim().split('\n').filter(Boolean);
     if (lines.length) row = JSON.parse(lines[lines.length - 1]);
   }
-  return { status: r.status, out: `${r.stdout}${r.stderr}`, row, dir };
+  const head = spawnSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  const added = Number(spawnSync('git', ['-C', repo, 'rev-list', '--count', `${baseHead}..HEAD`], { encoding: 'utf8' }).stdout.trim() || '0');
+  const dirty = spawnSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' }).stdout.trim();
+  const reviewed = existsSync(reviewCalls);
+  return { status: r.status, out: `${r.stdout}${r.stderr}`, row, dir, head, added, dirty, reviewed };
 }
 
 // ---------------------------------------------------------------------------
@@ -189,7 +230,7 @@ function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do
 }
 
 // Rule 2 — shape (a): worker exits non-zero, emits nothing.
-const a = delegate({ code: 1, stdout: '' });
+const a = delegate({ code: 1, stdout: '', writes: 'work', commit: true });
 check(a.status === 6,
   `rule 2: a worker that exited non-zero having emitted no result must make glm-task exit 6 ` +
   `(the delegated agent did not complete); got ${a.status}. ` +
@@ -200,12 +241,20 @@ check(a.row !== null, 'rule 3: no ledger row was written for a failed delegation
 check(a.row.worker_ok === false,
   `rule 3: the ledger row must record that the agent did not complete; worker_ok=${JSON.stringify(a.row.worker_ok)}. ` +
   'A row whose every agent field is null is indistinguishable from one nobody wrote.');
+check(/without emitting a result|no result/i.test(String(a.row.worker_reason ?? '')),
+  `rule 3: the reason must identify THIS shape — a worker that died without emitting a result. ` +
+  `It says ${JSON.stringify(a.row.worker_reason)}, which would also be said of a run that committed nothing, ` +
+  'so the rule would pass for a reason other than its own.');
 check(typeof a.row.worker_reason === 'string' && a.row.worker_reason.trim().length > 0,
   'rule 3: the row must say WHY the agent did not complete (worker_reason), not only that it did not — ' +
   'the reason is the whole value of the row to whoever reads it next.');
 
 // Rule 4 — CONTROL. Success is still success, and still fully recorded.
-const ok = delegate({ code: 0, stdout: resultLine({}) });
+// The shim COMMITS. Before #93 this control committed nothing, which #93 makes
+// a failing delegation in its own right — so leaving it alone would have set
+// the two halves of this gate against each other. A control that no longer
+// describes a successful run is not a control.
+const ok = delegate({ code: 0, stdout: resultLine({}), writes: 'the change', commit: true });
 check(ok.status === 0, `rule 4: a delegation whose agent completed must still exit 0; got ${ok.status}`);
 check(ok.row?.worker_ok === true,
   `rule 4: a successful run must record worker_ok=true; got ${JSON.stringify(ok.row?.worker_ok)}. ` +
@@ -215,7 +264,8 @@ check(ok.row?.num_turns === 3 && ok.row?.session_id === 'sess-gate' && ok.row?.a
   `session_id=${JSON.stringify(ok.row?.session_id)}, agent_error=${JSON.stringify(ok.row?.agent_error)}`);
 
 // Rule 5 — shape (b): exit ZERO, result marked is_error.
-const b = delegate({ code: 0, stdout: resultLine({ subtype: 'error_during_execution', is_error: true, result: 'the model refused' }) });
+const b = delegate({ code: 0, writes: 'work', commit: true,
+  stdout: resultLine({ subtype: 'error_during_execution', is_error: true, result: 'the model refused' }) });
 check(b.status === 6,
   `rule 5: a worker that exited 0 while reporting is_error must exit 6; got ${b.status}. ` +
   'Propagating only the worker\'s exit status passes rule 2 and misses this entirely.');
@@ -235,13 +285,15 @@ check(b.row?.worker_ok === false, 'rule 5: an errored agent result must record w
 // forbidding even when no producer is known to exercise it. If a future SDK
 // does start omitting the field, this fails loudly on the first run instead of
 // certifying every one of them.
-const unk = delegate({ code: 0, stdout: JSON.stringify({ type: 'result', subtype: null, is_error: false, session_id: 's', num_turns: 1, duration_ms: 1 }) });
+const unk = delegate({ code: 0, writes: 'work', commit: true,
+  stdout: JSON.stringify({ type: 'result', subtype: null, is_error: false, session_id: 's', num_turns: 1, duration_ms: 1 }) });
 check(unk.status === 6,
   `rule 5b: a result event that is neither explicitly successful nor explicitly an error must not ` +
   `read as success; got exit ${unk.status}. Unknown is not the same as fine.`);
 
 // Rule 6 — shape (c): exit ZERO, no result event at all.
-const c = delegate({ code: 0, stdout: JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } }) });
+const c = delegate({ code: 0, writes: 'work', commit: true,
+  stdout: JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } }) });
 check(c.status === 6,
   `rule 6: a worker that exited 0 and never emitted a result must exit 6; got ${c.status}. ` +
   'Reading only is_error treats a truncated or killed run as a success.');
@@ -249,7 +301,7 @@ check(c.row?.worker_ok === false, 'rule 6: a run with no result event must recor
 
 // Rule 7 — ORDERING: throttling outranks it. The item must be retried, not broken.
 const rl = delegate({
-  code: 1,
+  code: 1, writes: 'work', commit: true,
   stdout: resultLine({ subtype: 'error_during_execution', is_error: true, result: 'HTTP 429: rate limit exceeded, try again in 30 seconds' }),
 });
 check(rl.status === 5,
@@ -258,7 +310,7 @@ check(rl.status === 5,
   'that was never attempted. A fix that returns early on a failed worker inverts exactly this.');
 
 // Rule 8 — ORDERING: a passing verify does not rescue a failed worker.
-const wv = delegate({ code: 1, stdout: '', verify: 'true' });
+const wv = delegate({ code: 1, stdout: '', writes: 'work', commit: true, verify: 'true' });
 check(wv.status === 6,
   `rule 8: a failed delegation must exit 6 even when the verify command passes; got ${wv.status}. ` +
   'A weak verify passing over work that was never attempted is why BLOCKED already outranks verify.');
@@ -314,6 +366,141 @@ exit 6
     `rule 9: the parked record must say the delegated AGENT did not complete; it reads ${record}. ` +
     'Exit 6 is a defined outcome — a drain that files it as an unexplained crash tells the human ' +
     'the wrong thing about what happened, and its exit-code contract has stopped covering the toolchain it drives.');
+}
+
+// ---------------------------------------------------------------------------
+// #93 — a delegation that COMMITTED NOTHING is a delegation that produced
+// nothing, and must not report success either. Same property as #91, one step
+// further along: there the agent never ran, here it ran and left no trace a
+// branch can carry. glm-ship pushes COMMITS, so uncommitted work is not merged
+// — it is silently discarded with the worktree, while every signal says the
+// item succeeded.
+
+// Rule 10 — the agent worked and forgot to commit. Verify passes, because -v
+// runs against the working tree and is happy with uncommitted files: verify
+// cannot be what catches this.
+const unc = delegate({ code: 0, stdout: resultLine({}), writes: 'work', commit: false, verify: 'test -f feature.txt' });
+check(unc.status !== 0,
+  `rule 10: a delegation that committed NOTHING must not report success; it exited ${unc.status}. ` +
+  'glm-drain ships on a zero exit, and glm-ship pushes commits — so this opens an empty PR, ' +
+  'gets green CI because nothing changed, and auto-merges it while the work is thrown away with the worktree.');
+check(unc.row?.verify === 'pass',
+  `rule 10: the run must still record that verify passed (got ${JSON.stringify(unc.row?.verify)}) — ` +
+  'suppressing it hides that a green verify is exactly what made this look fine.');
+
+// Rule 11 — it says WHY, and names what was left behind, so the human can
+// recover the work rather than re-running the task.
+// Asserted on worker_reason ALONE, never on the run's output. The first draft
+// allowed either, and the filename check could not fail: glm-task echoes its own
+// verify command, so `-v "test -f feature.txt"` put "feature.txt" on stderr no
+// matter what the reason said. The reason is also the durable artifact — the
+// output scrolls past, the ledger row is what gets read afterwards.
+const uncReason = String(unc.row?.worker_reason ?? '');
+check(/uncommitted/i.test(uncReason),
+  'rule 11: the recorded reason must say the agent left work UNCOMMITTED. "Nothing was committed" ' +
+  `and "the agent did nothing" are different facts with different fixes. Reason: ${JSON.stringify(uncReason)}`);
+check(/feature\.txt/.test(uncReason),
+  'rule 11: the reason must NAME the files left uncommitted — they are about to be destroyed with ' +
+  `the worktree, and naming them is the difference between recoverable and lost. Reason: ${JSON.stringify(uncReason)}`);
+
+// Rule 12 — an agent that produced nothing at all is ALSO not a success, and
+// must not be reported in the same words as one that forgot to commit.
+const none = delegate({ code: 0, stdout: resultLine({}) });
+check(none.status !== 0,
+  `rule 12: a delegation that produced no change at all must not report success; it exited ${none.status}. ` +
+  'There is nothing to ship, so a zero exit sends the drain to ship an empty branch.');
+check(!/uncommitted/i.test(String(none.row?.worker_reason ?? '')),
+  `rule 12: "the agent produced nothing" must not be reported as "left work uncommitted" — ` +
+  `it says ${JSON.stringify(none.row?.worker_reason)}. A wrong reason sends the human looking for files that do not exist.`);
+
+// Rule 13 — the reviewer is not spent on a diff already known to be empty.
+const unrev = delegate({ code: 0, stdout: resultLine({}), writes: 'work', commit: false, reviewer: true });
+check(unrev.reviewed === false,
+  'rule 13: glm-review was invoked with nothing committed to review. That spends a reviewer call to ' +
+  'obtain an empty-diff error, and then records "the reviewer broke" as the run\'s review state — ' +
+  'which is what made this defect read as a reviewer problem for two rounds.');
+
+// Rule 14 — FORBID THE WRONG FIX. glm-task must refuse, never tidy up.
+// Committing on the agent's behalf fabricates authorship and a message, and
+// commits whatever else happened to be in the tree.
+check(unc.added === 0,
+  'rule 14: glm-task COMMITTED the agent\'s uncommitted work itself. That invents an author and a ' +
+  'commit message, and sweeps in whatever else was in the tree. The fix for "nothing was committed" ' +
+  'is to refuse and say so, not to commit it.');
+check(/feature\.txt/.test(unc.dirty),
+  `rule 14: the uncommitted work must be left exactly where the agent left it; the tree now reads ` +
+  `${JSON.stringify(unc.dirty)}. A gate that loses the work while reporting the problem is not an improvement.`);
+
+// Rule 15 — CONTROL for 10-14: an agent that commits is unaffected by any of
+// it, and its reviewer still runs. Forbids "refuse everything".
+const good = delegate({ code: 0, stdout: resultLine({}), writes: 'work', commit: true, reviewer: true });
+// This half deliberately overlaps rule 4 — a mutation that refuses everything
+// trips rule 4 first, so treat the reviewer assertion below as the load-bearing
+// one. Kept because it is the same claim stated where a reader of rules 10-15
+// will look for it.
+check(good.status === 0,
+  `rule 15: an agent that committed its work must still exit 0; got ${good.status}`);
+check(good.reviewed === true,
+  'rule 15: the reviewer must still be invoked when there IS a committed change — ' +
+  'skipping review for everything satisfies rule 13 and defeats the entire loop.');
+
+// ---------------------------------------------------------------------------
+// Rules 16-18 came from review, after this gate passed an implementation that
+// would have shipped a branch nobody read. All three reproduced exactly as the
+// reviewer stated them.
+
+// Rule 16 — "I cannot tell" must never resolve to "fine". A git that can count
+// commits but cannot read the working tree knows one half of the answer, and
+// the first implementation let that half through: it returned early on a
+// non-zero commit count, keeping the run a success, while the review guard —
+// which required BOTH probes to have worked — skipped the reviewer entirely.
+// The branch shipped, unreviewed, exit 0. Two conditions that must agree were
+// written twice and disagreed.
+{
+  const corrupt = delegate({
+    code: 0, stdout: resultLine({}), writes: 'work', commit: true, reviewer: true,
+    // Commit normally, THEN break the index — so the commit count answers and
+    // the tree state does not. Reaching it any other way (removing .git) breaks
+    // both probes and cannot show this.
+    afterWork: 'printf broken > "$GATE_REPO/$(git -C "$GATE_REPO" rev-parse --git-path index)"\n',
+  });
+  check(corrupt.status !== 0,
+    `rule 16: a run whose git could not read the working tree must not report success; it exited ` +
+    `${corrupt.status}. It committed, so the branch is real and shippable — and unread.`);
+  check(!(corrupt.reviewed === false && corrupt.status === 0),
+    'rule 16: the reviewer was skipped AND the run reported success. Whatever else is true, a ' +
+    'branch that no reviewer read must not come back looking like one that passed review.');
+}
+
+// Rule 17 — name the files, even inside a directory the agent created.
+// `git status --porcelain` collapses untracked directories to `?? new/`, so the
+// files that are about to be destroyed with the worktree are not named — which
+// is the whole point of rule 11.
+{
+  const nested = delegate({
+    code: 0, stdout: resultLine({}), commit: false,
+    afterWork: 'mkdir -p "$GATE_REPO/newdir" && printf a > "$GATE_REPO/newdir/alpha.txt" && printf b > "$GATE_REPO/newdir/beta.txt"\n',
+  });
+  const reason = String(nested.row?.worker_reason ?? '');
+  check(/alpha\.txt/.test(reason) && /beta\.txt/.test(reason),
+    `rule 17: files left inside a NEW DIRECTORY must be named individually; the reason says ` +
+    `${JSON.stringify(reason)}. "newdir" is not a list of what a human has to recover.`);
+}
+
+// Rule 18 — a repository-local git setting must not change the FACTS the run
+// reports. status.showUntrackedFiles=no makes the default porcelain output
+// empty, which turns "the agent left work uncommitted" into the confidently
+// wrong "the agent produced no change at all".
+{
+  const hidden = delegate({
+    code: 0, stdout: resultLine({}), writes: 'work', commit: false,
+    gitConfig: { 'status.showUntrackedFiles': 'no' },
+  });
+  const reason = String(hidden.row?.worker_reason ?? '');
+  check(/uncommitted/i.test(reason) && /feature\.txt/.test(reason),
+    `rule 18: a local git config must not change what the run reports happened. With ` +
+    `status.showUntrackedFiles=no the reason says ${JSON.stringify(reason)} — it must still say ` +
+    'the work was left uncommitted, and still name it.');
 }
 
 console.log(`DELEGATION OK (${checks} checks)`);
