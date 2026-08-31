@@ -60,3 +60,4 @@ jobs:
       - run: npm run verify:worker
       - run: npm run verify:delegation
       - run: npm run verify:ledger
+      - run: npm run verify:unreviewed

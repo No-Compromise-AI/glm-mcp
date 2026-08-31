@@ -64,6 +64,7 @@ jobs:
       - run: npm run verify:worker
       - run: npm run verify:delegation
       - run: npm run verify:ledger
+      - run: npm run verify:unreviewed
 
   build:
     # Deliberately NO id-token here. This job runs repository code; it must not

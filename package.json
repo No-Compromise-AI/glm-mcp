@@ -50,7 +50,8 @@
     "verify:drain": "node scripts/verify-drain.mjs",
     "verify:worker": "node scripts/verify-worker.mjs",
     "verify:delegation": "node scripts/verify-delegation.mjs",
-    "verify:ledger": "node scripts/verify-ledger.mjs"
+    "verify:ledger": "node scripts/verify-ledger.mjs",
+    "verify:unreviewed": "node scripts/verify-unreviewed.mjs"
   },
   "keywords": [
     "mcp",
