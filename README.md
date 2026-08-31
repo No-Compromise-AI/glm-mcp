@@ -159,6 +159,8 @@ Two things it is genuinely good at:
 | `prompt` | string | — | required |
 | `messages` | `{role, content}[]` | — | the conversation so far, as prior turns this call continues — see below |
 | `files` | string[] | — | files to include as context, each numbered `cat -n` style: literal paths (optionally with an inclusive line range, `src/auth/session.ts:40-120`) and/or globs (`src/**/*.ts`, `*.md`, `{lib,src}/*.ts`) |
+| `include` | string | — | send only the expanded `files` whose **content** contains this literal text (`"refreshToken"`). Matched against what is in each file, never its path, and applied before the character budget, so a large file about to be dropped cannot crowd out a small one that matches. A literal substring, not a regex. If nothing matches, the call is refused rather than answered without the material |
+| `images` | string[] | — | image paths to attach (PNG, JPEG, GIF, WebP), read under the same confinement and the same size limit as `files`. Requires a model that accepts image input; with any other model the call is **refused**, because an answer that silently ignored the images would read exactly like one that had looked at them |
 | `cwd` | string | server cwd | what relative `files` resolve against |
 | `model` | string | `glm-5.3` | any id from `glm_models` |
 | `reasoning` | `none`\|`low`\|`high`\|`max` | `low` | higher is slower |

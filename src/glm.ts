@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { readFileSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { expandGlob, isGlobPattern, patternAnchors } from "./glob.js";
 import { confineRoots, deniedCredentials, insideRoots, realpathish } from "./confine.js";
 import {
@@ -937,6 +937,115 @@ export interface FileContext {
  * callers that resolve a cwd of their own pass it as a string and get the
  * plain no-match, which is the answer their callers asked for.
  */
+/**
+ * The image media types the endpoint accepts. A union rather than `string`, so
+ * adding a format this server cannot actually send is a compile error here
+ * instead of a 400 from the vendor after the round trip.
+ */
+export type ImageMediaType = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+
+/** One image, ready for an Anthropic-shaped content block. */
+export interface ImageAttachment {
+  mediaType: ImageMediaType;
+  base64: string;
+}
+
+/**
+ * The media type, sniffed from the bytes rather than the extension (#56).
+ * A name is what the caller typed; the magic is what the file is, and the
+ * vendor rejects a mismatch after the round trip with a message about neither.
+ */
+function sniffImage(buf: Buffer): ImageMediaType | undefined {
+  if (buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+  if (buf.length >= 6 && buf.subarray(0, 6).toString("latin1").startsWith("GIF8")) return "image/gif";
+  if (buf.length >= 12 && buf.subarray(0, 4).toString("latin1") === "RIFF" && buf.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
+  return undefined;
+}
+
+export interface ImageContext {
+  images: ImageAttachment[];
+  notes: string[];
+  refusedCall: boolean;
+}
+
+/**
+ * Read image attachments under the SAME confinement and the SAME byte limit as
+ * text files (#56). Images are files: a second reader that skipped the roots
+ * would undo the boundary this server is built on, and a second size limit
+ * would be one more number free to drift from the one already there.
+ *
+ * A model that cannot see images is refused rather than quietly sent text —
+ * a caller who attaches a screenshot and gets prose back has no way to tell it
+ * was dropped.
+ */
+export function buildImageContext(
+  paths: string[],
+  cwd: string | undefined,
+  model: string = DEFAULT_MODEL,
+): ImageContext {
+  const notes: string[] = [];
+  if (paths.length === 0) return { images: [], notes, refusedCall: false };
+
+  if (!OUTPUT_LIMITS.get(model)?.vision) {
+    return {
+      images: [],
+      notes: [
+        `refused: ${model} does not accept image input, and ${paths.length} image(s) were attached. ` +
+          `Choose a vision model, or ask without the images — answering with them dropped would ` +
+          `read like an answer that had looked at them.`,
+      ],
+      refusedCall: true,
+    };
+  }
+
+  const roots = confineRoots();
+  const base = cwd ?? process.cwd();
+  const maxBytes = envLimit("GLM_MCP_MAX_FILE_BYTES", DEFAULT_MAX_FILE_BYTES);
+  const images: ImageAttachment[] = [];
+
+  for (const p of paths) {
+    const abs = isAbsolute(p) ? p : join(base, p);
+    let resolved: string;
+    try {
+      resolved = realpathish(abs);
+    } catch {
+      notes.push(`refused (unreadable): ${p}`);
+      continue;
+    }
+    if (roots !== null && !insideRoots(resolved, roots)) {
+      notes.push(`refused (outside the allowed roots): ${p}`);
+      continue;
+    }
+    let raw: Buffer;
+    try {
+      raw = readFileSync(resolved);
+    } catch {
+      notes.push(`refused (unreadable): ${p}`);
+      continue;
+    }
+    if (raw.length > maxBytes) {
+      notes.push(
+        `refused (too large): ${p} is ${raw.length} bytes, over the GLM_MCP_MAX_FILE_BYTES limit of ${maxBytes}`,
+      );
+      continue;
+    }
+    const mediaType = sniffImage(raw);
+    if (mediaType === undefined) {
+      notes.push(
+        `refused (not an image): ${p} is not a PNG, JPEG, GIF or WebP. Guessing a media type earns ` +
+          `a 400 from z.ai after the round trip, about neither the file nor the guess.`,
+      );
+      continue;
+    }
+    images.push({ mediaType, base64: raw.toString("base64") });
+  }
+
+  // Every attachment refused means the caller asked about pictures and none
+  // arrived — the same refusal a text call makes when it reads nothing.
+  return { images, notes, refusedCall: images.length === 0 };
+}
+
 export interface FileContextOptions {
   /**
    * Send only the expanded files whose CONTENT contains this string (#56).
@@ -1631,6 +1740,13 @@ export type TurnRole = "user" | "assistant";
 
 export interface AskArgs {
   prompt: string;
+  /**
+   * Images to attach to the final user turn (#56). Present, the turn's content
+   * becomes a block array; ABSENT, it stays the plain string it has always
+   * been — every existing caller is on that path and must not be able to tell
+   * this field exists.
+   */
+  images?: ImageAttachment[];
   model: string;
   reasoning: Reasoning;
   system?: string;
@@ -1737,7 +1853,25 @@ export async function ask(args: AskArgs): Promise<AskResult> {
   const body: Anthropic.Messages.MessageCreateParamsNonStreaming = {
     model,
     max_tokens: maxTokens,
-    messages: [...turns, { role: "user", content: prompt }],
+    messages: [
+      ...turns,
+      {
+        role: "user",
+        // #56: blocks only when there is something to put in them. A
+        // one-element array would be equivalent to the vendor and a visible
+        // change to every caller and every recorded request, for nothing.
+        content:
+          (args.images?.length ?? 0) === 0
+            ? prompt
+            : [
+                ...(args.images ?? []).map((img) => ({
+                  type: "image" as const,
+                  source: { type: "base64" as const, media_type: img.mediaType, data: img.base64 },
+                })),
+                { type: "text" as const, text: prompt },
+              ],
+      },
+    ],
   };
   if (system) body.system = system;
 

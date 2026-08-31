@@ -8,6 +8,7 @@ import { z } from "zod";
 import {
   ask,
   buildFileContext,
+  buildImageContext,
   DEFAULT_MODEL,
   explainError,
   listModels,
@@ -220,6 +221,17 @@ server.registerTool(
             "dropped; if none match, the call is refused rather than answered " +
             "without the material it was about."
         ),
+      images: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Optional image paths to attach (PNG, JPEG, GIF or WebP). Read under " +
+            "the same confinement and the same size limit as `files`. Requires a " +
+            "model that accepts image input — with any other model the call is " +
+            "REFUSED rather than answered without the images, because an answer " +
+            "that silently ignored them would read exactly like one that had " +
+            "looked."
+        ),
       cwd: z
         .string()
         .optional()
@@ -275,7 +287,7 @@ server.registerTool(
         ),
     },
   },
-  async ({ prompt, files, cwd, model, reasoning, system, max_tokens, messages, include }, extra) => {
+  async ({ prompt, files, cwd, model, reasoning, system, max_tokens, messages, include, images }, extra) => {
     // #43: armed before the first byte of work, silenced by the finally on
     // every exit — success, refusal and failure alike. A no-op for a client
     // that sent no progress token, so the silent majority notices nothing.
@@ -347,8 +359,27 @@ server.registerTool(
         }
       }
 
+      let attachments;
+      if (images !== undefined && images.length > 0) {
+        const ictx = buildImageContext(images, cwd, chosenModel);
+        notes.push(...ictx.notes);
+        if (ictx.refusedCall) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: `Refused: no image was attached.\n\n${ictx.notes.join("; ")}`,
+              },
+            ],
+          };
+        }
+        attachments = ictx.images;
+      }
+
       const result = await ask({
         prompt: finalPrompt,
+        ...(attachments === undefined ? {} : { images: attachments }),
         // Spread only when a thread exists, so the no-thread call reaches
         // ask() exactly as it did before #52 — the parameter is additive.
         ...(priorTurns.length > 0 ? { messages: priorTurns } : {}),
