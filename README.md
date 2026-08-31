@@ -161,6 +161,7 @@ Two things it is genuinely good at:
 | `files` | string[] | — | files to include as context, each numbered `cat -n` style: literal paths (optionally with an inclusive line range, `src/auth/session.ts:40-120`) and/or globs (`src/**/*.ts`, `*.md`, `{lib,src}/*.ts`) |
 | `include` | string | — | send only the expanded `files` whose **content** contains this literal text (`"refreshToken"`). Matched against what is in each file, never its path, and applied before the character budget, so a large file about to be dropped cannot crowd out a small one that matches. A literal substring, not a regex. If nothing matches, the call is refused rather than answered without the material |
 | `images` | string[] | — | image paths to attach (PNG, JPEG, GIF, WebP), read under the same confinement and the same size limit as `files`. Requires a model that accepts image input; with any other model the call is **refused**, because an answer that silently ignored the images would read exactly like one that had looked at them |
+| `schema` | object | — | a JSON Schema the answer must take. Sent as a **forced tool**, not asked for in the prompt: asking is unenforced, and a caller cannot tell a formatting drift from a real answer without parsing — the parsing this removes. The response is the structured value. If the model answers in prose instead the call **fails**, and its text is withheld deliberately, because a caller that asked for a shape cannot use text it would have to parse |
 | `cwd` | string | server cwd | what relative `files` resolve against |
 | `model` | string | `glm-5.3` | any id from `glm_models` |
 | `reasoning` | `none`\|`low`\|`high`\|`max` | `low` | higher is slower |
@@ -272,6 +273,29 @@ accepts images (`glm-4.6v` and siblings, and `glm-5.3-flash`, which is natively
 multimodal though its name says nothing of it) forgoes the modality it was selected
 for; each such id's role says so. An id this server's model table does not know is
 listed bare: it stays z.ai's to describe, exactly as it stays z.ai's to size.
+
+### A verdict instead of paragraphs
+
+When you want `{ finding, severity, lines }` rather than prose, pass a schema and get the
+value:
+
+```bash
+glm-mcp ask -f 'src/**/*.ts' --schema '{"type":"object","properties":{"finding":{"type":"string"},"severity":{"type":"string","enum":["P1","P2"]}},"required":["finding","severity"]}' \
+  "the worst thing in here"
+```
+
+stdout is the JSON value, so it pipes into `jq` and composes. `glm_ask` takes the same
+`schema` parameter over MCP.
+
+It is sent as a **forced tool**, never as a request in the prompt. "Reply as JSON like {…}"
+is unenforced: the model can preface it, fence it, apologise first, or drift on the twentieth
+call after nineteen good ones — and you cannot tell a formatting drift from a real answer
+without parsing, which is the parsing this exists to remove.
+
+If the model answers in prose anyway, **the call fails and the prose is withheld.** A
+shape-shaped promise broken silently is worse than the prose it replaced. An unusable schema
+— unparseable, or not an object schema — is refused before the request is sent, because a 400
+from the vendor arrives later and explains less.
 
 ### Narrowing a wide glob by what is in the files
 
