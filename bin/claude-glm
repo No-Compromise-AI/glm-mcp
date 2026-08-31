@@ -4,12 +4,35 @@
 set -euo pipefail
 
 # --- resolve the z.ai API key (never hardcode it in this file) ---
-if [[ -z "${ZAI_API_KEY:-}" && -f "$HOME/.config/zai/api-key" ]]; then
-  ZAI_API_KEY="$(tr -d '[:space:]' < "$HOME/.config/zai/api-key")"
-fi
-# fall back to the key zcode already stores
-if [[ -z "${ZAI_API_KEY:-}" && -f "$HOME/.zcode/v2/config.json" ]]; then
-  ZAI_API_KEY="$(python3 -c "import json,sys;d=json.load(open('$HOME/.zcode/v2/config.json'));print(d['provider']['builtin:zai-coding-plan']['options'].get('apiKey',''))" 2>/dev/null || true)"
+# Asked of the server rather than searched for again (#55). This file used to
+# reimplement the same three sources in bash, and the two copies had already
+# drifted where it mattered: glm-mcp requires GLM_MCP_ALLOW_ZCODE_KEY=1 before
+# it will use the key ZCode stores, and this script read that file
+# unconditionally — so the wrapper was quietly more permissive than the server
+# it wraps. One implementation, and this asks it.
+__self="${BASH_SOURCE[0]}"
+while [[ -L "$__self" ]]; do
+  __dir="$(cd -P "$(dirname -- "$__self")" && pwd)"
+  __self="$(readlink -- "$__self")"
+  [[ "$__self" != /* ]] && __self="$__dir/$__self"
+done
+HERE="$(cd -P "$(dirname -- "$__self")" && pwd)"
+ENTRY="$HERE/../dist/index.js"
+
+if [[ -z "${ZAI_API_KEY:-}" ]]; then
+  if [[ ! -f "$ENTRY" ]]; then
+    # No silent fallback to a second copy of the policy: that is the drift this
+    # change removes, and a wrapper that quietly disagrees with the server about
+    # which credentials are allowed is worse than one that stops.
+    echo "claude-glm: $ENTRY is missing — run 'npm ci' (or 'npm run build') in the repo root," >&2
+    echo "claude-glm: or export ZAI_API_KEY yourself." >&2
+    exit 1
+  fi
+  if ! ZAI_API_KEY="$(node "$ENTRY" key --print 2>/dev/null)"; then
+    echo "No z.ai API key. Put one in ~/.config/zai/api-key or export ZAI_API_KEY." >&2
+    echo "claude-glm: to reuse the key ZCode stores, set GLM_MCP_ALLOW_ZCODE_KEY=1." >&2
+    exit 1
+  fi
 fi
 if [[ -z "${ZAI_API_KEY:-}" ]]; then
   echo "No z.ai API key. Put one in ~/.config/zai/api-key or export ZAI_API_KEY." >&2

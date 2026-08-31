@@ -365,14 +365,28 @@ const isAbsent = (e: unknown): boolean => {
  * not the caller's business — the path and the underlying error go to stderr
  * for the operator.
  */
-export function resolveApiKey(): string {
+/**
+ * Where a resolved key came from. Named, not the value — `glm-mcp key` reports
+ * this so an operator can see which of the three sources answered without the
+ * secret crossing a terminal (#55).
+ */
+export type KeySource = "ZAI_API_KEY" | "~/.config/zai/api-key" | "~/.zcode/v2/config.json";
+
+/**
+ * The key AND which source produced it, from one search. `claude-glm` used to
+ * reimplement this policy in bash — five references to the same three paths,
+ * free to drift from the four here, and one side had grown ENOENT-versus-
+ * permission handling the other lacked (#55). One implementation, two views:
+ * this, and {@link resolveApiKey} for callers that only want the value.
+ */
+export function resolveApiKeyWithSource(): { key: string; source: KeySource } {
   const fromEnv = process.env.ZAI_API_KEY?.trim();
-  if (fromEnv) return fromEnv;
+  if (fromEnv) return { key: fromEnv, source: "ZAI_API_KEY" };
 
   const keyFile = join(homedir(), ".config", "zai", "api-key");
   try {
     const k = readFileSync(keyFile, "utf8").trim();
-    if (k) return k;
+    if (k) return { key: k, source: "~/.config/zai/api-key" };
   } catch (e) {
     if (!isAbsent(e)) {
       // #26: the thrown message is what the caller reads, and V8's errno errors
@@ -416,7 +430,9 @@ export function resolveApiKey(): string {
       try {
         const cfg = JSON.parse(raw);
         const k = cfg?.provider?.["builtin:zai-coding-plan"]?.options?.apiKey;
-        if (typeof k === "string" && k.trim()) return k.trim();
+        if (typeof k === "string" && k.trim()) {
+          return { key: k.trim(), source: "~/.zcode/v2/config.json" };
+        }
       } catch (e) {
         // A config that will not parse holds no usable key, so the plain
         // guidance below still applies — but the operator who opted in (#21)
@@ -431,6 +447,10 @@ export function resolveApiKey(): string {
     "No z.ai API key found. Set ZAI_API_KEY, or write the key to ~/.config/zai/api-key. " +
       "To reuse the key ZCode stores, set GLM_MCP_ALLOW_ZCODE_KEY=1.",
   );
+}
+
+export function resolveApiKey(): string {
+  return resolveApiKeyWithSource().key;
 }
 
 /**
