@@ -135,10 +135,21 @@ function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do
   // empty is how "there was nothing to review" got recorded as "the reviewer
   // broke" for two rounds running.
   const reviewCalls = join(dir, 'review-calls.txt');
+  const env = { ...process.env };
   if (reviewer) {
     const rv = join(bin, 'glm-review');
     writeFileSync(rv, `#!/usr/bin/env bash\necho "asked $*" >> ${JSON.stringify(reviewCalls)}\necho "VERDICT: PASS"\nexit 0\n`);
     chmodSync(rv, 0o755);
+    // glm-task keeps a reviewer only if its CLI resolves, and a CI runner has
+    // none — so provide one. Without this the gate read the DEVELOPER'S
+    // toolchain: rule 15 passed on a laptop with codex installed and failed on
+    // all three Node versions in CI. A gate must not be able to tell whose
+    // machine it is running on. (The stub only satisfies the resolution check;
+    // glm-task invokes "$HERE/glm-review" directly, so the shim above is what
+    // actually runs. Same mechanism test/delegation.test.mjs uses.)
+    writeFileSync(join(bin, 'codex'), '#!/usr/bin/env bash\nexit 0\n');
+    chmodSync(join(bin, 'codex'), 0o755);
+    env.PATH = `${bin}:${process.env.PATH}`;
   }
 
   const repo = join(dir, 'repo'); mkdirSync(repo);
@@ -155,7 +166,7 @@ function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do
   const r = spawnSync('bash', [join(bin, 'glm-task'), ...args, task], {
     encoding: 'utf8', timeout: 120_000,
     env: {
-      ...process.env,
+      ...env,
       HOME: dir,                              // never touch the real ~/.claude-glm
       GATE_REPO: repo,
       GLM_TASK_LEDGER: ledger,

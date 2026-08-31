@@ -154,7 +154,16 @@ fi
 
 cd "$DIR" || exit 1
 BASE="$(git rev-parse HEAD 2>/dev/null || echo '')"
-echo "glm-task: dir=$DIR base=${BASE:0:8} reviewer=$REVIEWER" >&2
+# What this run touched, for the ledger row (#77). A -W/-b run has already
+# named the branch it created; an in-place run shares a checkout, and the
+# branch it stands on is the only honest attribution — attribution is not a
+# property of isolation. Detached HEAD names no branch: symbolic-ref prints
+# nothing and the row records null rather than a guess. symbolic-ref rather
+# than `branch --show-current` because it predates the git bin/ has to run on.
+if [[ -z "$BRANCH" ]]; then
+  BRANCH="$(git symbolic-ref -q --short HEAD 2>/dev/null || true)"
+fi
+echo "glm-task: dir=$DIR base=${BASE:0:8} branch=${BRANCH:-none} reviewer=$REVIEWER" >&2
 echo "glm-task: log=$LOG" >&2
 echo "glm-task: notes=$NOTES" >&2
 
@@ -520,7 +529,7 @@ GLM_VERIFY="$VERIFY" GLM_VSTATUS="${VSTATUS:-skipped}" GLM_VRC="${VRC:-}" \
 GLM_WORKER_OK="${WORKER_OK:-}" GLM_WORKER_REASON="${WORKER_REASON:-}" \
 GLM_REVIEWER="$REVIEWER" GLM_RVERDICT="$REVIEW_VERDICT" GLM_ROUNDS="$ROUNDS" \
 GLM_NOTES_F="$NOTES" GLM_REVF="$REVF" GLM_REVERR="$REVERR" GLM_BASE="$BASE" GLM_BRANCH="${BRANCH:-}" python3 - <<'PY'
-import json, os, datetime
+import json, os, re, datetime
 res={}
 try:
     for line in open(os.environ["GLM_LOG"]):
@@ -553,10 +562,39 @@ if notes:
     print("\nglm-task: the agent raised %d item(s) for you:" % len(notes))
     for n in notes:
         print("  [%s] %s" % (n.get("level","?"), (n.get("msg") or "")[:300]))
+# Which GitHub issue the task names, or None — never a bare number (#77).
+# Only the three forms a task is actually written in here: "#123",
+# "issue 123", and the "gh issue view 123" line the /glm skill tells callers
+# to embed. A task saying "raise the timeout to 300 seconds" names no issue,
+# and a greedy digit scan would attribute work to an issue nobody touched:
+# absent is honestly unknown, wrong is a quietly false retro. First mention
+# wins when a task names several.
+# The number is only an issue number when the task SAYS issue. Requiring the
+# word is what makes a pull request number impossible to mistake for one —
+# GitHub numbers issues and PRs from a single sequence, so "#45" alone is a real
+# number for a real thing that may not be this run's issue.
+#
+# The first version matched a bare "#n" and then tried to suppress the ones
+# preceded by "PR". Review found that guard failing in both directions at once:
+# it swallowed the unambiguous "Review PR (issue 50)", and leaked on "Review PRs
+# #45 and #46" — and its tail is unbounded ("backport of #45", "closes #45").
+# A heuristic that needs a second heuristic to correct it is the wrong shape;
+# requiring the word needs no guard at all, and every case the reviewer raised
+# falls out of it.
+_rx_issue = re.compile(r"\bissues?\s*#?\s*([0-9]+)\b|\bgh\s+issue\s+view\s+([0-9]+)\b", re.I)
+_m = _rx_issue.search(os.environ["GLM_TASK_TEXT"])
+issue = int(_m.group(1) or _m.group(2)) if _m else None
 rec={
  "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
  "dir": os.environ["GLM_DIR"], "base": os.environ["GLM_BASE"] or None,
+ # The branch the run worked on, beside the identifiers already here: dir
+ # names a temp worktree that is deleted after an isolated run, so it
+ # identifies nothing afterwards — the branch is what a retro can point at.
+ "branch": os.environ["GLM_BRANCH"] or None,
  "task": os.environ["GLM_TASK_TEXT"][:500],
+ # Present and null when the task named no issue, never omitted: a reader
+ # cannot tell an omitted field from a row written before the field existed.
+ "issue": issue,
  "session_id": res.get("session_id"), "num_turns": res.get("num_turns"),
  "duration_ms": res.get("duration_ms"), "agent_error": res.get("is_error"),
  "agent_said": (res.get("result") or "")[:500],
