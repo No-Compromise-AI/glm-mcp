@@ -143,7 +143,30 @@ if [[ $ISOLATE -eq 1 ]]; then
   git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1 || { echo "glm-task: -W needs a git repo" >&2; exit 2; }
   BRANCH="${BRANCH:-glm/$STAMP}"
   WORKTREE="${GLM_WORKTREE_ROOT:-${TMPDIR:-/tmp}}/glm-wt-$STAMP"
-  if ! git -C "$DIR" worktree add -q -b "$BRANCH" "$WORKTREE" HEAD 2>&1; then
+  # An EXISTING branch is continued rather than refused. The workflow this repo
+  # follows is to commit the acceptance gate on a branch named for the work and
+  # then delegate against it, which is exactly the case `worktree add -b`
+  # rejects (#78).
+  #
+  # That abort was also, accidentally, the only thing keeping two runs off one
+  # branch. Removing it without replacing it would give up the guarantee, so the
+  # replacement is explicit and narrower: reuse only a branch nothing else has
+  # checked out. `git worktree add` refuses a branch that is checked out
+  # elsewhere on its own, but its error is git's, not ours, so the case is
+  # detected first and explained in the tool's own words.
+  if git -C "$DIR" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    if git -C "$DIR" worktree list --porcelain | grep -qx "branch refs/heads/$BRANCH"; then
+      echo "glm-task: branch '$BRANCH' is already checked out in another worktree." >&2
+      echo "glm-task: two runs on one branch commit over each other. Finish or remove that worktree (git worktree list), or pick another -b name." >&2
+      exit 2
+    fi
+    # From the branch's own tip, NOT from HEAD: continuing the work means
+    # keeping whatever is already on it.
+    echo "glm-task: reusing existing branch '$BRANCH' — continuing it from its own tip, not from HEAD" >&2
+    if ! git -C "$DIR" worktree add -q "$WORKTREE" "$BRANCH" 2>&1; then
+      echo "glm-task: could not create worktree $WORKTREE on existing branch $BRANCH" >&2; exit 2
+    fi
+  elif ! git -C "$DIR" worktree add -q -b "$BRANCH" "$WORKTREE" HEAD 2>&1; then
     echo "glm-task: could not create worktree $WORKTREE on $BRANCH" >&2; exit 2
   fi
   # Share installed deps rather than reinstalling per run. LINKED_NM remembers
@@ -547,6 +570,15 @@ try:
 except FileNotFoundError: pass
 try: review=open(os.environ["GLM_REVF"]).read()[:4000]
 except Exception: review=""
+# Reviewers cite absolute paths inside the worktree they read, and an isolated
+# run's worktree is deleted when the run ends — so every link in the stored
+# review pointed at nothing (#78). Only THIS run's own prefix is removed:
+# the line numbers were already correct, and a rewrite that stripped anything
+# path-shaped would mangle findings that legitimately name a file elsewhere.
+_wt = os.environ.get("GLM_DIR") or ""
+if _wt:
+    for _p in (_wt.rstrip("/") + "/", os.path.realpath(_wt).rstrip("/") + "/"):
+        review = review.replace(_p, "")
 # A review that delivered no verdict leaves REVF empty, and an empty
 # review_text is how 9 of 9 errored reviews were recorded as though nothing
 # had happened (#74). The reason lives on glm-review's stderr; keep it, so the

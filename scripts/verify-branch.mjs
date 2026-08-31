@@ -44,7 +44,10 @@
 //      by never creating one would satisfy rules 1-3.
 //   5. FORBID THE WRONG FIX: reuse must not discard what is on the branch.
 //      Resetting it to HEAD would make `worktree add -b` succeed and would throw
-//      away the commit the operator was trying to build on.
+//      away the commit the operator was trying to build on. NOTE: that mutation
+//      trips rule 1 first, which already requires the gate commit to survive —
+//      so this is a restatement aimed at the specific wrong fix, not an
+//      independent check. Said out loud rather than left to be discovered.
 //   6. A stored review cites paths that still exist: the run's worktree prefix
 //      is gone from `review_text`, leaving repo-relative paths.
 //   7. FORBID THE WRONG FIX: only the prefix goes. Line numbers, findings and
