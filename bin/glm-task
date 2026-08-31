@@ -360,7 +360,12 @@ check_committed() { # counts what the SHIPPED branch carries; may demote WORKER_
   LEFT_UNCOMMITTED=0; STATE_UNKNOWN=0
   [[ -z "$BASE" ]] && return 0
   _count="$(git rev-list --count "$BASE..$SHIPREF" 2>/dev/null)" && _count_ok=1
-  _st="$(git status --porcelain 2>/dev/null)" && _status_ok=1
+  # -uall: without it porcelain collapses an untracked directory to "?? new/",
+  # so files the agent is about to lose are never named (rule 11 asks for the
+  # names, not the directory) — and a repo-local status.showUntrackedFiles=no
+  # empties the output entirely, turning "left work uncommitted" into the
+  # confidently wrong "produced no change at all". -uall overrides both.
+  _st="$(git status --porcelain -uall 2>/dev/null)" && _status_ok=1
   if [[ "$_count" =~ ^[0-9]+$ ]]; then NEW_COMMITS="$_count"; fi
   [[ "$_count_ok" == "1" && "$_status_ok" == "1" && -n "$NEW_COMMITS" ]] && COUNT_OK=1
   # -W links node_modules into the worktree so runs share installed deps; that
@@ -382,7 +387,12 @@ check_committed() { # counts what the SHIPPED branch carries; may demote WORKER_
   # that COUNTS as carrying a change has nothing to demote. Everything else —
   # including a git that could not answer — falls through to refuse.
   [[ "${WORKER_OK:-0}" == "1" ]] || return 0
-  [[ "$_count_ok" == "1" && "$NEW_COMMITS" =~ ^[0-9]+$ && "$NEW_COMMITS" != "0" ]] && return 0
+  # COUNT_OK already means "both probes answered". Re-deriving "we know enough
+  # to proceed" from _count_ok alone let a run whose git could count commits but
+  # could not read the tree keep WORKER_OK=1 — while the review guard, which
+  # requires COUNT_OK, skipped the reviewer. Exit 0, branch shipped, nobody read
+  # it. Two conditions that must agree must not be written twice.
+  [[ "$COUNT_OK" == "1" && "$NEW_COMMITS" != "0" ]] && return 0
   WORKER_OK=0
   if [[ "$COUNT_OK" != "1" ]]; then
     # The count failed, or answered zero while the tree's state — clean, or
@@ -390,8 +400,14 @@ check_committed() { # counts what the SHIPPED branch carries; may demote WORKER_
     STATE_UNKNOWN=1
     if [[ "$_count_ok" != "1" || ! "$NEW_COMMITS" =~ ^[0-9]+$ ]]; then
       WORKER_REASON="git could not count what $SHIPREF carries since the base - the worktree git is broken or the ref is gone, so no change can be certified"
-    else
+    elif [[ "$NEW_COMMITS" == "0" ]]; then
       WORKER_REASON="git could not read the working tree to say what was left in it - with nothing committed, no change can be certified"
+    else
+      # The count answered, and answered non-zero: the branch DOES carry
+      # commits. Saying "nothing was committed" here would be false, and a
+      # false reason is the same defect as a false exit code — it sends whoever
+      # reads the row looking for the wrong thing.
+      WORKER_REASON="$SHIPREF carries $NEW_COMMITS commit(s), but git could not read the working tree, so whether the agent also left work behind cannot be certified"
     fi
   elif [[ "$UNCOMMITTED_COUNT" -gt 0 ]]; then
     LEFT_UNCOMMITTED=1

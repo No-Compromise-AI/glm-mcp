@@ -107,7 +107,8 @@ const resultLine = (o) => JSON.stringify({
  * boundary whose failure is under test.
  */
 function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do the thing',
-                    writes = null, commit = false, reviewer = false } = {}) {
+                    writes = null, commit = false, reviewer = false,
+                    afterWork = '', gitConfig = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'glm-delegation-gate-'));
   const bin = join(dir, 'bin'); mkdirSync(bin);
   for (const f of ['glm-task', '_glm-hosts.sh', '_glm-capacity.sh']) {
@@ -126,7 +127,7 @@ function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do
           `git -C "$GATE_REPO" -c user.email=a@example.invalid -c user.name=agent commit -qm "the agent's own commit" >/dev/null\n`
         : '')
     : '';
-  writeFileSync(worker, `#!/usr/bin/env bash\n${work}${stdout ? `cat <<'GATEEOF'\n${stdout}\nGATEEOF` : ':'}\nexit ${code}\n`);
+  writeFileSync(worker, `#!/usr/bin/env bash\n${work}${afterWork}${stdout ? `cat <<'GATEEOF'\n${stdout}\nGATEEOF` : ':'}\nexit ${code}\n`);
   chmodSync(worker, 0o755);
 
   // A reviewer that records the fact it was asked. Rule 13 turns on this file
@@ -145,6 +146,7 @@ function delegate({ code = 0, stdout = resultLine({}), verify = null, task = 'do
     { encoding: 'utf8' });
   git('init', '-q', '.');
   git('commit', '-q', '--allow-empty', '-m', 'base');
+  if (gitConfig) for (const [k, v] of Object.entries(gitConfig)) git('config', k, v);
   const baseHead = spawnSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
 
   const ledger = join(dir, 'ledger.jsonl');
@@ -430,5 +432,64 @@ check(good.status === 0,
 check(good.reviewed === true,
   'rule 15: the reviewer must still be invoked when there IS a committed change — ' +
   'skipping review for everything satisfies rule 13 and defeats the entire loop.');
+
+// ---------------------------------------------------------------------------
+// Rules 16-18 came from review, after this gate passed an implementation that
+// would have shipped a branch nobody read. All three reproduced exactly as the
+// reviewer stated them.
+
+// Rule 16 — "I cannot tell" must never resolve to "fine". A git that can count
+// commits but cannot read the working tree knows one half of the answer, and
+// the first implementation let that half through: it returned early on a
+// non-zero commit count, keeping the run a success, while the review guard —
+// which required BOTH probes to have worked — skipped the reviewer entirely.
+// The branch shipped, unreviewed, exit 0. Two conditions that must agree were
+// written twice and disagreed.
+{
+  const corrupt = delegate({
+    code: 0, stdout: resultLine({}), writes: 'work', commit: true, reviewer: true,
+    // Commit normally, THEN break the index — so the commit count answers and
+    // the tree state does not. Reaching it any other way (removing .git) breaks
+    // both probes and cannot show this.
+    afterWork: 'printf broken > "$GATE_REPO/$(git -C "$GATE_REPO" rev-parse --git-path index)"\n',
+  });
+  check(corrupt.status !== 0,
+    `rule 16: a run whose git could not read the working tree must not report success; it exited ` +
+    `${corrupt.status}. It committed, so the branch is real and shippable — and unread.`);
+  check(!(corrupt.reviewed === false && corrupt.status === 0),
+    'rule 16: the reviewer was skipped AND the run reported success. Whatever else is true, a ' +
+    'branch that no reviewer read must not come back looking like one that passed review.');
+}
+
+// Rule 17 — name the files, even inside a directory the agent created.
+// `git status --porcelain` collapses untracked directories to `?? new/`, so the
+// files that are about to be destroyed with the worktree are not named — which
+// is the whole point of rule 11.
+{
+  const nested = delegate({
+    code: 0, stdout: resultLine({}), commit: false,
+    afterWork: 'mkdir -p "$GATE_REPO/newdir" && printf a > "$GATE_REPO/newdir/alpha.txt" && printf b > "$GATE_REPO/newdir/beta.txt"\n',
+  });
+  const reason = String(nested.row?.worker_reason ?? '');
+  check(/alpha\.txt/.test(reason) && /beta\.txt/.test(reason),
+    `rule 17: files left inside a NEW DIRECTORY must be named individually; the reason says ` +
+    `${JSON.stringify(reason)}. "newdir" is not a list of what a human has to recover.`);
+}
+
+// Rule 18 — a repository-local git setting must not change the FACTS the run
+// reports. status.showUntrackedFiles=no makes the default porcelain output
+// empty, which turns "the agent left work uncommitted" into the confidently
+// wrong "the agent produced no change at all".
+{
+  const hidden = delegate({
+    code: 0, stdout: resultLine({}), writes: 'work', commit: false,
+    gitConfig: { 'status.showUntrackedFiles': 'no' },
+  });
+  const reason = String(hidden.row?.worker_reason ?? '');
+  check(/uncommitted/i.test(reason) && /feature\.txt/.test(reason),
+    `rule 18: a local git config must not change what the run reports happened. With ` +
+    `status.showUntrackedFiles=no the reason says ${JSON.stringify(reason)} — it must still say ` +
+    'the work was left uncommitted, and still name it.');
+}
 
 console.log(`DELEGATION OK (${checks} checks)`);
