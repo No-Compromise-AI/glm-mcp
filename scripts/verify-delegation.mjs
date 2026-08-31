@@ -503,4 +503,27 @@ check(good.reviewed === true,
     'the work was left uncommitted, and still name it.');
 }
 
+// Rule 19 — ORDERING: a BLOCKED agent's question outranks "committed nothing".
+// An agent that stops to ask has, by construction, committed nothing — so the
+// two conditions are true together on every blocked run, and whichever is
+// checked first decides what the operator is told. Exit 4 carries the question
+// into the drain's parked record; exit 6 replaces it with "nothing was
+// committed", which is true, useless, and loses the only thing a human could
+// act on. The behaviour was already right when this rule was written; nothing
+// asserted it, and an ordering nothing asserts is an ordering one edit away
+// from reversing.
+{
+  const blocked = delegate({
+    code: 0, stdout: resultLine({ result: 'stopped to ask' }),
+    // The escalation channel the agent actually uses: one JSON line to $GLM_NOTES.
+    afterWork: `printf '%s\\n' '{"level":"blocked","msg":"Which database should this use?"}' >> "$GLM_NOTES"\n`,
+  });
+  check(blocked.status === 4,
+    `rule 19: a blocked agent must exit 4, not ${blocked.status}. It committed nothing — every blocked ` +
+    'run does — so "committed nothing" is true of it and must not be what gets reported. The question ' +
+    'is the only part a human can act on.');
+  check(/BLOCKED/.test(blocked.out),
+    `rule 19: the run must say it is BLOCKED. It said:\n${blocked.out.slice(-500)}`);
+}
+
 console.log(`DELEGATION OK (${checks} checks)`);
