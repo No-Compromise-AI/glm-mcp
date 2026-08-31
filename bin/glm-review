@@ -106,15 +106,20 @@ declare -a EXHAUSTED=() TRIED=() USED=()
 declare -a REC_NAME=() REC_MODEL=() REC_STATUS=() REC_VERDICT=()
 LAST_VERDICT=""
 
-# The model actually asked for. Only agy is pinned by this script; the others
-# run their host CLI's own default, and saying so is more honest than naming a
-# model we did not select and cannot confirm.
+# The model actually asked for. Only agy is pinned here — GLM_AGY_MODEL is
+# passed to the reviewer on line 94 and genuinely selects it. The others run
+# their host CLI's own default, and this says so.
+#
+# There is deliberately no matching variable for the other reviewers. One could
+# only change the LABEL in the record, not the model that runs, since this
+# script passes no model to those CLIs — and a knob that changes what a record
+# claims without changing what happened is worse than no knob at all.
 model_of() {
   case "$1" in
     agy)    printf '%s' "${GLM_AGY_MODEL:-claude-opus-4-6-thinking}" ;;
-    glm)    printf '%s' "${GLM_WORKER_MODEL:-glm-4.6}" ;;
-    codex)  printf '%s' "${GLM_CODEX_MODEL:-codex CLI default (not pinned)}" ;;
-    claude) printf '%s' "${GLM_CLAUDE_MODEL:-claude CLI default (not pinned)}" ;;
+    codex)  printf '%s' "codex CLI default (not pinned by glm-review)" ;;
+    claude) printf '%s' "claude CLI default (not pinned by glm-review)" ;;
+    glm)    printf '%s' "glm-worker default (not pinned by glm-review)" ;;
     *)      printf '%s' "unknown" ;;
   esac
 }

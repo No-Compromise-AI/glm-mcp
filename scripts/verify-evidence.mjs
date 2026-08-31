@@ -94,11 +94,25 @@ if [ "$1 $2" = "pr comment" ]; then
   done
   exit 0
 fi
+# glm-ship always asks gh to do the filtering with --jq, so a stub that echoes
+# raw JSON answers a question the tool never asked: a count query would come
+# back "[]", which is not 0, and the watch loop would spin past every branch
+# that depends on it. The stub answers the SHAPE each call expects, not a
+# generic blob. (No backticks in here: this file is a JS template literal.)
+ALL="$*"
 case "$1 $2" in
   "pr list")   echo "" ;;
   "pr create") echo "7" ;;
-  "pr view")   printf '%s\\tMERGEABLE\\t%s\\n' "\${GATE_PRSTATE:-MERGED}" "\${GATE_MERGESTATE:-CLEAN}" ;;
-  "pr checks") echo "[]" ;;
+  "pr view")
+    case "$ALL" in
+      *reviewThreads*) echo "\${GATE_UNRESOLVED:-0}" ;;
+      *) printf '%s\\tMERGEABLE\\t%s\\n' "\${GATE_PRSTATE:-MERGED}" "\${GATE_MERGESTATE:-CLEAN}" ;;
+    esac ;;
+  "pr checks")
+    case "$ALL" in
+      *join*) printf '' ;;   # the failed-checks query: none failed
+      *) echo 0 ;;           # every count query: no checks at all
+    esac ;;
   *) : ;;
 esac
 exit 0
@@ -139,7 +153,7 @@ exit 0
       GLM_SHIP_CHECK_GRACE: '0',
       GATE_PRSTATE: blockedOnConversations ? 'OPEN' : 'MERGED',
       GATE_MERGESTATE: blockedOnConversations ? 'BLOCKED' : 'CLEAN',
-      GLM_SHIP_DEADLINE: '1',
+      GATE_UNRESOLVED: blockedOnConversations ? '2' : '0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

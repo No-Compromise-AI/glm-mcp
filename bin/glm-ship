@@ -72,7 +72,8 @@ say "branch=$BRANCH dir=$DIR"
 # Matched to THIS branch. Taking the newest row regardless would be wrong in
 # exactly the case the tool is for — several delegations in flight, one of them
 # failed, and the failure decides someone else's merge.
-REVIEW_STATE="$(GLM_LEDGER_F="$LEDGER" GLM_SHIP_BRANCH="$BRANCH" python3 - <<'PYEOF'
+REVREC_F="${TMPDIR:-/tmp}/glm-ship-record-$STAMP.json"
+REVIEW_STATE="$(GLM_LEDGER_F="$LEDGER" GLM_SHIP_BRANCH="$BRANCH" python3 - 2>"$REVREC_F" <<'PYEOF'
 import json, os
 best = None
 try:
@@ -92,6 +93,8 @@ try:
 except Exception: pass
 if best is not None:
     print("%s\t%s\t%s" % (best.get("review") or "", best.get("reviewer") or "", best.get("base") or ""))
+    import sys
+    json.dump(best.get("review_record") or {}, sys.stderr)
 PYEOF
 )"
 REVIEW_VERDICT_SEEN="$(printf '%s' "$REVIEW_STATE" | cut -f1)"
@@ -122,6 +125,65 @@ if [[ -z "$PR" || "$PR" == "null" ]]; then
 fi
 [[ -n "$PR" ]] || { note blocked "could not create or find a PR for $BRANCH"; exit 4; }
 say "PR #$PR"
+
+# ---- the review record, onto the PR ---------------------------------------
+# Until now this lived in ~/.claude-glm/outcomes.jsonl on one machine and died
+# there, so the rigour was an assertion in a commit message rather than a
+# record (#82). Posted ONCE, here, rather than inside the watch loop below,
+# which polls — a comment in that loop becomes a wall of duplicates on a slow PR.
+#
+# A plain issue comment, never `gh pr review`: main requires review threads to
+# be resolved before merge and glm-drain auto-merges unattended, so a tool that
+# posted threads would deadlock the drain on its own comments.
+CURRENT_HEAD="$(git -C "$DIR" rev-parse "$BRANCH" 2>/dev/null || echo '')"
+REVIEW_COMMENT="${TMPDIR:-/tmp}/glm-ship-comment-$STAMP.md"
+if GLM_REC_F="$REVREC_F" GLM_REC_CURHEAD="$CURRENT_HEAD" GLM_REC_OUT="$REVIEW_COMMENT" python3 - <<'PYEOF'
+import json, os, sys
+try:
+    rec = json.load(open(os.environ["GLM_REC_F"]))
+except Exception:
+    rec = None
+# Nothing is posted when there is nothing to say. An empty template reads as
+# coverage, and inventing a record is worse than having none.
+if not rec or not (rec.get("reviewers") or rec.get("absent")):
+    sys.exit(1)
+L = []
+L.append("## Review record")
+L.append("")
+L.append("_Self-reported by `glm-ship` from this delegation's own ledger. "
+         "It is an audit trail, not third-party attestation: nothing here is "
+         "verified by GitHub or by the reviewers themselves._")
+L.append("")
+base, head = rec.get("base") or "", rec.get("head") or ""
+L.append("**Reviewed:** `%s..%s`" % (base[:12], head[:12]))
+cur = os.environ.get("GLM_REC_CURHEAD") or ""
+if head and cur and cur != head:
+    L.append("")
+    L.append("> **HEAD MOVED after the review.** The review above read `%s`; this PR is at "
+             "`%s`. The commits in between were NOT reviewed." % (head[:12], cur[:12]))
+L.append("")
+if rec.get("reviewers"):
+    L.append("| reviewer | model | verdict |")
+    L.append("| --- | --- | --- |")
+    for r in rec["reviewers"]:
+        L.append("| %s | `%s` | %s |" % (r.get("name"), r.get("model"), r.get("verdict")))
+else:
+    L.append("**No reviewer delivered a verdict.**")
+if rec.get("absent"):
+    L.append("")
+    L.append("**Did not deliver:**")
+    for a in rec["absent"]:
+        L.append("- `%s` (%s) - %s" % (a.get("name"), a.get("model"), a.get("reason")))
+L.append("")
+open(os.environ["GLM_REC_OUT"], "w").write("\n".join(L) + "\n")
+PYEOF
+then
+  gh pr comment "$PR" --body-file "$REVIEW_COMMENT" >/dev/null 2>&1 \
+    && say "review record posted to #$PR" \
+    || note scope "could not post the review record to #$PR"
+else
+  say "no review record to post"
+fi
 # If auto-merge cannot be armed we must merge ourselves, or the watch loop waits
 # forever for something that will never happen.
 ARMED=0
@@ -139,6 +201,7 @@ while :; do
   past_deadline && { note blocked "PR #$PR: checks still running after ${DEADLINE}s"; exit 4; }
   STATE=$(gh pr view "$PR" --json mergeable,mergeStateStatus,state --jq '[.state,.mergeable,.mergeStateStatus]|@tsv' 2>/dev/null)
   PRSTATE=$(printf '%s' "$STATE" | cut -f1); MERGEABLE=$(printf '%s' "$STATE" | cut -f2)
+  MERGESTATE=$(printf '%s' "$STATE" | cut -f3)
   [[ "$PRSTATE" == "MERGED" ]] && break
   [[ "$PRSTATE" == "CLOSED" ]] && { note blocked "PR #$PR was closed without merging"; exit 4; }
   if [[ "$MERGEABLE" == "CONFLICTING" ]]; then
@@ -168,6 +231,22 @@ while :; do
     fi
   fi
   PENDING=$(gh pr checks "$PR" --json state --jq '[.[]|select(.state=="PENDING" or .state=="QUEUED" or .state=="IN_PROGRESS")]|length' 2>/dev/null)
+  if [[ "${PENDING:-0}" == "0" && "$MERGESTATE" == "BLOCKED" ]]; then
+    # Checks are done and nothing failed, yet GitHub will not merge. That is a
+    # human gate, not a CI problem, and it is its own outcome: waiting for it to
+    # hit the deadline and reporting a timeout describes a broken change, when
+    # the change is fine and waiting on somebody's click (#82).
+    UNRESOLVED=$(gh pr view "$PR" --json reviewThreads \
+      --jq '[.reviewThreads[]?|select(.isResolved==false)]|length' 2>/dev/null)
+    if [[ -n "$UNRESOLVED" && "$UNRESOLVED" != "null" && "$UNRESOLVED" != "0" ]]; then
+      note blocked "PR #$PR is green but has $UNRESOLVED unresolved conversation(s) and cannot merge until they are resolved. Nothing is wrong with the change."
+    else
+      # The exact reason needs a permission this may not have; name what it can
+      # actually be rather than guessing at one.
+      note blocked "PR #$PR is green but GitHub will not merge it — an unresolved conversation or a required review is holding it. Nothing is wrong with the change. See: gh pr view $PR"
+    fi
+    exit 4
+  fi
   if [[ "${PENDING:-0}" == "0" ]]; then
     if [[ $ARMED -eq 0 ]]; then
       say "checks green; merging"

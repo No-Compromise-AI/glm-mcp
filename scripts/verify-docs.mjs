@@ -156,6 +156,12 @@ const PLUMBING = new Set([
   // heredoc. Not knobs — GLM_TASK_LEDGER, which IS documented, is what a user
   // sets to move the ledger.
   'GLM_LEDGER_F', 'GLM_SHIP_BRANCH',
+  // The review record's plumbing (#82): GLM_REVREC is the path glm-task hands
+  // glm-review, and the GLM_REC_* pair carry the pieces into and out of the
+  // heredocs that build and render it. GLM_REVIEW_RECORD, which a user CAN set
+  // when calling glm-review directly, is documented rather than excluded.
+  'GLM_REVREC', 'GLM_REC_BASE', 'GLM_REC_HEAD', 'GLM_REC_NAMES', 'GLM_REC_MODELS',
+  'GLM_REC_STATUSES', 'GLM_REC_VERDICTS', 'GLM_REC_OUT', 'GLM_REC_F', 'GLM_REC_CURHEAD',
 ]);
 const binVars = new Set();
 for (const f of readdirSync(binDir)) {
