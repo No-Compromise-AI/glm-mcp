@@ -151,6 +151,11 @@ const PLUMBING = new Set([
   // GLM_WRC hands the worker's captured PIPESTATUS in, GLM_WORKER_OK/REASON hand
   // the computed verdict out. Read by nothing a user could set.
   'GLM_WRC', 'GLM_WORKER_OK', 'GLM_WORKER_REASON',
+  // glm-ship reads its branch's review verdict out of the ledger before it will
+  // merge (#75); these two hand the ledger path and the branch into that
+  // heredoc. Not knobs — GLM_TASK_LEDGER, which IS documented, is what a user
+  // sets to move the ledger.
+  'GLM_LEDGER_F', 'GLM_SHIP_BRANCH',
 ]);
 const binVars = new Set();
 for (const f of readdirSync(binDir)) {

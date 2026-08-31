@@ -6,11 +6,16 @@
 #   -b <branch>   branch to ship (default: current)
 #   -t <title>    PR title (default: the branch's last commit subject)
 #   -B <body>     PR body (default: generated from the commits)
-#   -m            enable auto-merge (squash)
+#   -m            arm GitHub auto-merge (squash). NOTE: this selects the
+#                 MECHANISM, not whether to merge — without it this tool still
+#                 merges once the checks are green. Merging is the job; -m only
+#                 decides whether GitHub does it or this loop does
 #   -D <workflow> deploy workflow filename to watch after merge
 #   -V <cmd>      post-deploy check. THIS is what "done" means; without it the
 #                 run reports merged-but-unverified, never done.
 #   -R            require at least one check; fail rather than merge unchecked
+#   -U            merge even though this branch's own review record says no
+#                 reviewer passed it. Says so, loudly, on the way past
 #   -T <secs>     overall watch deadline (default 3600)
 #
 # Escalates through the same notes channel as glm-task: anything that stops the
@@ -18,15 +23,16 @@
 set -uo pipefail
 
 DIR="$PWD"; BRANCH=""; TITLE=""; BODY=""; AUTOMERGE=0; DEPLOY_WF=""; VERIFY_CMD=""; DEADLINE=5400
-REQUIRE_CHECKS=0
+REQUIRE_CHECKS=0; ALLOW_UNREVIEWED=0
+LEDGER="${GLM_TASK_LEDGER:-$HOME/.claude-glm/outcomes.jsonl}"
 # Measured on this account: GitHub can take 2.5-20 MINUTES to create a run after the
 # event. Anything shorter than that concludes "no CI" while the run is still pending.
 CHECK_GRACE="${GLM_SHIP_CHECK_GRACE:-1500}"
-while getopts "C:b:t:B:mD:V:T:Rh" opt; do
+while getopts "C:b:t:B:mD:V:T:RUh" opt; do
   case "$opt" in
     C) DIR="$OPTARG" ;; b) BRANCH="$OPTARG" ;; t) TITLE="$OPTARG" ;; B) BODY="$OPTARG" ;;
-    m) AUTOMERGE=1 ;; R) REQUIRE_CHECKS=1 ;; D) DEPLOY_WF="$OPTARG" ;; V) VERIFY_CMD="$OPTARG" ;; T) DEADLINE="$OPTARG" ;;
-    h) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -16; exit 0 ;;
+    m) AUTOMERGE=1 ;; R) REQUIRE_CHECKS=1 ;; U) ALLOW_UNREVIEWED=1 ;; D) DEPLOY_WF="$OPTARG" ;; V) VERIFY_CMD="$OPTARG" ;; T) DEADLINE="$OPTARG" ;;
+    h) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -18; exit 0 ;;
     *) exit 2 ;;
   esac
 done
@@ -50,6 +56,61 @@ past_deadline() { (( SECONDS - START > DEADLINE )); }
 
 WARNED_NOCHECKS=0
 say "branch=$BRANCH dir=$DIR"
+
+# ---- what this branch's own record says about review ----------------------
+# glm-task marks a change UNREVIEWED when the reviewer errored, when every
+# reviewer was out of capacity, or when none was asked for. Until #77 that
+# verdict could not be found again — the ledger recorded no branch — so nothing
+# downstream could act on it, and the only thing standing between an unreviewed
+# change and a merge was glm-drain declining to call this tool. A human running
+# it by hand had nothing (#75).
+#
+# The check gates MERGING, not the -m flag: this tool merges once checks are
+# green whether or not auto-merge was armed, so guarding the flag would guard
+# nothing.
+#
+# Matched to THIS branch. Taking the newest row regardless would be wrong in
+# exactly the case the tool is for — several delegations in flight, one of them
+# failed, and the failure decides someone else's merge.
+REVIEW_STATE="$(GLM_LEDGER_F="$LEDGER" GLM_SHIP_BRANCH="$BRANCH" python3 - <<'PYEOF'
+import json, os
+best = None
+try:
+    for line in open(os.environ["GLM_LEDGER_F"]):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try: rec = json.loads(line)
+        except Exception: continue
+        if rec.get("branch") != os.environ["GLM_SHIP_BRANCH"]:
+            continue
+        # Last row for this branch wins: a re-run supersedes an earlier one.
+        # (No apostrophes in this heredoc: bash 3.2, which this repo targets,
+        # mis-scans quotes inside a heredoc nested in "$( ... )" and reports an
+        # unmatched quote hundreds of lines away.)
+        best = rec
+except Exception: pass
+if best is not None:
+    print("%s\t%s\t%s" % (best.get("review") or "", best.get("reviewer") or "", best.get("base") or ""))
+PYEOF
+)"
+REVIEW_VERDICT_SEEN="$(printf '%s' "$REVIEW_STATE" | cut -f1)"
+REVIEW_REVIEWER="$(printf '%s' "$REVIEW_STATE" | cut -f2)"
+if [[ -z "$REVIEW_VERDICT_SEEN" ]]; then
+  # Not a defect: glm-ship is also the tool a human uses on a branch that never
+  # went through glm-task. Said out loud so "nobody reviewed this" cannot be
+  # mistaken for "a reviewer passed it".
+  say "no review record for $BRANCH — shipping on the checks alone"
+elif [[ "$REVIEW_VERDICT_SEEN" == "pass" ]]; then
+  say "review=pass (${REVIEW_REVIEWER:-unknown})"
+elif [[ $ALLOW_UNREVIEWED -eq 1 ]]; then
+  say "review=$REVIEW_VERDICT_SEEN — UNREVIEWED, merging anyway because -U was given (operator override)"
+  note scope "merging $BRANCH UNREVIEWED: its record says review=$REVIEW_VERDICT_SEEN and -U was given"
+else
+  say "review=$REVIEW_VERDICT_SEEN — refusing to merge $BRANCH"
+  note blocked "$BRANCH is UNREVIEWED (review=$REVIEW_VERDICT_SEEN${REVIEW_REVIEWER:+, reviewer=$REVIEW_REVIEWER}) and will not be merged. Get a passing review, or re-run with -U to merge it anyway."
+  exit 6
+fi
 git push -u origin "$BRANCH" 2>&1 | tail -2 >&2 || { note blocked "push of $BRANCH failed"; exit 4; }
 
 PR=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number' 2>/dev/null)
