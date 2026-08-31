@@ -1738,8 +1738,40 @@ export function buildFileContext(
  */
 export type TurnRole = "user" | "assistant";
 
+/** The name the forced tool is given. Internal — callers never see it. */
+export const SCHEMA_TOOL_NAME = "emit_result";
+
+/**
+ * Reject a schema this server cannot use, before the round trip (#56).
+ * Returns the reason, or undefined when it is usable.
+ *
+ * The endpoint requires an OBJECT schema for a tool's input: a bare string or
+ * array schema is accepted by JSON Schema and rejected by the vendor, with a
+ * message about neither the caller's intent nor this parameter.
+ */
+export function schemaProblem(schema: unknown): string | undefined {
+  if (schema === null || typeof schema !== "object" || Array.isArray(schema)) {
+    return "a JSON Schema object is required (got " +
+      (Array.isArray(schema) ? "an array" : typeof schema) + ")";
+  }
+  const type = (schema as { type?: unknown }).type;
+  if (type !== "object") {
+    return `the top-level schema must have "type": "object" — a tool's input is an object, and ` +
+      `${JSON.stringify(type)} is refused here rather than by z.ai after the round trip`;
+  }
+  return undefined;
+}
+
 export interface AskArgs {
   prompt: string;
+  /**
+   * A JSON Schema the answer must take (#56). Sent as a single FORCED tool
+   * rather than asked for in the prompt: asking is unenforced, and a caller
+   * cannot tell a formatting drift from a real answer without parsing — the
+   * parsing this exists to remove. Absent, no tools are sent at all and the
+   * reply is prose exactly as it has always been.
+   */
+  schema?: Record<string, unknown>;
   /**
    * Images to attach to the final user turn (#56). Present, the turn's content
    * becomes a block array; ABSENT, it stays the plain string it has always
@@ -1779,6 +1811,12 @@ export interface AskArgs {
 }
 
 export interface AskResult {
+  /**
+   * The structured value, when a schema was requested and the model produced
+   * one. Undefined means it did NOT — the caller asked for a shape and must be
+   * told it did not arrive, never handed the prose instead.
+   */
+  structured?: unknown;
   text: string;
   thinkingChars: number;
   model: string;
@@ -1873,6 +1911,22 @@ export async function ask(args: AskArgs): Promise<AskResult> {
       },
     ],
   };
+  // #56: a single FORCED tool carrying the caller's schema. Forced, not
+  // offered — an optional tool is a suggestion, and a suggestion is what
+  // "please reply as JSON" already was. The schema goes here and NOT into the
+  // prompt: asking is unenforced, and a caller cannot tell a formatting drift
+  // from a real answer without parsing, which is the parsing this removes.
+  if (args.schema !== undefined) {
+    body.tools = [
+      {
+        name: SCHEMA_TOOL_NAME,
+        description: "Return the result in the caller's required shape.",
+        input_schema: args.schema as Anthropic.Messages.Tool.InputSchema,
+      },
+    ];
+    body.tool_choice = { type: "tool", name: SCHEMA_TOOL_NAME };
+  }
+
   if (system) body.system = system;
 
   // #60: every request states its own thinking intent, whatever the caller
@@ -1942,18 +1996,25 @@ export async function ask(args: AskArgs): Promise<AskResult> {
     // usage object should cost the caller a zero, not a crash.
     model?: string;
     stop_reason?: string | null;
-    content?: Array<{ type: string; text?: string; thinking?: string }>;
+    content?: Array<{ type: string; text?: string; thinking?: string; name?: string; input?: unknown }>;
     usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number | null };
   };
 
   let text = "";
   let thinkingChars = 0;
+  let structured: unknown;
   for (const block of res.content ?? []) {
     if (block.type === "text") text += block.text ?? "";
     else if (block.type === "thinking") thinkingChars += (block.thinking ?? "").length;
+    // #56: the caller asked for a shape, so the shape is the answer — its
+    // INPUT, not the envelope around it, which the caller never asked for.
+    else if (block.type === "tool_use" && block.name === SCHEMA_TOOL_NAME) {
+      structured = block.input;
+    }
   }
 
   return {
+    ...(args.schema === undefined ? {} : { structured }),
     text: text.trim(),
     thinkingChars,
     model: res.model ?? model,

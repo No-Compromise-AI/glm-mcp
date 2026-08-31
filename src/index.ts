@@ -232,6 +232,19 @@ server.registerTool(
             "that silently ignored them would read exactly like one that had " +
             "looked."
         ),
+      schema: z
+        .record(z.unknown())
+        .optional()
+        .describe(
+          "Optional JSON Schema the answer must take, e.g. " +
+            '{ "type": "object", "properties": { "finding": { "type": "string" } } }. ' +
+            "Sent as a forced tool rather than asked for in the prompt: asking is " +
+            "unenforced, and a caller cannot tell a formatting drift from a real " +
+            "answer without parsing — the parsing this removes. The response is " +
+            "the structured value as JSON. If the model answers in prose instead, " +
+            "the call FAILS rather than returning text a caller that asked for a " +
+            "shape cannot use."
+        ),
       cwd: z
         .string()
         .optional()
@@ -287,7 +300,7 @@ server.registerTool(
         ),
     },
   },
-  async ({ prompt, files, cwd, model, reasoning, system, max_tokens, messages, include, images }, extra) => {
+  async ({ prompt, files, cwd, model, reasoning, system, max_tokens, messages, include, images, schema }, extra) => {
     // #43: armed before the first byte of work, silenced by the finally on
     // every exit — success, refusal and failure alike. A no-op for a client
     // that sent no progress token, so the silent majority notices nothing.
@@ -380,6 +393,7 @@ server.registerTool(
       const result = await ask({
         prompt: finalPrompt,
         ...(attachments === undefined ? {} : { images: attachments }),
+        ...(schema === undefined ? {} : { schema }),
         // Spread only when a thread exists, so the no-thread call reaches
         // ask() exactly as it did before #52 — the parameter is additive.
         ...(priorTurns.length > 0 ? { messages: priorTurns } : {}),
@@ -392,6 +406,39 @@ server.registerTool(
       });
 
       const footer = usageFooter(result);
+
+      // #56: a shape was asked for, so a shape is the answer — or a failure.
+      // Returning the prose instead would be a shape-shaped promise broken
+      // silently, which is worse than the prose it replaced.
+      if (schema !== undefined) {
+        if (result.structured === undefined) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  "The model returned no structured value for the requested schema; it answered " +
+                  "in prose instead. Its text is withheld deliberately: a caller that asked for a " +
+                  `shape cannot use text it would have to parse.\n\n[${footer}]`,
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: [
+                JSON.stringify(result.structured, null, 2),
+                "",
+                `[${footer}]`,
+                ...(notes.length ? ["", `Notes: ${notes.join("; ")}`] : []),
+              ].join("\n"),
+            },
+          ],
+        };
+      }
 
       const body = [
         result.text || "(empty response)",

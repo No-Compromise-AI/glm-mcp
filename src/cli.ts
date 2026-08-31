@@ -22,6 +22,7 @@ import {
   ask,
   buildFileContext,
   buildImageContext,
+  schemaProblem,
   DEFAULT_MODEL,
   explainError,
   listModels,
@@ -48,6 +49,7 @@ ask options:
       --cwd <dir>         directory globs resolve against
       --include <text>    send only files whose CONTENT contains this literal text
       --image <path>      attach an image (repeatable; needs a vision model)
+      --schema <json>     a JSON Schema the answer must take; stdout becomes that value
       --max-tokens <n>    output cap (default: the model's own published one)
       --system <text>     system prompt
 
@@ -73,6 +75,7 @@ async function cmdAsk(argv: string[]): Promise<number> {
   let system: string | undefined;
   let include: string | undefined;
   const imagePaths: string[] = [];
+  let schema: Record<string, unknown> | undefined;
   const rest: string[] = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -91,6 +94,21 @@ async function cmdAsk(argv: string[]): Promise<number> {
       case "--cwd": cwd = takeValue(argv, i, a); i++; break;
       case "--include": include = takeValue(argv, i, a); i++; break;
       case "--image": imagePaths.push(takeValue(argv, i, a)); i++; break;
+      case "--schema": {
+        const v = takeValue(argv, i, a); i++;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(v);
+        } catch {
+          throw new Error("--schema wants a JSON Schema object; that is not valid JSON");
+        }
+        // Refused here rather than by z.ai after the round trip, which arrives
+        // later and explains less.
+        const why = schemaProblem(parsed);
+        if (why !== undefined) throw new Error(`--schema: ${why}`);
+        schema = parsed as Record<string, unknown>;
+        break;
+      }
       case "--system": system = takeValue(argv, i, a); i++; break;
       case "--max-tokens": {
         const v = takeValue(argv, i, a); i++;
@@ -140,13 +158,28 @@ async function cmdAsk(argv: string[]): Promise<number> {
   const result = await ask({
     prompt: finalPrompt,
     ...(images === undefined ? {} : { images }),
+    ...(schema === undefined ? {} : { schema }),
     model,
     reasoning,
     system,
     ...(maxTokens === undefined ? {} : { maxTokens }),
   });
 
-  process.stdout.write(result.text.endsWith("\n") ? result.text : `${result.text}\n`);
+  if (schema !== undefined) {
+    // A shape was promised. If it did not arrive, say so — printing whatever
+    // prose came back would be a shape-shaped promise broken silently, which is
+    // worse than the prose it replaced.
+    if (result.structured === undefined) {
+      throw new Error(
+        "the model returned no structured value for the requested schema; it answered in prose " +
+          "instead. Nothing is printed, because a caller that asked for a shape cannot use text it " +
+          "would have to parse.",
+      );
+    }
+    process.stdout.write(`${JSON.stringify(result.structured)}\n`);
+  } else {
+    process.stdout.write(result.text.endsWith("\n") ? result.text : `${result.text}\n`);
+  }
   // The cost line the MCP tools append to their answer. On stderr here, because
   // stdout is the answer a script captures.
   console.error(
