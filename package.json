@@ -52,6 +52,7 @@
     "verify:delegation": "node scripts/verify-delegation.mjs",
     "verify:ledger": "node scripts/verify-ledger.mjs",
     "verify:evidence": "node scripts/verify-evidence.mjs",
+    "verify:assumption": "node scripts/verify-assumption.mjs",
     "verify:unreviewed": "node scripts/verify-unreviewed.mjs"
   },
   "keywords": [
