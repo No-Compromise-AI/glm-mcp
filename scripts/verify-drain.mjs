@@ -204,6 +204,15 @@ exit ${shipCode}
     : [];
   const shipRows = readFileSync(shipLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => l.split('\t'));
   const shipped = shipRows.map((r) => r.join(' '));
+  // Which ITEM each ship was for, taken from the branch the drain passed rather
+  // than by looking for the id anywhere in the line. The line carries a
+  // millisecond timestamp and a run stamp, and an id is three or four digits:
+  // `drain-20260831-043013-8048` contains "301", so a substring test fires on
+  // the wall clock. CI found this at 04:30:13 and failed a correct
+  // implementation; six local runs at other times passed.
+  const shippedItems = shipRows
+    .map((r) => /item-([0-9]+)-/.exec(r.join(' '))?.[1])
+    .filter((x) => x !== undefined);
   const shipSpans = shipRows.filter((r) => r[1] === 'start').map((st) => {
     const en = shipRows.find((e) => e[1] === 'end' && e[3] === st[3] && Number(e[2]) >= Number(st[2]));
     return { args: st[3] ?? '', from: Number(st[2]), to: en ? Number(en[2]) : Number(st[2]) + 300 };
@@ -219,7 +228,7 @@ exit ${shipCode}
     const n = spans.filter((b) => b.from < a.to && a.from < b.to).length;
     if (n > peak) peak = n;
   }
-  return { stdout, status, starts, ends, spans, peak, parked, shipped, branches, shipSpans };
+  return { stdout, status, starts, ends, spans, peak, parked, shipped, shippedItems, branches, shipSpans };
 }
 
 // ------------------------------------------------------------- rules 1 and 2
@@ -268,7 +277,7 @@ exit ${shipCode}
 // ------------------------------------------------------------------- rule 6
 {
   const r = drain({ items: ['301', '302'], codes: { 301: 2, 302: 0 } });
-  check(!r.shipped.some((l) => l.includes('301')),
+  check(!r.shippedItems.includes('301'),
     `rule 6: item 301 came back UNREVIEWED (exit 2) and was shipped anyway. With auto-merge on, this is the difference between a drain and an accident. Ship log: ${JSON.stringify(r.shipped).slice(0, 200)}`);
   check(r.parked.some((x) => String(x.item ?? x.issue ?? '') === '301'),
     'rule 6: an unreviewed item was neither shipped nor parked — it vanished, and nobody is told a change went unexamined');
@@ -341,7 +350,7 @@ exit ${shipCode}
   // having it.
   const halted = /halt/i.test(r.stdout);
   if (halted) {
-    check(!r.shipped.some((l) => l.includes('1004')),
+    check(!r.shippedItems.includes('1004'),
       `rule 12: the line halted and item 1004 was shipped anyway. "Park everything remaining" has to include work already in flight, or the stop-the-line boundary leaks the very merges it exists to prevent. Ship log: ${JSON.stringify(r.shipped).slice(0, 200)}`);
   } else {
     check(false, `rule 12: two consecutive failures did not halt the line (rule 7 covers this too). Output: ${JSON.stringify(r.stdout.slice(0, 200))}`);
