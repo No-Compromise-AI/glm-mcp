@@ -363,6 +363,7 @@ rather than letting a broken main become the base for the rest of the night.
 | largest diff sent to a reviewer | `GLM_REVIEW_MAX_DIFF` | |
 | tool allowlist for the delegated agent | `GLM_TASK_TOOLS` | |
 | outcome ledger, and log path | `GLM_TASK_LEDGER` / `GLM_TASK_LOG` | `~/.claude-glm/outcomes.jsonl` |
+| where `glm-review` writes its machine-readable record — who reviewed, with which model, who did not and why. `glm-task` sets this itself and folds the result into the ledger row as `review_record`; set it yourself to capture the same record when calling `glm-review` directly | `GLM_REVIEW_RECORD` | unset — no record is written |
 | where `-W` worktrees are made | `GLM_WORKTREE_ROOT` | `$TMPDIR` |
 | where a run writes what it wants you to know | `GLM_NOTES` | a per-run file in `$TMPDIR` |
 | note levels that raise a desktop notification | `GLM_NOTIFY_LEVELS` | `blocked` |
