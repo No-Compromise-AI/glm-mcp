@@ -37,8 +37,12 @@
 //      the refusal NAMES the verdict. Driven from the verdicts glm-task itself
 //      can write, not a list copied into this gate.
 //   2. `skipped` refuses too. A run given `-r none` is deliberately unreviewed,
-//      and deliberate is still unreviewed — this is the verdict most likely to
-//      be argued into an exception, so it is pinned.
+//      and deliberate is still unreviewed. NOTE: rule 1 derives its verdicts
+//      from glm-task's source, which already includes `skipped`, so this rule
+//      cannot fail before rule 1 does — it is a deliberate restatement of the
+//      case most likely to be argued into an exception later, not an
+//      independent check. Said out loud rather than left for someone to
+//      discover by mutation.
 //   3. CONTROL: a passing verdict proceeds and arms auto-merge. Refusing
 //      everything satisfies rules 1 and 2 and is not a fix.
 //   4. The override works, and is LOUD. An override nobody can see afterwards is
