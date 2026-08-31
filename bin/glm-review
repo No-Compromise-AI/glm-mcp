@@ -24,10 +24,12 @@ HERE="$(cd -P "$(dirname -- "$__self")" && pwd)"
 . "$HERE/_glm-capacity.sh"
 
 DIR="$PWD"; BASE=""; SPEC=""; HEADREF="HEAD"; REVIEWERS="${GLM_REVIEWER:-auto}"
-while getopts "C:b:s:r:H:h" opt; do
+SECURITY=0
+while getopts "C:b:s:r:H:Sh" opt; do
   case "$opt" in
     C) DIR="$OPTARG" ;; b) BASE="$OPTARG" ;; s) SPEC="$OPTARG" ;; r) REVIEWERS="$OPTARG" ;;
     H) HEADREF="$OPTARG" ;;
+    S) SECURITY=1 ;;
     h) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -10; exit 0 ;;
     *) exit 2 ;;
   esac
@@ -319,7 +321,25 @@ PYEOF
 fi
 if [[ $ANY_OK -eq 1 ]]; then
   echo "glm-review: reviewed by: ${USED[*]-}" >&2
+  # Changes required is a verdict whoever asked must act on, quorum or not:
+  # one reviewer finding a real defect does not need a second to agree.
   [[ $ANY_CHANGES -eq 1 ]] && exit 1
+  # -S: a PASS from a single reviewer is one model's opinion. The two worst
+  # defects this toolchain shipped were both blessed by an acceptance gate
+  # written from the same understanding that produced them, so for changes the
+  # caller marks security-relevant the requirement is a second, independent
+  # look — the half that does not depend on anyone having noticed an ambiguity.
+  #
+  # A distinct code, not 3: 3 means capacity and gets requeued with backoff,
+  # which would spin forever on a machine that simply has one reviewer
+  # installed. This needs a human to decide, so it must reach them.
+  if [[ $SECURITY -eq 1 && ${#USED[@]} -lt 2 ]]; then
+    echo "glm-review: -S asks for a quorum and only one reviewer delivered (${USED[*]-}). A single PASS is one model's opinion; this is NOT reviewed to the standard requested." >&2
+    if [[ ${#EXHAUSTED[@]} -gt 0 ]]; then
+      echo "glm-review: out of capacity: ${EXHAUSTED[*]-} — retrying later may reach a quorum." >&2
+    fi
+    exit 4
+  fi
   exit 0
 fi
 if [[ ${#EXHAUSTED[@]} -gt 0 ]]; then

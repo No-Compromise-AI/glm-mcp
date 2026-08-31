@@ -271,6 +271,63 @@ multimodal though its name says nothing of it) forgoes the modality it was selec
 for; each such id's role says so. An id this server's model table does not know is
 listed bare: it stays z.ai's to describe, exactly as it stays z.ai's to size.
 
+## Writing a spec the loop can hold you to
+
+Two of the worst defects this toolchain has shipped came from a single ambiguous
+sentence in a spec, resolved silently and plausibly by the implementer. Neither was
+caught by its acceptance gate, because the same person wrote the gate and the spec in
+the same words on the same afternoon — **correlated oracles, not independent ones.**
+
+- *"normalise baseURL before comparing (trailing slash, empty string treated as unset)"*
+  bundles three decisions into one clause: what counts as equivalent, whether normalising
+  is in place or scoped to the comparison, and what "unset" implies downstream. The
+  normalisation landed on the value that gets **sent**, and a bearer token went to the
+  vendor's default endpoint.
+- *"whether a URL can be MADE of it"* — "it" has two referents. Read as the joined URL,
+  `http://` passes, because `http://` + `v1/messages` parses, and the token goes to a host
+  called `v1`.
+
+Both are mechanically detectable before dispatch: **a pronoun whose referent is ambiguous,
+and a compound instruction bundling several decisions into one clause.** Read your spec
+back looking for those two shapes specifically. It is cheaper than finding them in review,
+and far cheaper than finding them in production.
+
+Three habits that follow:
+
+- **Name the observable, not the mechanism.** "the caller receives X when it sends Y",
+  never "the function normalises Z" — the second specifies a design and cannot be checked
+  from outside.
+- **Say which value a rule applies to** when a value is transformed on its way somewhere.
+  "the value used for comparison" and "the value sent" are different things and the defect
+  above lives in the gap.
+- **Ask for the assumption.** `glm-task`'s notes channel has an `assumption` level below
+  `scope`: it never interrupts anyone and lands in the ledger, and the standing instruction
+  asks the agent to log any sentence it read one particular way, with the reading it chose.
+  It is exempt from the channel's usual "default to silence" rule, because a resolved
+  ambiguity does not feel like a fork from the inside — it feels like reading.
+
+For a change where being wrong is expensive, pass `-S` to `glm-review`: a PASS from a
+single reviewer is one model's opinion, and `-S` refuses to call that reviewed.
+
+### Dogfooding is a step, not a good intention
+
+Across one 33-run session the `glm_ask` consultant was used substantively **three times**,
+and those three calls produced three real defects — the routing guidance that sends callers
+to models the file-context budget was not sized for, `reasoning: "none"` selecting the
+opposite of what it says, and a README example citing a line number the model could not
+have counted. Eighteen acceptance gates were green across the same work.
+
+Gates cannot substitute for this, and that is the point: **every gate checks a property
+somebody already thought of.** All three findings are of the form *the tool documents or
+implies something it cannot do*, which is invisible to a test written from the same
+understanding that produced the defect.
+
+So after a caller-facing change lands, put the new surface in front of the model and ask it
+to **use** it, not to review the diff. "Route these six requests using only this guidance"
+is a usage question; "is this diff correct" is not, and only the first found #59. File what
+comes back, and verify it before acting — one of the model's own retro claims about this
+toolchain was simply wrong.
+
 ## The shell tools in `bin/`
 
 This repository holds two things that share a name and almost nothing else, and conflating
